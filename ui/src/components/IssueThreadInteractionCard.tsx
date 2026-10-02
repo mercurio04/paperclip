@@ -31,6 +31,7 @@ import {
 } from "../lib/issue-thread-interactions";
 import { cn, formatDateTime, formatShortDate } from "../lib/utils";
 import { InteractionAudienceLine } from "./InteractionAudienceLine";
+import { InteractionReplacementNotice } from "./InteractionReplacementNotice";
 import { MarkdownBody, type MarkdownExternalReferenceMap } from "./MarkdownBody";
 import { Button } from "./ui/button";
 import { Checkbox } from "./ui/checkbox";
@@ -3564,15 +3565,7 @@ export function IssueThreadInteractionCard({
   onUploadImage,
   externalReferences,
 }: IssueThreadInteractionCardProps) {
-  // Single enforcement point (PAP-424, plan from PAP-420; extended by PAP-437):
-  // a card that should never be drawn — a degenerate `ask_user_questions`
-  // (placeholder junk like the onboarding `Test / A` card, no genuine question)
-  // or a stale sibling the server auto-expired when its creator posted a newer
-  // question (`superseded_by_newer_interaction`). Every render site (both thread
-  // backbones + the attention resolver) routes through this component, so
-  // suppressing here suppresses it everywhere at once. The interaction is still
-  // created and stored server-side; only the render is suppressed. Composition
-  // sites additionally filter it so no empty slot lingers.
+  // Suppress unanswerable placeholders, but retain expired replacement receipts.
   if (shouldHideInteractionCard(interaction)) return null;
   const isPlan = isPlanConfirmation(interaction);
   const isToolAction =
@@ -3805,6 +3798,7 @@ export function IssueThreadInteractionCard({
         </div>
 
         <div className="mt-5">
+          <InteractionReplacementNotice interaction={interaction} />
           {interaction.kind === "suggest_tasks" ? (
             <SuggestTasksCard
               interaction={interaction}
