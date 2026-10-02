@@ -442,14 +442,21 @@ export function shouldHideInteractionCard(
   return isDegenerateAskUserQuestions(interaction);
 }
 
+export function interactionExpirationReason(interaction: IssueThreadInteraction): string | null {
+  if (interaction.status !== "expired" || !interaction.result) return null;
+  const result = interaction.result;
+  return ("expirationReason" in result ? result.expirationReason : null)
+    ?? ("outcome" in result ? result.outcome : null)
+    ?? null;
+}
+
 /** Existing server audit metadata, never a new permission or resolution. */
 export function interactionReplacement(
   interaction: IssueThreadInteraction,
 ): { label: string; href: string } | null {
   if (interaction.status !== "expired" || !interaction.result) return null;
   const result = interaction.result;
-  const reason = "expirationReason" in result ? result.expirationReason
-    : "outcome" in result ? result.outcome : null;
+  const reason = interactionExpirationReason(interaction);
   const base = `/issues/${encodeURIComponent(interaction.issueId)}`;
   if (
     (reason === "superseded_by_newer_interaction" || reason === "superseded_by_newer_request") &&
