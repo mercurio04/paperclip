@@ -12,6 +12,7 @@ import {
   getCheckboxConfirmationSelectedLabels,
   getItemVerdictProgress,
   getQuestionAnswerLabels,
+  interactionExpirationReason,
   shouldHideInteractionCard,
   normalizeRequestConfirmationTargetHref,
   type AskUserQuestionsAnswer,
@@ -1098,6 +1099,9 @@ function AskUserQuestionsCard({
   }, [interaction.result?.answers]);
 
   const questions = interaction.payload.questions;
+  const expirationReason = interactionExpirationReason(interaction);
+  const replacedByNewerRequest = expirationReason === "superseded_by_newer_interaction"
+    || expirationReason === "superseded_by_newer_request";
   const requiredQuestions = questions.filter((question) => question.required);
   const canSubmit = requiredQuestions.every(
     (question) =>
@@ -1377,14 +1381,20 @@ function AskUserQuestionsCard({
               ? questions.length === 1
                 ? "Question expired when the issue closed"
                 : "Questions expired when the issue closed"
-              : questions.length === 1
-                ? "Question expired by comment"
-                : "Questions expired by comment"}
+              : replacedByNewerRequest
+                ? questions.length === 1 ? "Question replaced by a newer request" : "Questions replaced by a newer request"
+                : expirationReason === "superseded_by_comment"
+                  ? questions.length === 1 ? "Question expired by comment" : "Questions expired by comment"
+                  : questions.length === 1 ? "Question expired" : "Questions expired"}
           </div>
           <p className="mt-1">
             {interaction.result?.outcome === "issue_closed"
               ? "This question request expired automatically when the issue reached a terminal state."
-              : "A later board/user comment superseded this question request. Create a fresh request if answers are still needed."}
+              : replacedByNewerRequest
+                ? "A newer interaction replaced this question request. No answer was recorded here."
+                : expirationReason === "superseded_by_comment"
+                  ? "A later board/user comment superseded this question request. Create a fresh request if answers are still needed."
+                  : "This question request expired. No answer was recorded here."}
           </p>
           {interaction.result?.commentId ? (
             <a
@@ -1579,6 +1589,7 @@ function RequestConfirmationResolution({
     const expiredByComment = outcome === "superseded_by_comment";
     const expiredByIssueClosed = outcome === "issue_closed";
     const expiredByTargetChange = outcome === "stale_target";
+    const expiredByNewerRequest = outcome === "superseded_by_newer_request";
     return (
       <div className="space-y-3 rounded-sm border border-amber-500/60 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-100">
         {/*
@@ -1589,7 +1600,9 @@ function RequestConfirmationResolution({
          */}
         {expiredByIssueClosed ? null : (
           <div className="text-(length:--text-micro) font-semibold uppercase tracking-(--tracking-eyebrow) text-amber-700">
-            {expiredByComment ? "Expired by comment" : "Expired by target change"}
+            {expiredByComment ? "Expired by comment"
+              : expiredByNewerRequest ? "Replaced by a newer request"
+                : expiredByTargetChange ? "Expired by target change" : "Expired"}
           </div>
         )}
         <p className="leading-6">
@@ -1597,7 +1610,11 @@ function RequestConfirmationResolution({
             ? "A board comment superseded this confirmation before it was resolved."
             : expiredByIssueClosed
               ? "This confirmation expired automatically when the issue reached a terminal state."
-              : "The requested target changed before this confirmation was resolved."}
+              : expiredByNewerRequest
+                ? "A newer interaction replaced this confirmation before it was resolved."
+                : expiredByTargetChange
+                  ? "The requested target changed before this confirmation was resolved."
+                  : "This confirmation expired before it was resolved."}
         </p>
         {expiredByComment && interaction.result?.commentId ? (
           <Button asChild size="sm" variant="ghost" className="h-7 px-2 text-amber-950 hover:bg-amber-500/15 dark:text-amber-50">
