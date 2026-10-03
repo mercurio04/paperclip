@@ -1,3 +1,4 @@
+import { displayDateTimeString } from "@/lib/display-time";
 import { createContext, useContext, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Mail, Paperclip } from "lucide-react";
@@ -72,7 +73,7 @@ export function EmailMessageCard({
           {message.direction === "inbound" ? "Email received" : "Email sent"}
         </span>
         <span className="text-xs text-muted-foreground">
-          {new Date(message.timestamp).toLocaleString()}
+          {displayDateTimeString(message.timestamp)}
         </span>
       </div>
       <div className="space-y-1">

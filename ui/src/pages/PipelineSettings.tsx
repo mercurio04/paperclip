@@ -1,3 +1,4 @@
+import { displayDateTimeString } from "@/lib/display-time";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -1251,7 +1252,7 @@ function StageEventsList({
           key={event.id}
           className="grid min-h-11 grid-cols-(--gtc-15) items-center gap-3 border-b border-border/70 px-3 py-2 text-sm last:border-b-0"
         >
-          <span className="text-xs text-muted-foreground" title={new Date(event.createdAt).toLocaleString()}>
+          <span className="text-xs text-muted-foreground" title={displayDateTimeString(event.createdAt)}>
             {relativeTime(event.createdAt)}
           </span>
           <div className="min-w-0">

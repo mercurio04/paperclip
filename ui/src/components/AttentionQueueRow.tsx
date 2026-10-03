@@ -1,3 +1,4 @@
+import { displayDateTimeString, parseDisplayDateTimeLocal, displayTomorrowMorning, DISPLAY_TIME_ZONE_LABEL } from "@/lib/display-time";
 import { memo, useState, type KeyboardEvent, type ReactNode } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -61,12 +62,9 @@ const DAY_MS = 24 * HOUR_MS;
 // the row also reflows correctly inside narrow side panels, not just on phones.
 const ACTION_BTN = "h-9 gap-1.5 px-3 text-sm @xl:h-6 @xl:gap-1 @xl:px-2 @xl:text-xs";
 
-/** Tomorrow at 9am local time. */
+/** Tomorrow at 9am in the human display zone. */
 function tomorrowMorningIso(): string {
-  const d = new Date();
-  d.setDate(d.getDate() + 1);
-  d.setHours(9, 0, 0, 0);
-  return d.toISOString();
+  return displayTomorrowMorning().toISOString();
 }
 
 /** Snooze presets, resolved to a future ISO timestamp at click time. */
@@ -293,7 +291,7 @@ export const AttentionQueueRow = memo(function AttentionQueueRow({
           {isHidden && snoozedUntil ? (
             <span
               className="text-(length:--text-nano) text-muted-foreground"
-              title={`Reappears ${new Date(snoozedUntil).toLocaleString()}`}
+              title={`Reappears ${displayDateTimeString(snoozedUntil)}`}
             >
               Reappears {reappearLabel(snoozedUntil)}
             </span>
@@ -676,7 +674,7 @@ function SnoozeSubmenu({ onSnooze }: { onSnooze: (snoozedUntil: string) => void 
   const [customValue, setCustomValue] = useState("");
   const applyCustom = () => {
     if (!customValue) return;
-    const ts = new Date(customValue);
+    const ts = parseDisplayDateTimeLocal(customValue);
     if (Number.isNaN(ts.getTime())) return;
     onSnooze(ts.toISOString());
   };
@@ -701,10 +699,12 @@ function SnoozeSubmenu({ onSnooze }: { onSnooze: (snoozedUntil: string) => void 
           onClick={(e) => e.stopPropagation()}
         >
           <span className="text-(length:--text-nano) font-medium uppercase tracking-(--tracking-eyebrow) text-muted-foreground">
-            Custom
+            Custom · ART (UTC−03:00)
           </span>
           <input
             type="datetime-local"
+            aria-label={`Snooze until (${DISPLAY_TIME_ZONE_LABEL})`}
+            title={DISPLAY_TIME_ZONE_LABEL}
             value={customValue}
             onChange={(e) => setCustomValue(e.target.value)}
             className="w-full rounded-sm border border-border bg-background px-2 py-1 text-xs"

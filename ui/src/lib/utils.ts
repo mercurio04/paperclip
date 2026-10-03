@@ -1,3 +1,4 @@
+import { displayDateString, displayDateTimeString } from "./display-time";
 import { type ClassValue, clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
 import { deriveAgentUrlKey, deriveProjectUrlKey, normalizeProjectUrlKey, hasNonAsciiContent } from "@paperclipai/shared";
@@ -51,7 +52,7 @@ export function formatProjectBudget(budget: { amountCents: number; windowKind: s
 }
 
 export function formatDate(date: Date | string): string {
-  return new Date(date).toLocaleDateString("en-US", {
+  return displayDateString(date, "en-US", {
     month: "short",
     day: "numeric",
     year: "numeric",
@@ -62,18 +63,19 @@ export function formatDateTime(
   date: Date | string,
   options: { includeSeconds?: boolean } = {},
 ): string {
-  return new Date(date).toLocaleString("en-US", {
+  return displayDateTimeString(date, "en-US", {
     month: "short",
     day: "numeric",
     year: "numeric",
     hour: "numeric",
     minute: "2-digit",
     ...(options.includeSeconds ? { second: "2-digit" as const } : {}),
+    timeZoneName: "short",
   });
 }
 
 export function formatShortDate(date: Date | string): string {
-  return new Date(date).toLocaleString("en-US", {
+  return displayDateTimeString(date, "en-US", {
     month: "short",
     day: "numeric",
   });

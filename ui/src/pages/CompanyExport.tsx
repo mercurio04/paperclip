@@ -1,3 +1,4 @@
+import { displayDayKey } from "@/lib/display-time";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import type {
@@ -493,7 +494,7 @@ function generateReadmeFromSelection(
   lines.push("See [Paperclip](https://paperclip.ing) for more information.");
   lines.push("");
   lines.push("---");
-  lines.push(`Exported from [Paperclip](https://paperclip.ing) on ${new Date().toISOString().split("T")[0]}`);
+  lines.push(`Exported from [Paperclip](https://paperclip.ing) on ${displayDayKey(new Date())} (ART)`);
   lines.push("");
 
   return lines.join("\n");

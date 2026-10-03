@@ -1,3 +1,4 @@
+import { displayDateTimeString } from "@/lib/display-time";
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -770,7 +771,7 @@ export function EmailEndpointSettings({
         {inbox.receiveMode === "websocket" ? "Live connection" : "Webhook"}
       </p>
       <p className="text-sm text-muted-foreground">
-        Last mail check: {inbox.lastSyncAt ? new Date(inbox.lastSyncAt).toLocaleString() : "Not checked yet"}
+        Last mail check: {inbox.lastSyncAt ? displayDateTimeString(inbox.lastSyncAt) : "Not checked yet"}
       </p>
       <p className="text-sm">
         Each email conversation is a task. Task comments stay internal; use

@@ -1,3 +1,4 @@
+import { displayDateString, displayDayStart, displayDayEnd, displayCalendarOrdinal } from "@/lib/display-time";
 import type {
   AttentionDetailImage,
   AttentionFeed,
@@ -427,7 +428,7 @@ export function decideByLabel(decideBy: string | null): string {
   if (/^\d{4}-\d{2}-\d{2}$/.test(decideBy)) {
     const parsed = new Date(`${decideBy}T00:00:00.000Z`);
     return Number.isFinite(parsed.getTime())
-      ? parsed.toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" })
+      ? displayDateString(decideBy, undefined, { month: "short", day: "numeric" })
       : decideBy;
   }
   return decideBy;
@@ -465,14 +466,10 @@ export function resolveAttentionDateRange(
   custom?: { from?: string | null; to?: string | null },
 ): AttentionActivityBounds {
   const startOfLocalDay = (ms: number) => {
-    const d = new Date(ms);
-    d.setHours(0, 0, 0, 0);
-    return d;
+    return displayDayStart(ms);
   };
   const endOfLocalDay = (ms: number) => {
-    const d = new Date(ms);
-    d.setHours(23, 59, 59, 999);
-    return d;
+    return displayDayEnd(ms);
   };
   switch (range) {
     case "all":
@@ -487,18 +484,18 @@ export function resolveAttentionDateRange(
     case "last_7_days":
       return { activitySince: startOfLocalDay(now - 6 * MS_PER_DAY_DECIDE).toISOString() };
     case "this_month": {
-      const d = new Date(now);
-      const start = new Date(d.getFullYear(), d.getMonth(), 1, 0, 0, 0, 0);
+      const key = new Date(displayCalendarOrdinal(now)).toISOString().slice(0, 7) + "-01";
+      const start = displayDayStart(key);
       return { activitySince: start.toISOString() };
     }
     case "custom": {
       const bounds: AttentionActivityBounds = {};
       if (custom?.from) {
-        const from = new Date(`${custom.from}T00:00:00`);
+        const from = displayDayStart(custom.from);
         if (Number.isFinite(from.getTime())) bounds.activitySince = from.toISOString();
       }
       if (custom?.to) {
-        const to = new Date(`${custom.to}T23:59:59.999`);
+        const to = displayDayEnd(custom.to);
         if (Number.isFinite(to.getTime())) bounds.activityUntil = to.toISOString();
       }
       return bounds;
@@ -823,9 +820,7 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 export function attentionDateBucket(activityAt: string, now: number): DateBucket {
   const ts = new Date(activityAt).getTime();
   if (!Number.isFinite(ts)) return "earlier";
-  const startOfToday = new Date(now);
-  startOfToday.setHours(0, 0, 0, 0);
-  const todayStart = startOfToday.getTime();
+  const todayStart = displayDayStart(now).getTime();
   if (ts >= todayStart) return "today";
   if (ts >= todayStart - MS_PER_DAY) return "yesterday";
   // Rolling 7-day window from the start of today (locale week-start agnostic).

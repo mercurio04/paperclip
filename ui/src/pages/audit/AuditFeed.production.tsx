@@ -1,3 +1,4 @@
+import { displayDateTimeString, displayDayStart, displayDayEnd } from "@/lib/display-time";
 import { useEffect, useMemo, useState } from "react";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { Download, ScrollText, ShieldAlert } from "lucide-react";
@@ -80,13 +81,13 @@ export interface AuditFeedProps {
 
 function toStartIso(value: string): string | undefined {
   if (!value) return undefined;
-  const date = new Date(`${value}T00:00:00.000Z`);
+  const date = displayDayStart(value);
   return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
 }
 
 function toEndIso(value: string): string | undefined {
   if (!value) return undefined;
-  const date = new Date(`${value}T23:59:59.999Z`);
+  const date = displayDayEnd(value);
   return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
 }
 
@@ -227,7 +228,7 @@ function AuditRow({
         <time
           className="shrink-0 whitespace-nowrap text-xs text-muted-foreground"
           dateTime={record.createdAt}
-          title={new Date(record.createdAt).toLocaleString()}
+          title={displayDateTimeString(record.createdAt)}
         >
           {relativeTime(record.createdAt)}
         </time>

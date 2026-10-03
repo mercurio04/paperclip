@@ -1,3 +1,4 @@
+import { displayDateTimeLocalValue } from "@/lib/display-time";
 import type { AdapterModel } from "../../api/agents";
 import type { Issue, Project } from "@paperclipai/shared";
 import { extractProviderIdWithFallback } from "../../lib/model-utils";
@@ -47,10 +48,7 @@ export function isMainIssueWorkspace(input: {
 
 export function toDateTimeLocalValue(value: string | null | undefined) {
   if (!value) return "";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "";
-  const offsetMs = date.getTimezoneOffset() * 60_000;
-  return new Date(date.getTime() - offsetMs).toISOString().slice(0, 16);
+  return displayDateTimeLocalValue(value);
 }
 
 export const ISSUE_THINKING_EFFORT_OPTIONS = {

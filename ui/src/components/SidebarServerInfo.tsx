@@ -1,3 +1,4 @@
+import { displayDateTimeFormatter } from "@/lib/display-time";
 import { useQuery } from "@tanstack/react-query";
 import { Clock3, FileDiff, GitCommit, type LucideIcon } from "lucide-react";
 import { healthApi, type HealthStatus } from "@/api/health";
@@ -8,7 +9,7 @@ function formatTimestamp(value: string | null | undefined): string {
   if (!value) return "Unavailable";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "Unavailable";
-  return new Intl.DateTimeFormat(undefined, {
+  return displayDateTimeFormatter(undefined, {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(date);

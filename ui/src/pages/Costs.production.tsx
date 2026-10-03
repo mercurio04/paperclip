@@ -544,6 +544,7 @@ export function Costs() {
                 <h1 className="text-3xl font-semibold tracking-tight">Costs</h1>
                 <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
                   Inference spend, platform fees, credits, and live quota windows.
+                  <span className="block">Cost date ranges use your browser time zone. Daily budget totals use UTC.</span>
                 </p>
             </div>
 

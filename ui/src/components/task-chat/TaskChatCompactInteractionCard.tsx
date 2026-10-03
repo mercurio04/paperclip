@@ -1,3 +1,4 @@
+import { displayDateTimeString } from "@/lib/display-time";
 import {
   useEffect,
   useMemo,
@@ -533,9 +534,7 @@ function ReceiptDisclosure({
             </p>
             <p className="mt-1">
               Expires{" "}
-              {new Date(
-                interaction.payload.toolAction.expiresAt,
-              ).toLocaleString()}
+              {displayDateTimeString(interaction.payload.toolAction.expiresAt)}
             </p>
             <div className="mt-2">
               <MarkdownBody externalReferences={externalReferences}>
@@ -570,9 +569,7 @@ function ReceiptDisclosure({
             <div>
               <dt className="text-xs text-muted-foreground">Expires</dt>
               <dd>
-                {new Date(
-                  interaction.payload.secretProposal.expiresAt,
-                ).toLocaleString()}
+                {displayDateTimeString(interaction.payload.secretProposal.expiresAt)}
               </dd>
             </div>
           </dl>
@@ -898,9 +895,7 @@ function ConfirmationCard({
             </span>
             <span className="ml-auto text-xs text-muted-foreground">
               Expires{" "}
-              {new Date(
-                interaction.payload.toolAction.expiresAt,
-              ).toLocaleString()}
+              {displayDateTimeString(interaction.payload.toolAction.expiresAt)}
             </span>
           </div>
           <MarkdownBody externalReferences={externalReferences}>
@@ -939,9 +934,7 @@ function ConfirmationCard({
           <div>
             <dt className="text-xs text-muted-foreground">Expires</dt>
             <dd>
-              {new Date(
-                interaction.payload.secretProposal.expiresAt,
-              ).toLocaleString()}
+              {displayDateTimeString(interaction.payload.secretProposal.expiresAt)}
             </dd>
           </div>
         </dl>

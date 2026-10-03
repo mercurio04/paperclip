@@ -1,3 +1,4 @@
+import { displayCalendarDate } from "@/lib/display-time";
 import { useState, type ReactNode } from "react";
 import { environmentDisplayLabel, filterManagedSandboxSelectableEnvironments } from "@/lib/managed-sandbox-environment";
 import { Link } from "@/lib/router";
@@ -475,7 +476,7 @@ export function ProjectProperties({ project, repositories, onUpdate, onFieldUpda
         </PropertyRow>
         {project.targetDate && (
           <PropertyRow label={<FieldLabel label="Target Date" state="idle" />}>
-            <span className="text-sm">{formatDate(project.targetDate)}</span>
+            <span className="text-sm">{formatDate(displayCalendarDate(project.targetDate))}</span>
           </PropertyRow>
         )}
       </div>

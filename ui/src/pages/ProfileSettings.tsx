@@ -1,3 +1,4 @@
+import { DISPLAY_TIME_ZONE_LABEL } from "@/lib/display-time";
 import { useEffect, useId, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Camera, LoaderCircle, Save, Trash2, UserRoundPen } from "lucide-react";
@@ -148,6 +149,7 @@ export function ProfileSettings() {
         </div>
         <p className="text-sm text-muted-foreground">
           Control how your account appears in the sidebar and other board surfaces.
+          <span className="block">Display times: {DISPLAY_TIME_ZONE_LABEL}.</span>
         </p>
       </div>
 

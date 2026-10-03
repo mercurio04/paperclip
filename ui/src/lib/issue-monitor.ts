@@ -1,3 +1,4 @@
+import { DISPLAY_TIME_ZONE } from "./display-time";
 import { useEffect, useState } from "react";
 
 const SECOND_MS = 1_000;
@@ -95,7 +96,7 @@ export function formatMonitorEtaLabel(nextCheckAt: MonitorDate, now: MonitorDate
 function zonedYmd(
   date: Date,
   locale: Intl.LocalesArgument,
-  timeZone: string | undefined,
+  timeZone: string = DISPLAY_TIME_ZONE,
 ): { year: string; month: string; day: string } {
   const parts = new Intl.DateTimeFormat(locale, {
     year: "numeric",
@@ -128,7 +129,7 @@ export function formatMonitorAbsolute(
   const time = new Intl.DateTimeFormat(options.locale, {
     hour: "numeric",
     minute: "2-digit",
-    timeZone: options.timeZone,
+    timeZone: options.timeZone ?? DISPLAY_TIME_ZONE,
   }).format(target);
 
   const isToday =
@@ -139,13 +140,13 @@ export function formatMonitorAbsolute(
 
   const weekday = new Intl.DateTimeFormat(options.locale, {
     weekday: "short",
-    timeZone: options.timeZone,
+    timeZone: options.timeZone ?? DISPLAY_TIME_ZONE,
   }).format(target);
   const date = new Intl.DateTimeFormat(options.locale, {
     month: "short",
     day: "numeric",
     year: targetYmd.year === referenceYmd.year ? undefined : "numeric",
-    timeZone: options.timeZone,
+    timeZone: options.timeZone ?? DISPLAY_TIME_ZONE,
   }).format(target);
 
   return `${weekday} ${date}, ${time}`;
@@ -161,14 +162,14 @@ export function formatMonitorAbsoluteFull(
     year: "numeric",
     month: "long",
     day: "numeric",
-    timeZone: options.timeZone,
+    timeZone: options.timeZone ?? DISPLAY_TIME_ZONE,
   }).format(date);
   const timePart = new Intl.DateTimeFormat(options.locale, {
     hour: "numeric",
     minute: "2-digit",
     second: "2-digit",
     timeZoneName: "short",
-    timeZone: options.timeZone,
+    timeZone: options.timeZone ?? DISPLAY_TIME_ZONE,
   }).format(date);
   return `${datePart}, ${timePart}`;
 }

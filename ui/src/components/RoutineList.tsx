@@ -1,3 +1,4 @@
+import { displayDateTimeString } from "@/lib/display-time";
 import type { ReactNode } from "react";
 import { MoreHorizontal, Play } from "lucide-react";
 import { Link } from "@/lib/router";
@@ -36,7 +37,7 @@ export type RoutineListRowItem = {
 
 export function formatLastRunTimestamp(value: Date | string | null | undefined) {
   if (!value) return "Never";
-  return new Date(value).toLocaleString();
+  return displayDateTimeString(value);
 }
 
 export function formatRoutineRunStatus(value: string | null | undefined) {

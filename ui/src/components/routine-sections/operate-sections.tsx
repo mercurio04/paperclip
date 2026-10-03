@@ -1,3 +1,4 @@
+import { displayDateString } from "@/lib/display-time";
 import { useMemo, useState } from "react";
 import { Activity as ActivityIcon, Play, SlidersHorizontal } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -207,7 +208,7 @@ export function ActivitySection() {
     for (const event of events) {
       let label = "Earlier";
       try {
-        label = new Date(event.createdAt).toLocaleDateString(undefined, {
+        label = displayDateString(event.createdAt, undefined, {
           weekday: "short",
           month: "short",
           day: "numeric",

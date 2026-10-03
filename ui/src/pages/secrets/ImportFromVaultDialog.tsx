@@ -1,3 +1,4 @@
+import { displayDateString } from "@/lib/display-time";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -188,7 +189,7 @@ function formatRelativeShort(value: string | null | undefined): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "—";
   const diff = Date.now() - date.getTime();
-  if (diff < 0) return date.toLocaleDateString();
+  if (diff < 0) return displayDateString(date);
   const seconds = Math.floor(diff / 1000);
   if (seconds < 60) return `${seconds}s ago`;
   const minutes = Math.floor(seconds / 60);
@@ -197,7 +198,7 @@ function formatRelativeShort(value: string | null | undefined): string {
   if (hours < 48) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   if (days < 30) return `${days}d ago`;
-  return date.toLocaleDateString();
+  return displayDateString(date);
 }
 
 function readableErrorMessage(error: unknown): string {

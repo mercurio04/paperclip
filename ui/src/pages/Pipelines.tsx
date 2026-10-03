@@ -1,3 +1,4 @@
+import { displayDateString, displayDateTimeFormatter, displayDateTimeString } from "@/lib/display-time";
 import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { groupWarningsByStage, LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
@@ -581,7 +582,7 @@ function formatPipelineActivity(value: string | Date | null) {
   if (diffDays < 7) return `${diffDays} days ago`;
   if (diffDays < 14) return "last week";
   if (diffDays < 30) return `${Math.round(diffDays / 7)} weeks ago`;
-  return new Date(value).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  return displayDateString(value, "en-US", { month: "short", day: "numeric" });
 }
 
 function PipelineStatusChip({ archivedAt }: { archivedAt: Date | string | null }) {
@@ -4164,7 +4165,7 @@ function BuiltFromTree({
 }
 
 function formatShortDate(value: Date | string) {
-  return new Intl.DateTimeFormat(undefined, {
+  return displayDateTimeFormatter(undefined, {
     month: "short",
     day: "numeric",
     hour: "numeric",
@@ -5235,7 +5236,7 @@ export function Learnings() {
                         forcedMove && "border-l-2 border-l-amber-400 bg-amber-50/50 dark:bg-amber-400/10",
                       )}
                     >
-                      <span className="text-xs text-muted-foreground" title={new Date(event.createdAt).toLocaleString()}>
+                      <span className="text-xs text-muted-foreground" title={displayDateTimeString(event.createdAt)}>
                         {relativeTime(event.createdAt)}
                       </span>
                       <div className="min-w-0">

@@ -1,3 +1,4 @@
+import { displayDateTimeFormatter } from "@/lib/display-time";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -43,7 +44,7 @@ function formatTime(value: string | Date | null | undefined): string {
   if (!value) return "—";
   const date = new Date(value as string | Date);
   if (Number.isNaN(date.getTime())) return "—";
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
+  return displayDateTimeFormatter(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
 }
 
 function serviceTone(status: string): "success" | "warn" | "error" | "muted" {

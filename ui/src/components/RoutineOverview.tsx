@@ -1,3 +1,4 @@
+import { displayDateTimeString } from "@/lib/display-time";
 import type {
   Issue,
   IssuePriority,
@@ -27,7 +28,7 @@ export type RoutineScheduleSummary = {
 };
 
 export function formatRoutineTimestamp(value: Date | string) {
-  return new Date(value).toLocaleString(undefined, {
+  return displayDateTimeString(value, undefined, {
     dateStyle: "medium",
     timeStyle: "short",
   });

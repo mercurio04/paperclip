@@ -1,3 +1,4 @@
+import { displayDayKey, displayCalendarOrdinal } from "./display-time";
 import type { PipelineCompanyCaseEvent } from "../api/pipelines";
 import { formatShortDate } from "./utils";
 
@@ -94,15 +95,15 @@ export function formatLearningEvent(event: PipelineCompanyCaseEvent): LearningEv
 export function learningDayKey(value: string | Date) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "Unknown";
-  return date.toISOString().slice(0, 10);
+  return displayDayKey(date);
 }
 
 export function learningDayLabel(value: string | Date) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "Unknown";
   const today = new Date();
-  const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
-  const startOfDay = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  const startOfToday = displayCalendarOrdinal(today);
+  const startOfDay = displayCalendarOrdinal(date);
   const diffDays = Math.round((startOfToday - startOfDay) / 86_400_000);
   if (diffDays === 0) return "Today";
   if (diffDays === 1) return "Yesterday";

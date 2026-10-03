@@ -1,3 +1,4 @@
+import { displayDayKey } from "@/lib/display-time";
 import type { CompanySkillVersion } from "@paperclipai/shared";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -18,16 +19,13 @@ const DEFAULT_LABEL = "Default — current (recommended)";
  * v7-roster manifest entry) render verbatim; full timestamps collapse to their
  * local calendar day so the picker reads `released 2026-07-21`.
  */
-export function formatReleaseDate(value: CompanySkillVersion["releasedAt"]): string | null {
+export function formatReleaseDate(value: CompanySkillVersion["releasedAt"] | string): string | null {
   if (!value) return null;
   const raw = typeof value === "string" ? value : value.toISOString();
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
   const parsed = new Date(raw);
   if (Number.isNaN(parsed.getTime())) return null;
-  const year = parsed.getFullYear();
-  const month = String(parsed.getMonth() + 1).padStart(2, "0");
-  const day = String(parsed.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
+  return displayDayKey(parsed);
 }
 
 /** Release display name, e.g. `V7 — Roster champion` (no date). */
