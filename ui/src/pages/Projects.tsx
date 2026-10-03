@@ -1,3 +1,4 @@
+import { displayCalendarDate } from "@/lib/display-time";
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { Project } from "@paperclipai/shared";
@@ -234,7 +235,7 @@ export function Projects() {
                             )}
                             {project.targetDate && (
                               <span className="hidden text-xs text-muted-foreground md:inline">
-                                {formatDate(project.targetDate)}
+                                {formatDate(displayCalendarDate(project.targetDate))}
                               </span>
                             )}
                             <StatusBadge status={project.status} />

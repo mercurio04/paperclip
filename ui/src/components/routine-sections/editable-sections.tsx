@@ -1,3 +1,4 @@
+import { displayDateTimeFormatter, displayDateTimeString } from "@/lib/display-time";
 import { useEffect, useMemo, useState } from "react";
 import {
   ArrowRight,
@@ -141,7 +142,7 @@ export function OverviewSection({
       .filter((trigger) => trigger.kind === "schedule" && trigger.nextRunAt)
       .map((trigger) => new Date(trigger.nextRunAt as Date))
       .sort((a, b) => a.getTime() - b.getTime())[0];
-    return upcoming ? upcoming.toLocaleString() : null;
+    return upcoming ? displayDateTimeString(upcoming) : null;
   }, [routine.triggers]);
   const lastRun = (routineRuns ?? [])[0] ?? null;
   const recentActivity = (activity ?? []).slice(0, 5);
@@ -832,7 +833,7 @@ function NextFiresPreview({
 
 function formatFireTime(date: Date, timeZone: string): string {
   try {
-    return new Intl.DateTimeFormat(undefined, {
+    return displayDateTimeFormatter(undefined, {
       timeZone,
       year: "numeric",
       month: "2-digit",

@@ -1,3 +1,4 @@
+import { displayDateTimeString } from "@/lib/display-time";
 import {
   useCallback,
   useEffect,
@@ -1224,7 +1225,7 @@ export function RunnerInspector({
 
           {canInspectRaw === true && inspection?.trace?.runId === runId ? (
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border p-3">
-              <p className="text-xs text-muted-foreground">{inspection.trace.frameCount} frames · {formatBytes(inspection.trace.byteCount)} · expires {new Date(inspection.trace.expiresAt).toLocaleString()}</p>
+              <p className="text-xs text-muted-foreground">{inspection.trace.frameCount} frames · {formatBytes(inspection.trace.byteCount)} · expires {displayDateTimeString(inspection.trace.expiresAt)}</p>
               <div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => void downloadTrace()}><Download className="mr-1.5 h-4 w-4" />Download exact trace</Button><Button size="sm" variant="destructive" onClick={() => void deleteTrace()}><Trash2 className="mr-1.5 h-4 w-4" />Delete trace</Button></div>
             </div>
           ) : null}

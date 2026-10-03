@@ -1,3 +1,4 @@
+import { displayDateTimeString } from "@/lib/display-time";
 import type { ReactNode } from "react";
 import type {
   ToolRiskLevel,
@@ -131,7 +132,7 @@ export function RelativeTime({ value }: { value: Date | string | null | undefine
     text = isFuture ? `in ${value}` : `${value} ago`;
   }
   return (
-    <span title={date.toLocaleString()} className="text-muted-foreground">
+    <span title={displayDateTimeString(date)} className="text-muted-foreground">
       {text}
     </span>
   );

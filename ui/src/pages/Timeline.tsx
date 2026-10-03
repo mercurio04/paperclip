@@ -1,3 +1,4 @@
+import { displayDateTimeString, displayDayKey, displayCalendarOrdinal, displayDayStart, displayDayEnd } from "@/lib/display-time";
 /**
  * Work Timeline page (PAP-12424 / Phase C of PAP-12405).
  *
@@ -103,28 +104,18 @@ export async function loadTimelineWindow(
   };
 }
 
-function dateInputValue(date: Date): string {
-  const yyyy = date.getFullYear();
-  const mm = String(date.getMonth() + 1).padStart(2, "0");
-  const dd = String(date.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
-
 function presetRange(preset: Exclude<RangePreset, "custom">, now = new Date()): DateRangeState {
-  const from = new Date(now);
-  const to = new Date(now);
-  if (preset === "today") {
-    return { fromDate: dateInputValue(from), toDate: dateInputValue(to) };
-  } else {
-    from.setDate(from.getDate() - (preset === "7d" ? 6 : 29));
-  }
-  return { fromDate: dateInputValue(from), toDate: dateInputValue(to) };
+  const days = preset === "today" ? 0 : preset === "7d" ? 6 : 29;
+  return {
+    fromDate: new Date(displayCalendarOrdinal(now) - days * 86_400_000).toISOString().slice(0, 10),
+    toDate: displayDayKey(now),
+  };
 }
 
 function rangeWindow(range: DateRangeState): Pick<WorkTimelineParams, "from" | "to"> | null {
   if (!range.fromDate || !range.toDate) return null;
-  const from = new Date(`${range.fromDate}T00:00:00`);
-  const to = new Date(`${range.toDate}T23:59:59.999`);
+  const from = displayDayStart(range.fromDate);
+  const to = displayDayEnd(range.toDate);
   if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to) return null;
   return { from: from.toISOString(), to: to.toISOString() };
 }
@@ -530,7 +521,7 @@ export function Timeline({ embedded = false }: { embedded?: boolean } = {}) {
             <div className="flex flex-wrap items-center justify-between gap-3">
               <p className="text-xs text-muted-foreground">
                 {data.spans.length} run{data.spans.length === 1 ? "" : "s"} ·{" "}
-                {new Date(data.window.from).toLocaleString()} to {new Date(data.window.to).toLocaleString()}
+                {displayDateTimeString(data.window.from)} to {displayDateTimeString(data.window.to)}
                 {data.window.capped ? " · window capped" : ""}
               </p>
               {rangeControls}

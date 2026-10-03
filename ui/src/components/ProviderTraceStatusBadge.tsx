@@ -1,3 +1,4 @@
+import { displayDateTimeString } from "@/lib/display-time";
 import type { ProviderTraceMetadata } from "@paperclipai/shared";
 import { Bug, CircleOff } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -70,7 +71,7 @@ export function ProviderTraceStatusBadge({
       )}
       title={
         trace
-          ? `${trace.frameCount} frames · ${trace.byteCount} bytes · expires ${new Date(trace.expiresAt).toLocaleString()}`
+          ? `${trace.frameCount} frames · ${trace.byteCount} bytes · expires ${displayDateTimeString(trace.expiresAt)}`
           : requested
             ? "This run requested sensitive provider-frame capture."
             : "Raw provider-frame capture was disabled for this run."

@@ -106,6 +106,18 @@ describe("WorkTimelineChart", () => {
     expect(timeAxis?.textContent).not.toContain("09:00");
   });
 
+  it("retains Argentina minutes in a tooltip regardless of browser fractional offset", async () => {
+    const data = timelineSample();
+    data.spans[0]!.start = "2026-07-02T09:15:00Z";
+    renderChart(data);
+    const bar = container.querySelector<SVGGElement>("g.cursor-pointer[data-run-id='run-1']")!;
+    flushSync(() => bar.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, clientX: 100, clientY: 100 })));
+    await flushTimelineEffects();
+    const tooltip = container.querySelector<HTMLDivElement>("div.fixed.pointer-events-none");
+    expect(tooltip?.textContent).toContain("6:15 AM–7 AM");
+    expect(tooltip?.textContent).not.toContain("9:15 AM");
+  });
+
   it("freezes the time axis over vertical scrolling while preserving horizontal alignment", async () => {
     renderChart(timelineSample());
 

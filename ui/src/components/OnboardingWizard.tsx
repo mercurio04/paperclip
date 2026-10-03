@@ -1,3 +1,4 @@
+import { displayTimeString } from "@/lib/display-time";
 import { healthApi } from "@/api/health";
 import { LocalProviderLoginInstructions } from "./AdapterLoginChrome";
 import { useLocalAiLogin } from "./ai-connections/useLocalAiLogin";
@@ -3113,7 +3114,7 @@ function AdapterEnvironmentResult({
       <div className="flex items-center justify-between gap-2">
         <span className="font-medium">{statusLabel}</span>
         <span className="opacity-80">
-          {new Date(result.testedAt).toLocaleTimeString()}
+          {displayTimeString(result.testedAt)}
         </span>
       </div>
       <div className="mt-1.5 space-y-1">

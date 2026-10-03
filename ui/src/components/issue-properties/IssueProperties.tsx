@@ -1,3 +1,4 @@
+import { parseDisplayDateTimeLocal, DISPLAY_TIME_ZONE_LABEL } from "@/lib/display-time";
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { createPortal } from "react-dom";
@@ -1273,7 +1274,7 @@ export function IssueProperties({
   };
   const saveMonitor = () => {
     if (!monitorAtInput) return;
-    const nextCheckAt = new Date(monitorAtInput);
+    const nextCheckAt = parseDisplayDateTimeLocal(monitorAtInput);
     if (Number.isNaN(nextCheckAt.getTime())) return;
     const serviceName = monitorServiceInput.trim() || null;
     updateMonitor({
@@ -1546,6 +1547,8 @@ export function IssueProperties({
       <div className="flex flex-col gap-2 md:flex-row">
         <input
           type="datetime-local"
+          aria-label={`Monitor time · ${DISPLAY_TIME_ZONE_LABEL}`}
+          title={DISPLAY_TIME_ZONE_LABEL}
           className="rounded-md border border-border bg-transparent px-2 py-1 text-xs"
           value={monitorAtInput}
           onChange={(e) => setMonitorAtInput(e.target.value)}

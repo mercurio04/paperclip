@@ -213,7 +213,7 @@ export function TokensPanel({
               <span className="text-xs text-muted-foreground">Also used as the client label.</span>
             </label>
             <label className="space-y-1.5 text-sm">
-              <span className="text-xs font-medium text-muted-foreground">Expires</span>
+              <span className="text-xs font-medium text-muted-foreground">Expires (end of day UTC)</span>
               <Input type="date" value={expiresAt} onChange={(event) => setExpiresAt(event.target.value)} required />
             </label>
           </div>

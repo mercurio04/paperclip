@@ -1,3 +1,4 @@
+import { displayDateTimeString } from "@/lib/display-time";
 import { useId, useState, type ReactNode } from "react";
 import {
   ChevronDown,
@@ -100,7 +101,7 @@ const TONE_TOKENS: Record<SystemNoticeTone, ToneTokens> = {
 
 function formatTimestamp(ts: string) {
   try {
-    return new Date(ts).toLocaleString(undefined, {
+    return displayDateTimeString(ts, undefined, {
       month: "short",
       day: "numeric",
       hour: "numeric",

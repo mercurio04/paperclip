@@ -1,3 +1,4 @@
+import { displayDateTimeString } from "@/lib/display-time";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import { useMemo, useState } from "react";
 import type {
@@ -785,7 +786,7 @@ function formatTimeShort(value: string | Date | null | undefined): string | null
     if (absMin < 60) {
       return diffMs >= 0 ? `in ${absMin}m` : `${absMin}m ago`;
     }
-    return date.toLocaleString(undefined, {
+    return displayDateTimeString(date, undefined, {
       month: "short",
       day: "numeric",
       hour: "numeric",
@@ -888,7 +889,7 @@ function formatTimeAbsolute(value: string | Date | null | undefined): string | n
   if (!value) return null;
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) return null;
-  return date.toLocaleString(undefined, {
+  return displayDateTimeString(date, undefined, {
     month: "short",
     day: "numeric",
     hour: "numeric",

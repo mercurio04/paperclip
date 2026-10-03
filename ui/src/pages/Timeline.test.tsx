@@ -143,6 +143,18 @@ describe("Timeline", () => {
     vi.clearAllMocks();
   });
 
+  it("queries the same Argentina calendar day shown in its filters", async () => {
+    root = createRoot(container);
+    flushSync(() => root?.render(<QueryClientProvider client={queryClient}><Timeline /></QueryClientProvider>));
+    await flushReact();
+    const dates = Array.from(container.querySelectorAll<HTMLInputElement>('input[type="date"]'));
+    expect(dates).toHaveLength(2);
+    expect(mockWorkTimelineApi.get).toHaveBeenCalledWith("company-1", expect.objectContaining({
+      from: `${dates[0]!.value}T03:00:00.000Z`,
+      to: new Date(Date.parse(`${dates[1]!.value}T03:00:00Z`) + 86_400_000 - 1).toISOString(),
+    }), expect.anything());
+  });
+
   it("requests the collapsed app sidebar by default", async () => {
     root = createRoot(container);
 

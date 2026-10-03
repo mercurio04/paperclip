@@ -1,3 +1,4 @@
+import { displayCalendarOrdinal } from "./display-time";
 export type TaskDateGroup = "today" | "yesterday" | "earlier";
 
 export const taskDateGroupLabels: Record<TaskDateGroup, string> = {
@@ -7,10 +8,10 @@ export const taskDateGroupLabels: Record<TaskDateGroup, string> = {
 };
 
 function localCalendarOrdinal(date: Date): number {
-  return Date.UTC(date.getFullYear(), date.getMonth(), date.getDate());
+  return displayCalendarOrdinal(date);
 }
 
-/** Groups timestamps by the operator's local calendar, including across DST. */
+/** Groups timestamps by the Argentina display calendar, including across DST. */
 export function taskDateGroup(value: Date | string | number, now: Date = new Date()): TaskDateGroup {
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) return "earlier";

@@ -1,3 +1,4 @@
+import { displayDateString } from "@/lib/display-time";
 import { useMemo } from "react";
 import type { CostByProviderModel, CostWindowSpendRow, QuotaWindow } from "@paperclipai/shared";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
@@ -367,7 +368,7 @@ export function ProviderQuotaCard({
                             </p>
                           ) : qw.resetsAt ? (
                             <p className="text-xs text-muted-foreground">
-                              resets {new Date(qw.resetsAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+                              resets {displayDateString(qw.resetsAt, undefined, { month: "short", day: "numeric" })}
                             </p>
                           ) : null}
                         </div>

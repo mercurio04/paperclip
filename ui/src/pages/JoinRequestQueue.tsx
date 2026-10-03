@@ -1,3 +1,4 @@
+import { displayDateTimeString } from "@/lib/display-time";
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { UserPlus2 } from "lucide-react";
@@ -181,7 +182,7 @@ export function JoinRequestQueue() {
                 </div>
                 <div className="rounded-lg border border-border bg-background px-3 py-2">
                   <div className="text-xs font-medium uppercase tracking-wide">Request details</div>
-                  <div className="mt-2">Submitted {new Date(request.createdAt).toLocaleString()}</div>
+                  <div className="mt-2">Submitted {displayDateTimeString(request.createdAt)}</div>
                   <div>Source IP {request.requestIp}</div>
                   {request.requestType === "agent" && request.capabilities ? <div>{request.capabilities}</div> : null}
                 </div>
