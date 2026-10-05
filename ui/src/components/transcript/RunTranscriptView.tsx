@@ -705,7 +705,7 @@ export function normalizeTranscript(entries: TranscriptEntry[], streaming: boole
         text: entry.text.trim() || entry.errors[0] || (entry.isError ? "Run failed" : "Completed"),
         detail:
           !entry.isError && entry.text.trim().length > 0
-            ? `${formatTokens(entry.inputTokens)} / ${formatTokens(entry.outputTokens)} / $${entry.costUsd.toFixed(6)}`
+            ? resultUsageDetail(entry)
             : undefined,
       });
       continue;
@@ -1736,6 +1736,14 @@ function findScrollParent(element: HTMLElement): HTMLElement | Window {
   return window;
 }
 
+function resultUsageDetail(entry: Extract<TranscriptEntry, { kind: "result" }>): string {
+  if (entry.costBasis === "session_cumulative") {
+    const cost = entry.costStatus === "unpriced" ? "unknown" : `$${entry.costUsd.toFixed(6)}`;
+    return `Main-chain input ${formatTokens(entry.inputTokens)} / output ${formatTokens(entry.outputTokens)} / cached read ${formatTokens(entry.cachedTokens)} · session cumulative nominal cost ${cost}`;
+  }
+  return `${formatTokens(entry.inputTokens)} / ${formatTokens(entry.outputTokens)} / $${entry.costUsd.toFixed(6)}`;
+}
+
 function rawEntryContent(entry: TranscriptEntry): string {
   if (entry.kind === "provider_activity") {
     return `${entry.eventType}\n${entry.title}: ${entry.summary}`;
@@ -1747,7 +1755,7 @@ function rawEntryContent(entry: TranscriptEntry): string {
     return formatToolPayload(entry.content);
   }
   if (entry.kind === "result") {
-    return `${entry.text}\n${formatTokens(entry.inputTokens)} / ${formatTokens(entry.outputTokens)} / $${entry.costUsd.toFixed(6)}`;
+    return `${entry.text}\n${resultUsageDetail(entry)}`;
   }
   if (entry.kind === "init") {
     return `model=${entry.model}${entry.sessionId ? ` session=${entry.sessionId}` : ""}`;

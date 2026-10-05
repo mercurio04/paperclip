@@ -123,7 +123,7 @@ export function parseClaudeStdoutLine(line: string, ts: string): TranscriptEntry
 
   if (type === "result") {
     const usage = asRecord(parsed.usage) ?? {};
-    const inputTokens = asNumber(usage.input_tokens);
+    const inputTokens = asNumber(usage.input_tokens) + asNumber(usage.cache_creation_input_tokens);
     const outputTokens = asNumber(usage.output_tokens);
     const cachedTokens = asNumber(usage.cache_read_input_tokens);
     const costUsd = asNumber(parsed.total_cost_usd);
@@ -139,6 +139,12 @@ export function parseClaudeStdoutLine(line: string, ts: string): TranscriptEntry
       outputTokens,
       cachedTokens,
       costUsd,
+      // Raw transcript cost is the provider's session ledger, not the
+      // invocation delta recorded by heartbeat accounting.
+      costBasis: "session_cumulative",
+      costStatus: typeof parsed.total_cost_usd === "number"
+        && Number.isFinite(parsed.total_cost_usd) && parsed.total_cost_usd >= 0
+        ? "reported" : "unpriced",
       subtype,
       isError,
       errors,

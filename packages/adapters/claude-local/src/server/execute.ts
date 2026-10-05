@@ -1105,7 +1105,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       (() => {
         const usageObj = parseObject(parsed.usage);
         return {
-          inputTokens: asNumber(usageObj.input_tokens, 0),
+          inputTokens: asNumber(usageObj.input_tokens, 0) + asNumber(usageObj.cache_creation_input_tokens, 0),
           cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
           outputTokens: asNumber(usageObj.output_tokens, 0),
         };
@@ -1113,13 +1113,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const usageBasis = parsedStream.usage
       ? parsedStream.usageBasis
       : fallbackModelUsageTotals
-      ? ("per_run" as const)
+      ? ("session_cumulative" as const)
       : null;
 
     const rawResolvedSessionId =
       parsedStream.sessionId ??
       (asString(parsed.session_id, opts.fallbackSessionId ?? "") || opts.fallbackSessionId);
-    const clearSessionForMaxTurns = isClaudeMaxTurnsResult(parsed);
+    const maxTurnsExhausted = isClaudeMaxTurnsResult(parsed);
     const poisonedPreviousMessageId = isClaudePoisonedPreviousMessageIdError(parsed);
     // Fable 5 policy refusals exit cleanly (exitCode=0, is_error=false), so this
     // is intentionally independent of `failed` — otherwise a refusal looks like a
@@ -1160,7 +1160,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const providerQuota =
       failed &&
       !loginMeta.requiresLogin &&
-      !clearSessionForMaxTurns &&
+      !maxTurnsExhausted &&
       !poisonedPreviousMessageId &&
       isClaudeProviderQuotaError({
         parsed,
@@ -1171,7 +1171,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const transientUpstream =
       failed &&
       !loginMeta.requiresLogin &&
-      !clearSessionForMaxTurns &&
+      !maxTurnsExhausted &&
       !poisonedPreviousMessageId &&
       !providerQuota &&
       isClaudeTransientUpstreamError({
@@ -1202,7 +1202,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage,
       })
       ? "model_not_found"
-      : failed && clearSessionForMaxTurns
+      : failed && maxTurnsExhausted
       ? "max_turns_exhausted"
       : failed && poisonedPreviousMessageId
       ? "claude_poisoned_previous_message_id"
@@ -1222,7 +1222,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
-      ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
+      ...(failed && maxTurnsExhausted ? { stopReason: "max_turns_exhausted" } : {}),
       ...(failed && poisonedPreviousMessageId ? { stopReason: "claude_poisoned_previous_message_id" } : {}),
       ...(claudeRefusal ? { stopReason: "refusal", errorFamily: "model_refusal" } : {}),
       ...(errorFamily ? { errorFamily } : {}),
@@ -1254,7 +1254,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       resultJson: mergedResultJson,
       summary: parsedStream.summary || asString(parsed.result, ""),
       clearSession:
-        clearSessionForMaxTurns ||
+        // A turn limit ends this invocation, not its resumable CLI session.
         // Clear-on-error: a poisoned previous_message_id is a deterministic
         // state error. Force the server to drop persisted session state for
         // this issue so the next continuation starts from a clean slate.

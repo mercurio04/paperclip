@@ -33,7 +33,8 @@ const CLAUDE_EXTRA_USAGE_RESET_RE =
  * Sum the per-model usage ledger from a Claude CLI result event. The result
  * event's top-level `usage` reflects only the main-loop message chain, so it
  * undercounts output tokens whenever subagents or sidechains ran; `modelUsage`
- * is the CLI's authoritative per-model accounting (it is what backs /cost).
+ * is the CLI's per-model ledger (it is what backs /cost), which may include
+ * prior invocations after resume. It must not be attributed as a fresh run.
  * Cache-creation tokens are billed prompt tokens, so they count as input.
  */
 export function claudeModelUsageTotals(modelUsage: unknown): UsageSummary | null {
@@ -100,7 +101,7 @@ export function parseClaudeStreamJson(stdout: string) {
       model,
       costUsd: null as number | null,
       usage: null as UsageSummary | null,
-      usageBasis: null as "per_run" | null,
+      usageBasis: null as "per_run" | "session_cumulative" | null,
       summary: assistantTexts.join("\n\n").trim(),
       resultJson: null as Record<string, unknown> | null,
     };
@@ -109,7 +110,7 @@ export function parseClaudeStreamJson(stdout: string) {
   const modelUsageTotals = claudeModelUsageTotals(finalResult.modelUsage);
   const usageObj = parseObject(finalResult.usage);
   const usage: UsageSummary = modelUsageTotals ?? {
-    inputTokens: asNumber(usageObj.input_tokens, 0),
+    inputTokens: asNumber(usageObj.input_tokens, 0) + asNumber(usageObj.cache_creation_input_tokens, 0),
     cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
     outputTokens: asNumber(usageObj.output_tokens, 0),
   };
@@ -122,9 +123,9 @@ export function parseClaudeStreamJson(stdout: string) {
     model,
     costUsd,
     usage,
-    // modelUsage covers exactly this CLI invocation, so mark it per-run to
-    // keep the server from applying its session-cumulative delta heuristic.
-    usageBasis: "per_run" as const,
+    // modelUsage and total_cost_usd can carry the resumed session ledger.
+    // Keep raw totals; the server resolves them against the previous result.
+    usageBasis: modelUsageTotals ? "session_cumulative" as const : "per_run" as const,
     summary,
     resultJson: finalResult,
   };

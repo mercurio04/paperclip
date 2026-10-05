@@ -172,22 +172,43 @@ function coerceBillingType(value: unknown): BillingType | null {
   return null;
 }
 
-function readRunCostUsd(payload: Record<string, unknown> | null): number {
-  if (!payload) return 0;
+function readRunCostUsd(payload: Record<string, unknown> | null): number | null {
+  if (!payload) return null;
   for (const key of ["costUsd", "cost_usd", "total_cost_usd"] as const) {
     const value = payload[key];
     if (typeof value === "number" && Number.isFinite(value)) return value;
   }
-  return 0;
+  return null;
 }
 
 export function visibleRunCostUsd(
   usage: Record<string, unknown> | null,
   result: Record<string, unknown> | null = null,
-): number {
+): number | null {
   const billingType = coerceBillingType(usage?.billingType) ?? coerceBillingType(result?.billingType);
+  if (typeof usage?.accountingSource === "string" && usage.accountingSource.startsWith("claude_")) {
+    // The normalized invocation is authoritative, including zero and unknown.
+    // resultJson is retained for audit and can contain the entire session cost.
+    if (usage.costStatus === "unpriced") return null;
+    if (billingType === "subscription_included") return 0;
+    const cost = readRunCostUsd(usage);
+    return cost != null && cost >= 0 ? cost : null;
+  }
   if (billingType === "subscription_included") return 0;
-  return readRunCostUsd(usage) || readRunCostUsd(result);
+  // Older CLI resumes predate invocation accounting. Without a baseline here,
+  // the raw session total is not a trustworthy price for this invocation.
+  if (usage?.provider === "anthropic" && usage.sessionReused === true
+    && typeof result?.total_cost_usd === "number") return null;
+  return readRunCostUsd(usage) || readRunCostUsd(result) || 0;
+}
+
+export function formatRunCost(cost: number | null, precision = 4): string {
+  return cost === null ? "Unknown" : cost > 0 ? `$${cost.toFixed(precision)}` : "-";
+}
+
+export function formatRunCostSummary(knownCost: number, hasUnknownCost: boolean): string {
+  if (hasUnknownCost) return knownCost > 0 ? `Cost unknown (known $${knownCost.toFixed(4)})` : "Cost unknown";
+  return `$${knownCost.toFixed(4)}`;
 }
 
 export function financeEventKindDisplayName(eventKind: FinanceEventKind): string {

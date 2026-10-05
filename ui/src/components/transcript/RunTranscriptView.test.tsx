@@ -3,12 +3,43 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { parseAcpxStdoutLine } from "@paperclipai/adapter-utils/acpx-engine/ui";
+import { parseClaudeStdoutLine } from "../../../../packages/adapters/claude-local/src/ui/parse-stdout";
 import { buildTranscript, type RunLogChunk, type TranscriptEntry } from "../../adapters";
 import type { ToolRunDecision } from "@paperclipai/shared";
 import { ThemeProvider } from "../../context/ThemeContext";
 import { RunTranscriptView, keyTranscriptBlocks, normalizeTranscript } from "./RunTranscriptView";
 
 describe("RunTranscriptView", () => {
+  it.each(["reported", "zero", "unpriced"])("labels Claude transcript metrics without treating cumulative cost as invocation cost: %s", (status) => {
+    const raw = { type: "result", result: "Completed", usage: {
+      input_tokens: 6, cache_creation_input_tokens: 7163,
+      output_tokens: 857, cache_read_input_tokens: 411903,
+    }, ...(status === "unpriced" ? {} : { total_cost_usd: status === "zero" ? 0 : 2.9037956 }) };
+    const entries = parseClaudeStdoutLine(JSON.stringify(raw), "2026-10-05T00:00:00.000Z");
+    expect(entries[0]).toMatchObject({ kind: "result", inputTokens: 7169,
+      outputTokens: 857, cachedTokens: 411903, costBasis: "session_cumulative",
+      costStatus: status === "unpriced" ? "unpriced" : "reported" });
+    const blocks = normalizeTranscript(entries, false);
+    expect(blocks[0]).toMatchObject({ type: "event", label: "result" });
+    const expectedCost = status === "unpriced" ? "unknown" : status === "zero" ? "$0.000000" : "$2.903796";
+    expect(blocks[0]).toHaveProperty("detail", expect.stringContaining(`session cumulative nominal cost ${expectedCost}`));
+    expect(blocks[0]).toHaveProperty("detail", expect.stringContaining("cached read"));
+    // Both nice and raw displays must identify the same provider scope.
+    for (const mode of ["nice", "raw"] as const) {
+      const html = renderToStaticMarkup(<ThemeProvider><RunTranscriptView entries={entries} mode={mode} /></ThemeProvider>);
+      expect(html).toContain(`session cumulative nominal cost ${expectedCost}`);
+      expect(html).toContain("Main-chain input");
+    }
+    expect(raw.usage.input_tokens).toBe(6);
+  });
+
+  it("preserves the cost display contract of other transcript providers", () => {
+    const entry: TranscriptEntry = { kind: "result", ts: "", text: "Completed",
+      inputTokens: 10, outputTokens: 20, cachedTokens: 0, costUsd: 0.125,
+      subtype: "success", isError: false, errors: [] };
+    expect(normalizeTranscript([entry], false)[0]).toHaveProperty("detail", "10 / 20 / $0.125000");
+  });
+
   it("renders provider activity semantically without dumping the payload", () => {
     const html = renderToStaticMarkup(<RunTranscriptView entries={[{ kind: "provider_activity", ts: "2026-08-21T12:00:00.000Z", family: "plan", eventType: "plan.updated", status: "completed", title: "Plan", summary: "Plan completed", payload: { steps: [{ stepId: "s1", body: "Validate schemas", status: "completed" }], hiddenSecret: "must-not-render" } }]} />);
     expect(html).toContain("Plan");

@@ -1,3 +1,4 @@
+import { isClaudeCliAccountingResult, resolveClaudeInvocationAccounting } from "./claude-invocation-accounting.js";
 import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
@@ -10988,6 +10989,10 @@ export function heartbeatService(
       .select({
         id: heartbeatRuns.id,
         usageJson: heartbeatRuns.usageJson,
+        resultJson: sql<Record<string, unknown> | null>`jsonb_build_object(
+          'modelUsage', ${heartbeatRuns.resultJson} -> 'modelUsage',
+          'total_cost_usd', ${heartbeatRuns.resultJson} -> 'total_cost_usd'
+        )`,
       })
       .from(heartbeatRuns)
       .where(and(...conditions))
@@ -11847,13 +11852,21 @@ export function heartbeatService(
     sessionId: string | null;
     rawUsage: UsageTotals | null;
     usageBasis?: "per_run" | "session_cumulative" | null;
+    claudeResult?: AdapterExecutionResult;
+    sessionReused?: boolean;
   }) {
     const { agentId, runId, sessionId, rawUsage, usageBasis } = input;
+    if (input.claudeResult) {
+      const previous = sessionId ? await getLatestRunForSession(agentId, sessionId, { excludeRunId: runId }) : null;
+      return { ...resolveClaudeInvocationAccounting(input.claudeResult, previous?.resultJson, Boolean(input.sessionReused)), previousRawUsage: readRawUsageTotals(previous?.usageJson) };
+    }
     // Adapters that declare per-run usage (e.g. the ACPX lane reports each
     // turn's tokens, not session totals) must not be session-delta'd, or
     // consecutive runs would be undercounted.
     if (!sessionId || !rawUsage || usageBasis === "per_run") {
       return {
+        accountedCostUsd: undefined as number | null | undefined,
+        accountingSource: undefined as string | undefined,
         normalizedUsage: rawUsage,
         previousRawUsage: null as UsageTotals | null,
         derivedFromSessionTotals: false,
@@ -11865,6 +11878,8 @@ export function heartbeatService(
     });
     const previousRawUsage = readRawUsageTotals(previousRun?.usageJson);
     return {
+      accountedCostUsd: undefined as number | null | undefined,
+      accountingSource: undefined as string | undefined,
       normalizedUsage: deriveNormalizedUsageDelta(rawUsage, previousRawUsage),
       previousRawUsage,
       derivedFromSessionTotals: previousRawUsage !== null,
@@ -24327,8 +24342,16 @@ export function heartbeatService(
             nextSessionState.displayId ?? nextSessionState.legacySessionId,
           rawUsage,
           usageBasis: adapterResult.usageBasis ?? null,
+          ...(agent.adapterType === "claude_local" && isClaudeCliAccountingResult(adapterResult) ? { claudeResult: adapterResult, sessionReused: Boolean(
+            (runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId) &&
+            (nextSessionState.displayId ?? nextSessionState.legacySessionId) ===
+              (runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId)
+          ) } : {}),
         });
         const normalizedUsage = sessionUsageResolution.normalizedUsage;
+        const accountedAdapterResult = sessionUsageResolution.accountedCostUsd !== undefined
+          ? { ...adapterResult, costUsd: sessionUsageResolution.accountedCostUsd, cacheAdjustedCostUsd: null, usage: normalizedUsage ?? undefined }
+          : adapterResult;
         const runErrorMessage =
           outcome === "cancelled"
             ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
@@ -24387,10 +24410,11 @@ export function heartbeatService(
                 ? "timed_out"
                 : "failed";
 
-        const cacheAdjustedCostUsd = resolveCacheAdjustedCostUsd(adapterResult);
+        const cacheAdjustedCostUsd = resolveCacheAdjustedCostUsd(accountedAdapterResult);
         const usageJson =
           normalizedUsage ||
-          adapterResult.costUsd != null ||
+          sessionUsageResolution.accountingSource ||
+          accountedAdapterResult.costUsd != null ||
           cacheAdjustedCostUsd != null
             ? ({
                 ...(normalizedUsage ?? {}),
@@ -24401,6 +24425,7 @@ export function heartbeatService(
                       rawOutputTokens: rawUsage.outputTokens,
                     }
                   : {}),
+                ...(sessionUsageResolution.accountingSource ? { accountingSource: sessionUsageResolution.accountingSource, rawCostUsd: adapterResult.costUsd ?? null } : {}),
                 ...(sessionUsageResolution.derivedFromSessionTotals
                   ? { usageSource: "session_delta" }
                   : adapterResult.usageBasis === "per_run"
@@ -24428,13 +24453,15 @@ export function heartbeatService(
                   readNonEmptyString(adapterResult.provider) ?? "unknown",
                 biller: resolveLedgerBiller(adapterResult),
                 model: readNonEmptyString(adapterResult.model) ?? "unknown",
-                ...(adapterResult.costUsd != null
-                  ? { costUsd: adapterResult.costUsd }
+                ...(accountedAdapterResult.costUsd != null
+                  ? { costUsd: accountedAdapterResult.costUsd }
                   : {}),
                 ...(cacheAdjustedCostUsd != null
                   ? { cacheAdjustedCostUsd }
                   : {}),
-                costStatus: resolveLedgerCostStatus({
+                costStatus: sessionUsageResolution.accountingSource && cacheAdjustedCostUsd == null
+                  ? "unpriced"
+                  : resolveLedgerCostStatus({
                   costUsd: cacheAdjustedCostUsd,
                   inputTokens: normalizedUsage?.inputTokens ?? 0,
                   cachedInputTokens: normalizedUsage?.cachedInputTokens ?? 0,
@@ -24851,7 +24878,7 @@ export function heartbeatService(
           await updateRuntimeState(
             agent,
             finalizedRun,
-            adapterResult,
+            accountedAdapterResult,
             {
               legacySessionId: nextSessionState.legacySessionId,
             },

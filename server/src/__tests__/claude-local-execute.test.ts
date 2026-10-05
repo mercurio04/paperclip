@@ -637,7 +637,7 @@ describe("claude execute", () => {
     }
   });
 
-  it("normalizes max-turn exhaustion into scheduler stop metadata", async () => {
+  it("preserves a valid session at the turn limit while retaining scheduler stop metadata", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-max-turns-"));
     const resultEvent = {
       type: "result",
@@ -671,7 +671,9 @@ describe("claude execute", () => {
       expect(result.errorCode).toBe("max_turns_exhausted");
       expect(result.errorFamily).toBeNull();
       expect(result.resultJson).toMatchObject({ stopReason: "max_turns_exhausted" });
-      expect(result.clearSession).toBe(true);
+      expect(result.clearSession).toBe(false);
+      expect(result.sessionId).toBe(resultEvent.session_id);
+      expect(result.sessionParams).toMatchObject({ sessionId: resultEvent.session_id, cwd: workspace });
     } finally {
       restore();
       await fs.rm(root, { recursive: true, force: true });
