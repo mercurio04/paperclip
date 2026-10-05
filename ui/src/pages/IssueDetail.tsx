@@ -2691,7 +2691,7 @@ export function IssueDetailActivityTab({
               {hasIssueTreeCost && issueTreeCostSummary ? (
                 <div className="flex flex-wrap gap-3">
                   <span className="font-medium text-foreground">
-                    Including sub-tasks{" "}
+                    Recorded charges including sub-tasks{" "}
                     {(issueTreeCostSummary.costCents / 100).toLocaleString(
                       undefined,
                       {
@@ -2702,6 +2702,7 @@ export function IssueDetailActivityTab({
                       },
                     )}
                   </span>
+                  <span>Unpriced runs are excluded from recorded charges.</span>
                   <span>
                     Tokens {formatTokens(issueTreeCostTokens)}
                     {issueTreeCostSummary.cachedInputTokens > 0

@@ -1425,8 +1425,8 @@ describe("IssueDetail", () => {
 
   it.each(["zero", "unknown", "unknown_empty", "delta"])("uses the normalized Claude cost in task activity: %s", async (mode) => {
     mockIssuesApi.get.mockResolvedValue(createIssue());
-    mockIssuesApi.getCostSummary.mockResolvedValue({ issueId: "issue-1", issueCount: 1,
-      costCents: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, runCount: 0, runtimeMs: 0 });
+    mockIssuesApi.getCostSummary.mockResolvedValue({ issueId: "issue-1", issueCount: 2,
+      costCents: 50, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, runCount: 0, runtimeMs: 0 });
     const usage = { accountingSource: "claude_session_delta", billingType: "metered_api",
       provider: "anthropic", inputTokens: mode === "unknown_empty" ? 0 : 10, outputTokens: mode === "unknown_empty" ? 0 : 20 };
     const run = (runId: string, costUsd: number | undefined, costStatus = "reported") => ({
@@ -1451,6 +1451,8 @@ describe("IssueDetail", () => {
       expect(container.textContent).not.toContain("No cost data yet.");
       expect(container.textContent).not.toContain("$16.5335");
       expect(container.textContent).not.toContain("$33.0671");
+      expect(container.textContent).toContain("Recorded charges including sub-tasks $0.5000");
+      expect(container.textContent).toContain("Unpriced runs are excluded from recorded charges.");
     });
   });
 
