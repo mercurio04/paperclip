@@ -1105,7 +1105,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       (() => {
         const usageObj = parseObject(parsed.usage);
         return {
-          inputTokens: asNumber(usageObj.input_tokens, 0),
+          inputTokens: asNumber(usageObj.input_tokens, 0) + asNumber(usageObj.cache_creation_input_tokens, 0),
           cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
           outputTokens: asNumber(usageObj.output_tokens, 0),
         };
@@ -1113,7 +1113,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const usageBasis = parsedStream.usage
       ? parsedStream.usageBasis
       : fallbackModelUsageTotals
-      ? ("per_run" as const)
+      ? ("session_cumulative" as const)
       : null;
 
     const rawResolvedSessionId =

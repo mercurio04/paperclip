@@ -535,7 +535,7 @@ describe("parseClaudeStreamJson usage extraction", () => {
       ...extra,
     });
 
-  it("prefers modelUsage totals over the main-loop usage block and marks them per-run", () => {
+  it("keeps modelUsage raw totals and marks the resumed ledger cumulative", () => {
     const parsed = parseClaudeStreamJson(
       `${resultEvent({
         modelUsage: {
@@ -553,7 +553,7 @@ describe("parseClaudeStreamJson usage extraction", () => {
       outputTokens: 77_000,
       cachedInputTokens: 300_000,
     });
-    expect(parsed.usageBasis).toBe("per_run");
+    expect(parsed.usageBasis).toBe("session_cumulative");
     expect(parsed.costUsd).toBeCloseTo(1.25);
   });
 
@@ -566,4 +566,12 @@ describe("parseClaudeStreamJson usage extraction", () => {
     });
     expect(parsed.usageBasis).toBe("per_run");
   });
+});
+
+
+it("counts invocation cache creation when the Claude model ledger is absent", () => {
+  const parsed = parseClaudeStreamJson(JSON.stringify({ type: "result", usage: {
+    input_tokens: 3, cache_creation_input_tokens: 20, cache_read_input_tokens: 100, output_tokens: 5 } }));
+  expect(parsed.usage).toEqual({inputTokens:23,cachedInputTokens:100,outputTokens:5});
+  expect(parsed.usageBasis).toBe("per_run");
 });
