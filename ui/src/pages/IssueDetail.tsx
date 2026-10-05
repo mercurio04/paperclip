@@ -166,6 +166,7 @@ import {
   formatDurationMs,
   formatTokens,
   visibleRunCostUsd,
+  formatRunCostSummary,
 } from "../lib/utils";
 import { liveBlueBadge } from "../lib/status-colors";
 import { ApprovalCard } from "../components/ApprovalCard";
@@ -2499,7 +2500,7 @@ type IssueDetailActivityTabProps = {
   externalReferences?: MarkdownExternalReferenceMap;
 };
 
-function IssueDetailActivityTab({
+export function IssueDetailActivityTab({
   issue,
   issueId,
   companyId,
@@ -2572,6 +2573,7 @@ function IssueDetailActivityTab({
     let runtimeMs = 0;
     let runCount = 0;
     let hasCost = false;
+    let hasUnknownCost = false;
     let hasTokens = false;
     const nowMs = Date.now();
 
@@ -2587,12 +2589,13 @@ function IssueDetailActivityTab({
         "cache_read_input_tokens",
       );
       const runCost = visibleRunCostUsd(usage, result);
-      if (runCost > 0) hasCost = true;
+      if (runCost === null) hasUnknownCost = true;
+      else if (runCost > 0) hasCost = true;
       if (runInput + runOutput + runCached > 0) hasTokens = true;
       input += runInput;
       output += runOutput;
       cached += runCached;
-      cost += runCost;
+      if (runCost !== null) cost += runCost;
 
       if (run.startedAt) {
         const startMs = new Date(run.startedAt).getTime();
@@ -2617,6 +2620,7 @@ function IssueDetailActivityTab({
       cost,
       totalTokens: input + output,
       hasCost,
+      hasUnknownCost,
       hasTokens,
       runtimeMs,
       runCount,
@@ -2649,6 +2653,7 @@ function IssueDetailActivityTab({
           </div>
           {!issueCostSummary.hasCost &&
           !issueCostSummary.hasTokens &&
+          !issueCostSummary.hasUnknownCost &&
           !hasIssueTreeCost ? (
             <div className="text-xs text-muted-foreground">
               No cost data yet.
@@ -2657,9 +2662,9 @@ function IssueDetailActivityTab({
             <div className="space-y-1 text-xs text-muted-foreground tabular-nums">
               <div className="flex flex-wrap gap-3">
                 <span className="font-medium text-foreground">This task</span>
-                {issueCostSummary.hasCost ? (
+                {issueCostSummary.hasCost || issueCostSummary.hasUnknownCost ? (
                   <span className="font-medium text-foreground">
-                    ${issueCostSummary.cost.toFixed(4)}
+                    {formatRunCostSummary(issueCostSummary.cost, issueCostSummary.hasUnknownCost)}
                   </span>
                 ) : null}
                 {issueCostSummary.hasTokens ? (
@@ -2678,6 +2683,7 @@ function IssueDetailActivityTab({
                 ) : null}
                 {!issueCostSummary.hasCost &&
                 !issueCostSummary.hasTokens &&
+                !issueCostSummary.hasUnknownCost &&
                 !issueCostSummary.hasRuntime ? (
                   <span>No direct cost data.</span>
                 ) : null}

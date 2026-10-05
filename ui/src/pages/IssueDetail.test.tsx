@@ -30,6 +30,7 @@ import {
   canBoardManageRuntime,
   canBoardResolveRecoveryAction,
   IssueDetail,
+  IssueDetailActivityTab,
   TaskDetailSurface,
   readRecoveryReconcileWorkspaceId,
   shouldScrollIssueDetailToTopOnNavigation,
@@ -76,6 +77,7 @@ const mockIssuesApi = vi.hoisted(() => ({
   deleteAttachment: vi.fn(),
   upsertDocument: vi.fn(),
   getDocument: vi.fn(),
+  getCostSummary: vi.fn(),
   rejectInteraction: vi.fn(),
 }));
 
@@ -1419,6 +1421,37 @@ describe("IssueDetail", () => {
     localStorage.clear();
     sessionStorage.clear();
     vi.restoreAllMocks();
+  });
+
+  it.each(["zero", "unknown", "unknown_empty", "delta"])("uses the normalized Claude cost in task activity: %s", async (mode) => {
+    mockIssuesApi.get.mockResolvedValue(createIssue());
+    mockIssuesApi.getCostSummary.mockResolvedValue({ issueId: "issue-1", issueCount: 1,
+      costCents: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, runCount: 0, runtimeMs: 0 });
+    const usage = { accountingSource: "claude_session_delta", billingType: "metered_api",
+      provider: "anthropic", inputTokens: mode === "unknown_empty" ? 0 : 10, outputTokens: mode === "unknown_empty" ? 0 : 20 };
+    const run = (runId: string, costUsd: number | undefined, costStatus = "reported") => ({
+      runId, agentId: "agent-1", status: "succeeded", adapterType: "claude_local",
+      contextIssueId: "issue-1", createdAt: "2026-10-05T00:00:00.000Z", logBytes: 0,
+      usageJson: { ...usage, costUsd, costStatus }, resultJson: { total_cost_usd: 16.533545 },
+    });
+    mockActivityApi.runsForIssue.mockResolvedValue([
+      ...(mode === "unknown_empty" ? [] : [run("first", 0.5)]),
+      run("resume", mode.startsWith("unknown") ? undefined : mode === "zero" ? 0 : 0.1568486,
+        mode.startsWith("unknown") ? "unpriced" : "reported")]);
+    const issue = createIssue();
+    await act(async () => root.render(<QueryClientProvider client={queryClient}>
+      <IssueDetailActivityTab issue={issue} issueId={issue.id} companyId={issue.companyId} issueStatus={issue.status}
+        childIssues={[]} agentMap={new Map()} hasLiveRuns={false} currentUserId={null}
+        userProfileMap={new Map()} pendingApprovalAction={null} onApprovalAction={() => {}} />
+    </QueryClientProvider>));
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Cost Summary");
+      expect(container.textContent).toContain(mode === "unknown" ? "Cost unknown (known $0.5000)"
+        : mode === "unknown_empty" ? "Cost unknown" : mode === "zero" ? "$0.5000" : "$0.6568");
+      expect(container.textContent).not.toContain("No cost data yet.");
+      expect(container.textContent).not.toContain("$16.5335");
+      expect(container.textContent).not.toContain("$33.0671");
+    });
   });
 
   it("keeps an existing conversation on its agent-addressed route", async () => {
