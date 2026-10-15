@@ -900,6 +900,111 @@ describe("agent live run routes", () => {
     expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(routeAgentId, expect.objectContaining({ manualUserWake: true }));
   });
 
+  describe("manual-only human task binding (TAX-452 H6)", () => {
+    const boundIssueId = "55555555-5555-4555-8555-555555555555";
+    const manualOnlyAgent = {
+      id: routeAgentId,
+      companyId: "company-1",
+      name: "Bombero",
+      adapterType: "paperclip_runner",
+      status: "idle",
+      permissions: {
+        invocationPolicy: { mode: "manual_only" },
+        authorizationPolicy: { protectedAgent: { blockAssignment: true } },
+      },
+    };
+    const openIssue = {
+      id: boundIssueId,
+      companyId: "company-1",
+      projectId: null,
+      parentId: null,
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      conversationAgentId: null,
+      status: "todo",
+    };
+    beforeEach(() => {
+      mockAgentService.getById.mockResolvedValue(manualOnlyAgent);
+      mockIssueService.getById.mockResolvedValue(openIssue);
+      mockHeartbeatService.wakeup.mockResolvedValue({ id: "run-manual", status: "queued" });
+    });
+
+    it.each(["wakeup", "heartbeat/invoke"])("binds an accessible task to a board %s without assigning it", async (endpoint) => {
+      const res = await requestApp(await createApp(), (url) =>
+        request(url).post(`/api/agents/${routeAgentId}/${endpoint}`).send({ payload: { issueId: boundIssueId } }));
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "issue:comment",
+        resource: expect.objectContaining({ issueId: boundIssueId, companyId: "company-1" }),
+      }));
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(routeAgentId, expect.objectContaining({
+        manualUserWake: true,
+        requestedByActorType: "user",
+        requestedByActorId: "local-board",
+        payload: expect.objectContaining({ issueId: boundIssueId, taskId: boundIssueId }),
+      }));
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "heartbeat.invoked",
+        actorType: "user",
+        details: expect.objectContaining({ manualInvocation: { userId: "local-board", issueId: boundIssueId } }),
+      }));
+    });
+
+    it("denies a task from another company as not found", async () => {
+      mockIssueService.getById.mockResolvedValue({ ...openIssue, companyId: "company-2" });
+      const res = await requestApp(await createApp(), (url) =>
+        request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({ payload: { issueId: boundIssueId } }));
+      expect(res.status).toBe(404);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("denies a task the human cannot act on", async () => {
+      mockAccessService.decide.mockImplementation(async ({ action }) => ({
+        allowed: action !== "issue:comment", explanation: "Missing issue access",
+      }));
+      const res = await requestApp(await createApp(undefined, {
+        type: "board", userId: "operator", source: "session", companyIds: ["company-1"],
+      }), (url) => request(url).post(`/api/agents/${routeAgentId}/heartbeat/invoke`).send({ payload: { issueId: boundIssueId } }));
+      expect(res.status).toBe(403);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { label: "mismatched issueId/taskId", payload: { issueId: boundIssueId, taskId: "66666666-6666-4666-8666-666666666666" }, status: 400 },
+      { label: "a closed task", payload: { issueId: boundIssueId }, issue: { status: "done" }, status: 409 },
+      { label: "a chat conversation", payload: { issueId: boundIssueId }, issue: { conversationAgentId: routeAgentId }, status: 409 },
+      { label: "a task another agent owns", payload: { issueId: boundIssueId }, issue: { assigneeAgentId: "77777777-7777-4777-8777-777777777777" }, status: 409 },
+    ])("rejects $label", async ({ payload, issue, status }) => {
+      if (issue) mockIssueService.getById.mockResolvedValue({ ...openIssue, ...issue });
+      const res = await requestApp(await createApp(), (url) =>
+        request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({ payload }));
+      expect(res.status, JSON.stringify(res.body)).toBe(status);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("leaves an agent actor's self-wake unbound (the manual-only gate skips it)", async () => {
+      const res = await requestApp(await createApp(undefined, {
+        type: "agent", agentId: routeAgentId, companyId: "company-1", source: "agent_key",
+      }), (url) => request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({ payload: { issueId: boundIssueId } }));
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockIssueService.getById).not.toHaveBeenCalled();
+      const [, opts] = mockHeartbeatService.wakeup.mock.calls[0]!;
+      expect(opts.manualUserWake).toBeUndefined();
+      expect(opts.requestedByActorType).toBe("agent");
+    });
+
+    it("does not touch task binding for a regular agent (regression)", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...manualOnlyAgent, permissions: {} });
+      const res = await requestApp(await createApp(), (url) =>
+        request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({ payload: { issueId: boundIssueId } }));
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockIssueService.getById).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(routeAgentId, expect.objectContaining({
+        payload: { issueId: boundIssueId },
+      }));
+    });
+  });
+
   describe("exact failed chat run retry", () => {
     const retryBody = {
       failedRunId: failedChatRunId,

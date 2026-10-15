@@ -77,6 +77,7 @@ import {
   or,
   sql,
 } from "drizzle-orm";
+import { manualOnlyHumanBindingSql } from "./manual-invocation-binding.js";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -17641,8 +17642,18 @@ export function heartbeatService(
             eq(issues.id, claimedIssueId),
             eq(issues.companyId, claimed.companyId),
             // Mention/context runs can touch an issue, but only the current assignee
-            // owns the issue execution lock shown as the active run.
-            eq(issues.assigneeAgentId, claimed.agentId),
+            // owns the issue execution lock shown as the active run. A human
+            // invocation of a manual-only agent bound to an unowned task owns it
+            // too (TAX-452 H6).
+            or(
+              eq(issues.assigneeAgentId, claimed.agentId),
+              manualOnlyHumanBindingSql({
+                runId: claimed.id,
+                agentId: claimed.agentId,
+                issueId: claimedIssueId,
+                issueAssigneeAgentId: issues.assigneeAgentId,
+              }),
+            ),
             claimed.scheduledRetryReason === "native_safe_replacement"
               ? or(
                   isNull(issues.checkoutRunId),
@@ -26183,6 +26194,31 @@ export function heartbeatService(
         error: "This agent only runs from an explicit human invocation.",
       });
       return null;
+    }
+    // A manual-only agent is never an assignee: the human invocation itself
+    // binds the task it runs in (TAX-452 H6). Only a live task of the agent's
+    // own company can be bound; the route already checked the user's access.
+    if (manualOnlyAgent && issueId) {
+      const [boundIssue] = await db
+        .select({ id: issues.id, status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
+        .limit(1);
+      if (
+        !boundIssue ||
+        boundIssue.status === "done" ||
+        boundIssue.status === "cancelled" ||
+        boundIssue.assigneeAgentId !== null
+      ) {
+        await writeSkippedRequest(MANUAL_ONLY_SKIP_REASON, {
+          error: "Manual invocation names a task outside this agent's company, a closed task, or a task an agent owns.",
+        });
+        return null;
+      }
+      enrichedContextSnapshot.manualInvocation = {
+        userId: opts.requestedByActorId ?? null,
+        issueId,
+      };
     }
 
     const budgetBlock = await budgets.getInvocationBlock(

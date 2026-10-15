@@ -14,7 +14,11 @@ const SERVER_PORT = 47200;
 const FIXTURE_PORT = 47301;
 const PG_PORT = 54329; // inside the private netns; cannot reach the host one
 const MODEL_ID = "e2e-fixture";
-const COUNTER = "e2e-counter.txt";
+// Counter: one marker file per allowed write inside the workspace. A file
+// write (OpenCode `write`, permission `edit`) stays valid under restricted_v1,
+// which denies bash/webfetch/task; distinct files avoid OpenCode's
+// read-before-overwrite guard on the second action.
+const COUNTER_PREFIX = "e2e-tick-";
 const API = `http://127.0.0.1:${SERVER_PORT}/api`;
 const HOME = join(OUT, "home");
 const PCHOME = join(OUT, "pchome");
@@ -47,9 +51,10 @@ function record(name, expected, observed, pass, extra = {}) {
 
 // ---------------------------------------------------------------- fixture
 // Deterministic OpenAI-compatible provider. Main-agent requests (with tools):
-// no tool result yet -> bash call #1; one non-rejected tool result -> bash
+// no tool result yet -> write call #1; one non-rejected tool result -> write
 // call #2; otherwise a final text. Requests without tools (titles) -> text.
-const BASH_COMMAND = `echo tick >> ${COUNTER}`;
+// Both writes target a relative path inside the run workspace.
+const WRITE_TOOL = "write";
 function fixtureDecision(body) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const tools = Array.isArray(body.tools) ? body.tools.map((t) => t?.function?.name) : [];
@@ -58,7 +63,7 @@ function fixtureDecision(body) {
   const lastText = typeof last?.content === "string" ? last.content : JSON.stringify(last?.content ?? "");
   const rejected = /reject|denied|not allowed|permission/i.test(lastText);
   let action;
-  if (!tools.includes("bash")) action = { kind: "text", text: "E2E fixture" };
+  if (!tools.includes(WRITE_TOOL)) action = { kind: "text", text: "E2E fixture" };
   else if (toolResults.length === 0) action = { kind: "tool", id: "call_e2e_1" };
   else if (toolResults.length === 1 && !rejected) action = { kind: "tool", id: "call_e2e_2" };
   else action = { kind: "text", text: "E2E fixture done." };
@@ -69,7 +74,7 @@ function fixtureDecision(body) {
     toolCount: tools.length,
     toolResults: toolResults.length,
     lastToolResultRejected: toolResults.length ? rejected : null,
-    action: action.kind === "tool" ? `bash:${action.id}` : "text",
+    action: action.kind === "tool" ? `${WRITE_TOOL}:${action.id}` : "text",
   });
   return action;
 }
@@ -101,7 +106,7 @@ const fixture = http.createServer((req, res) => {
     const action = fixtureDecision(body);
     const usage = { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 };
     const call = action.kind === "tool"
-      ? { index: 0, id: action.id, type: "function", function: { name: "bash", arguments: JSON.stringify({ command: BASH_COMMAND, description: "Append one line to the E2E counter file" }) } }
+      ? { index: 0, id: action.id, type: "function", function: { name: WRITE_TOOL, arguments: JSON.stringify({ filePath: `${COUNTER_PREFIX}${action.id}.txt`, content: "tick\n" }) } }
       : null;
     if (body.stream) {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
@@ -187,8 +192,11 @@ function pendingPermissions(events) {
   }
   return [...created.values()];
 }
+function counterFiles(cwd) {
+  try { return fs.readdirSync(cwd).filter((f) => f.startsWith(COUNTER_PREFIX)); } catch { return []; }
+}
 function counterValue(cwd) {
-  try { return fs.readFileSync(join(cwd, COUNTER), "utf8").split("\n").filter(Boolean).length; } catch { return 0; }
+  return counterFiles(cwd).length;
 }
 async function runFailure(runId) {
   const row = (await pgSql`select status, error_code, error from heartbeat_runs where id = ${runId}`)[0];
@@ -345,33 +353,38 @@ async function main() {
   record("inert.non_human_wakes_skipped", "after human resume: every agent-actor wake (timer/assignment/automation/on_demand/invoke) skipped with reason agent.manual_only and 0 runs",
     { http: wakeResults, rows: skipped, runs: runsBefore[0].n },
     skipped.length >= 5 && skipped.every((w) => w.status === "skipped" && w.reason === "agent.manual_only") && runsBefore[0].n === 0);
-  // Informational: a board-authored /wakeup is an authenticated human click
-  // (manualUserWake) whatever `source` label it carries.
-  const boardWake = await api("POST", `/agents/${agent.id}/wakeup`, { source: "automation" });
-  const boardRows = await pgSql`select source, status, reason, run_id from agent_wakeup_requests where agent_id = ${agent.id} and requested_by_actor_type = 'user' order by requested_at desc limit 1`;
-  const boardRun = boardRows[0]?.run_id ? await waitTerminal(boardRows[0].run_id, 60_000).catch((e) => e.message) : null;
-  const boardRunErr = boardRows[0]?.run_id ? (await pgSql`select error_code, error from heartbeat_runs where id = ${boardRows[0].run_id}`)[0] : null;
-  receipt.cases.push({ name: "info.inert_board_wake_without_task", informational: true, pass: true,
-    observed: { http: boardWake.status, row: boardRows[0], runStatus: boardRun, runError: boardRunErr },
-    note: "Board wake counts as human invocation; with no assignable task the native runner refuses (paperclip_runner_issue_ineligible). An inert agent cannot be assigned, so it cannot run natively today: design gap reported, not fixed here." });
-  log("INFO inert board wake", receipt.cases.at(-1).observed);
-
-  // Permission bridge: a second, non-inert runner agent with the same
-  // restricted_v1 OpenCode profile; runs start from issue assignment.
-  const runnerRes = await api("POST", `/companies/${company.id}/agents`, {
-    name: "Runner E2E", role: "engineer", adapterType: "paperclip_runner", adapterConfig,
-  });
-  if (runnerRes.status >= 400) throw new Error(`runner agent create ${runnerRes.status} ${runnerRes.text}`);
-  const runner = runnerRes.json;
-  receipt.ids.runnerAgentId = runner.id;
-  async function assignAndGetRun(title) {
-    const iss = await must("POST", `/companies/${company.id}/issues`, { title, status: "todo", assigneeAgentId: runner.id });
-    const run = await waitFor(async () => (await pgSql`select id, status from heartbeat_runs where agent_id = ${runner.id} and context_snapshot->>'issueId' = ${iss.id} order by created_at desc limit 1`)[0], `run for ${title}`, 60_000, 500);
+  // Human invocation after the gate (TAX-452 H6): the board names the task in
+  // the explicit manual wake. The SAME inert agent runs in that task context
+  // without ever becoming its assignee; assignment stays a hard 409.
+  const humanRuns = [];
+  async function invokeAndGetRun(title) {
+    const iss = await must("POST", `/companies/${company.id}/issues`, { title, status: "todo" });
+    const r = await api("POST", `/agents/${agent.id}/wakeup`, { source: "on_demand", reason: "e2e_human_invocation", payload: { issueId: iss.id } });
+    if (r.status !== 202 || !r.json?.id) throw new Error(`human invocation for ${title}: ${r.status} ${r.text}`);
+    const run = (await pgSql`select id, status, agent_id, context_snapshot->'manualInvocation' as manual_invocation from heartbeat_runs where id = ${r.json.id}`)[0];
+    const wake = (await pgSql`select requested_by_actor_type, requested_by_actor_id, payload->>'manualUserWake' as manual_user_wake, payload->>'issueId' as issue_id from agent_wakeup_requests where run_id = ${r.json.id}`)[0];
+    const activity = (await pgSql`select actor_type, actor_id, details->'manualInvocation' as manual_invocation from activity_log where run_id = ${r.json.id} and action = 'heartbeat.invoked'`)[0];
+    humanRuns.push({ title, http: r.status, issueId: iss.id, run, wake, activity });
     return { issue: iss, run };
   }
+  // Agent-actor wakes that name a task are still skipped (no run, no binding).
+  const issueProbe = await must("POST", `/companies/${company.id}/issues`, { title: "E2E agent self-wake probe", status: "todo" });
+  const selfBound = await api("POST", `/agents/${agent.id}/wakeup`, { source: "on_demand", payload: { issueId: issueProbe.id } }, agentAuth);
+  const selfBoundRuns = await pgSql`select count(*)::int as n from heartbeat_runs where agent_id = ${agent.id}`;
+  const selfBoundRow = (await pgSql`select status, reason from agent_wakeup_requests where agent_id = ${agent.id} and requested_by_actor_type = 'agent' order by requested_at desc limit 1`)[0];
+  record("inert.agent_task_bound_wake_skipped", "agent-actor wake naming a task: skipped agent.manual_only, 0 runs",
+    { http: selfBound.status, row: selfBoundRow, runs: selfBoundRuns[0].n },
+    selfBoundRow?.status === "skipped" && selfBoundRow?.reason === "agent.manual_only" && selfBoundRuns[0].n === 0);
+  // Another company's task cannot be bound by the human invocation.
+  const otherCompany = await must("POST", "/companies", { name: "E2E TAX-452 other" });
+  const foreignIssue = await must("POST", `/companies/${otherCompany.id}/issues`, { title: "E2E foreign task", status: "todo" });
+  const foreignWake = await api("POST", `/agents/${agent.id}/wakeup`, { source: "on_demand", payload: { issueId: foreignIssue.id } });
+  const foreignRuns = await pgSql`select count(*)::int as n from heartbeat_runs where agent_id = ${agent.id}`;
+  record("inert.cross_company_task_denied", "404 and 0 runs", { http: foreignWake.status, runs: foreignRuns[0].n },
+    foreignWake.status === 404 && foreignRuns[0].n === 0);
 
   // --------------------------------------------- run A: once, then re-ask
-  const { issue: issueA, run: runA } = await assignAndGetRun("E2E run A: once then reject");
+  const { issue: issueA, run: runA } = await invokeAndGetRun("E2E run A: once then reject");
   receipt.ids.issueA = issueA.id;
   receipt.ids.runA = runA.id;
   log("runA", runA.id, runA.status);
@@ -383,9 +396,9 @@ async function main() {
   const cwdA = reqA1.permission.cwd;
   receipt.ids.runA_request1 = reqA1.requestId;
   receipt.config.contractA1 = { ...reqA1.permission, metadata: Object.keys(reqA1.permission.metadata ?? {}), arguments: reqA1.permission.arguments };
-  record("contract.typed_permission", "permission.v1 with bash, restricted_v1/ask, decisions once|reject",
+  record("contract.typed_permission", "permission.v1 for a workspace file write (edit), restricted_v1/ask, decisions once|reject",
     { schema: reqA1.schema, permission: reqA1.permission.permission, policy: reqA1.permission.policy, decisions: reqA1.decisions, providerVersion: reqA1.permission.providerVersion },
-    reqA1.schema === "paperclip.runtime_request.permission.v1" && reqA1.permission.permission === "bash" && reqA1.permission.policy?.profile === "restricted_v1" && JSON.stringify(reqA1.decisions) === '["once","reject"]');
+    reqA1.schema === "paperclip.runtime_request.permission.v1" && ["edit", "write"].includes(reqA1.permission.permission) && reqA1.permission.targets?.every((t) => typeof t.resolvedPath !== "string" || t.resolvedPath.startsWith(reqA1.permission.cwd)) && reqA1.permission.policy?.profile === "restricted_v1" && JSON.stringify(reqA1.decisions) === '["once","reject"]');
   record("counter.before_once", 0, counterValue(cwdA), counterValue(cwdA) === 0);
 
   const resolvePath = (runId, requestId) => `/heartbeat-runs/${runId}/runtime-requests/${encodeURIComponent(requestId)}/resolve`;
@@ -397,8 +410,7 @@ async function main() {
   record("negative.always_400", "400", { status: always.status }, always.status === 400);
   const legacy = await api("POST", resolvePath(runA.id, reqA1.requestId), { resolution: { action: "accept_for_session" } });
   record("negative.accept_for_session_400", "400", { status: legacy.status }, legacy.status === 400);
-  const key = await must("POST", `/agents/${runner.id}/keys`, { name: "e2e-negative" });
-  const agentActor = await api("POST", resolvePath(runA.id, reqA1.requestId), { resolution: { action: "permission_decision", decision: "once", contractSha256: sha } }, { authorization: `Bearer ${key.token}` });
+  const agentActor = await api("POST", resolvePath(runA.id, reqA1.requestId), { resolution: { action: "permission_decision", decision: "once", contractSha256: sha } }, agentAuth);
   record("negative.agent_actor_403", "403 (board-only)", { status: agentActor.status, body: agentActor.text.slice(0, 160) }, agentActor.status === 403 || agentActor.status === 401);
   const unknownReq = await api("POST", resolvePath(runA.id, "per_e2e_unknown"), { resolution: { action: "permission_decision", decision: "once", contractSha256: sha } });
   record("negative.unknown_request_409", "409", { status: unknownReq.status }, unknownReq.status === 409);
@@ -430,8 +442,9 @@ async function main() {
   receipt.events.runA = summarizeEvents(eventsA);
 
   // ---------------------------------------------- run B: reject on first
-  if (fs.existsSync(join(cwdA, COUNTER))) fs.renameSync(join(cwdA, COUNTER), join(OUT, "counter-runA.txt"));
-  const { issue: issueB, run: runB } = await assignAndGetRun("E2E run B: reject");
+  fs.mkdirSync(join(OUT, "counter-runA"), { recursive: true });
+  for (const f of counterFiles(cwdA)) fs.renameSync(join(cwdA, f), join(OUT, "counter-runA", f));
+  const { issue: issueB, run: runB } = await invokeAndGetRun("E2E run B: reject");
   receipt.ids.issueB = issueB.id;
   receipt.ids.runB = runB.id;
   const reqB1 = await waitFor(async () => {
@@ -461,6 +474,25 @@ async function main() {
   record("durable.one_claim_per_request", "3 claims (A1 once, A2 reject, B1 reject), all delivered",
     claims.map((c) => `${c.request_id.slice(-8)}:${c.decision}:${c.status}`),
     claims.length === 3 && claims.every((c) => c.status === "delivered"));
+
+  receipt.events.humanInvocations = humanRuns;
+  record("inert.same_agent_human_invocations", "runs A and B belong to the inert agent; receipt = authenticated user manual wake; activity records the invoking user and task",
+    humanRuns.map((h) => ({ run: h.run?.agent_id === agent.id, wake: h.wake, activity: h.activity })),
+    humanRuns.length === 2 && humanRuns.every((h) => h.run?.agent_id === agent.id && h.run?.manual_invocation?.issueId === h.issueId &&
+      h.wake?.requested_by_actor_type === "user" && h.wake?.manual_user_wake === "true" && h.wake?.issue_id === h.issueId &&
+      h.activity?.actor_type === "user" && h.activity?.manual_invocation?.issueId === h.issueId));
+  const aEnd = await must("GET", `/agents/${agent.id}`);
+  const boundIssues = await pgSql`select id, assignee_agent_id, execution_run_id from issues where id in ${pgSql([issueA.id, issueB.id])}`;
+  const assignAfter = await api("PATCH", `/issues/${issueA.id}`, { assigneeAgentId: agent.id });
+  const assignCreateAfter = await api("POST", `/companies/${company.id}/issues`, { title: "E2E assign after runs", assigneeAgentId: agent.id });
+  const runAgents = await pgSql`select distinct agent_id from heartbeat_runs where company_id = ${company.id}`;
+  record("inert.locks_intact_after_runs", "tasks never assigned and execution locks released; both human-invoked runs succeeded; assignment still 409; manual_only + blockAssignment persisted; only the inert agent ran",
+    { assignees: boundIssues.map((i) => i.assignee_agent_id), executionLocks: boundIssues.map((i) => i.execution_run_id), runStatuses: [statusA, statusB], patch: assignAfter.status, create: assignCreateAfter.status,
+      mode: aEnd.permissions?.invocationPolicy?.mode, blockAssignment: aEnd.permissions?.authorizationPolicy?.protectedAgent?.blockAssignment, runAgents: runAgents.map((r) => r.agent_id) },
+    boundIssues.length === 2 && boundIssues.every((i) => i.assignee_agent_id === null && i.execution_run_id === null) &&
+      statusA === "succeeded" && statusB === "succeeded" && assignAfter.status === 409 && assignCreateAfter.status === 409 &&
+      aEnd.permissions?.invocationPolicy?.mode === "manual_only" && aEnd.permissions?.authorizationPolicy?.protectedAgent?.blockAssignment === true &&
+      runAgents.length === 1 && runAgents[0].agent_id === agent.id);
 }
 
 let failure = null;

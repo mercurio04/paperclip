@@ -1783,6 +1783,65 @@ export function agentRoutes(
     if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
+  /**
+   * Human-invocation task binding for an opt-in manual-only agent (TAX-452 H6).
+   *
+   * Such an agent can never be assigned work, so an explicit board invocation
+   * may name the task to run in (`payload.issueId` / `payload.taskId`) without
+   * making the agent its assignee. Only an authenticated board user who can act
+   * on that task, in the agent's company, may bind it. Agent actors keep their
+   * existing self-wake path, which the manual-only gate skips anyway. The task
+   * assignment itself is never changed and `assertAssignableAgent` stays a hard
+   * 409 for every assignment path.
+   */
+  async function bindManualOnlyInvocationTask(
+    req: Request,
+    agent: { id: string; companyId: string; permissions?: unknown },
+    payload: Record<string, unknown> | null,
+  ): Promise<{ payload: Record<string, unknown> | null; issueId: string | null }> {
+    if (req.actor.type !== "board" || !agentInvocationIsManualOnly(agent.permissions)) {
+      return { payload, issueId: null };
+    }
+    const issueIdRaw = payload?.issueId;
+    const taskIdRaw = payload?.taskId;
+    if (issueIdRaw === undefined && taskIdRaw === undefined) return { payload, issueId: null };
+    const ids = [issueIdRaw, taskIdRaw].filter((value) => value !== undefined && value !== null);
+    if (ids.some((value) => typeof value !== "string" || value.trim().length === 0)) {
+      throw badRequest("Manual invocation task must be a task id.");
+    }
+    if (new Set(ids).size > 1) {
+      throw badRequest("Manual invocation names two different tasks.");
+    }
+    const issueId = (ids[0] as string | undefined) ?? null;
+    if (!issueId) return { payload, issueId: null };
+    const issue = await issueService(db).getById(issueId).catch(() => null);
+    // Cross-company and missing tasks are indistinguishable to the caller.
+    if (!issue || issue.companyId !== agent.companyId) throw notFound("Task not found");
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "issue:comment",
+      resource: {
+        type: "issue", companyId: issue.companyId, issueId: issue.id,
+        projectId: issue.projectId, parentIssueId: issue.parentId,
+        assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId, status: issue.status,
+      },
+    });
+    if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+    if (issue.conversationAgentId) {
+      throw conflict("A manual-only agent cannot be invoked in a chat conversation.");
+    }
+    if (["done", "cancelled"].includes(issue.status)) {
+      throw conflict("A manual-only agent cannot be invoked on a closed task.");
+    }
+    if (issue.assigneeAgentId) {
+      throw conflict("A manual-only agent cannot be invoked on a task another agent owns.");
+    }
+    return {
+      payload: { ...payload, issueId: issue.id, taskId: issue.id },
+      issueId: issue.id,
+    };
+  }
+
   // The single owner-authorization helper for the three adapter login routes. It
   // requires a board actor, company access, and the same configuration
   // permission as the adapter Test route (`agents:create`). It returns the
@@ -5897,6 +5956,12 @@ export function agentRoutes(
         ),
       );
     }
+    let manualInvocationIssueId: string | null = null;
+    if (!req.body.failedRunId) {
+      const bound = await bindManualOnlyInvocationTask(req, agent, wakePayload);
+      wakePayload = bound.payload;
+      manualInvocationIssueId = bound.issueId;
+    }
     const run = await heartbeat.wakeup(id, {
       failedRunId: req.body.failedRunId ?? null,
       ...(req.actor.type === "board" && !req.body.failedRunId ? { manualUserWake: true } : {}),
@@ -5943,7 +6008,12 @@ export function agentRoutes(
       action: "heartbeat.invoked",
       entityType: "heartbeat_run",
       entityId: run.id,
-      details: { agentId: id },
+      details: {
+        agentId: id,
+        ...(agentInvocationIsManualOnly(agent.permissions) && req.actor.type === "board"
+          ? { manualInvocation: { userId: req.actor.userId ?? null, issueId: manualInvocationIssueId } }
+          : {}),
+      },
     });
     if (req.body.debug?.providerTrace === "raw") {
       await logActivity(db, {
@@ -6051,6 +6121,9 @@ export function agentRoutes(
     if (typeof body.idempotencyKey === "string" && body.idempotencyKey.length > 0) {
       wakeOpts.idempotencyKey = body.idempotencyKey;
     }
+    const bound = await bindManualOnlyInvocationTask(req, agent, wakeOpts.payload ?? null);
+    const manualInvocationIssueId = bound.issueId;
+    if (bound.payload) wakeOpts.payload = bound.payload;
     const run = await heartbeat.wakeup(id, wakeOpts);
 
     if (!run) {
@@ -6068,7 +6141,12 @@ export function agentRoutes(
       action: "heartbeat.invoked",
       entityType: "heartbeat_run",
       entityId: run.id,
-      details: { agentId: id },
+      details: {
+        agentId: id,
+        ...(agentInvocationIsManualOnly(agent.permissions) && req.actor.type === "board"
+          ? { manualInvocation: { userId: req.actor.userId ?? null, issueId: manualInvocationIssueId } }
+          : {}),
+      },
     });
     if (providerTraceRequested) {
       await logActivity(db, {

@@ -15,7 +15,10 @@ profile and the typed `once`/`reject` permission decision, plus the inert
 - Real `paperclip-runnerd` (release build) and real OpenCode 1.18.29 from the
   pinned dependency, using `opencodePermissionProfile: "restricted_v1"`.
 - A deterministic OpenAI-compatible fixture provider on `127.0.0.1:47301`
-  whose only tool call is `bash: echo tick >> e2e-counter.txt` (the counter).
+  whose only tool call is an OpenCode `write` of a relative marker file
+  `e2e-tick-<call>.txt` inside the run workspace (the counter is the number of
+  marker files). restricted_v1 denies bash/webfetch/task, so a file write is
+  the innocuous action that still asks for permission.
 
 ## Prerequisites
 
@@ -44,9 +47,19 @@ On failure the instance directories are kept for diagnosis.
 
 Inert agent: paused, manual-only policy, no grants/memberships, assignment 409
 (create and patch), wakes 409 while paused, agent-actor wakes skipped with
-`agent.manual_only` after a human resume. Permission bridge (second,
-non-inert runner agent): typed contract, sha mismatch 409, `always` and
+`agent.manual_only` after a human resume, including an agent wake naming a
+task; a human invocation naming another company's task 404s. Permission
+bridge on the SAME inert agent (TAX-452 H6): each run starts from an
+explicit board wake (`POST /agents/:id/wakeup` with `payload.issueId`) that
+binds the task without assigning it; typed contract, sha mismatch 409, `always` and
 `accept_for_session` 400, agent actor 403, unknown request 409, double click
 202/409, once → counter 0→1, second action asks again, cross-request sha 409,
 reject leaves the counter unchanged, cross-run 409, reject on first action →
-counter 0, exactly one delivered durable claim per request.
+counter 0, exactly one delivered durable claim per request. Afterwards: both
+runs belong to the inert agent with a user manual-wake receipt and a
+`heartbeat.invoked` activity row naming the invoking user and task; the tasks
+were never assigned, assignment is still 409 and the persisted locks are
+unchanged.
+
+An `OUT_DIR` under `/tmp` is bind-mounted across the private tmpfs so the
+receipt survives on the host.

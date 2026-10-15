@@ -30,6 +30,7 @@ import {
   MANUAL_ONLY_SKIP_REASON,
   preserveInertLocks,
 } from "../services/agent-invocation-policy.ts";
+import { manualOnlyHumanBindingSql } from "../services/manual-invocation-binding.ts";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -240,6 +241,134 @@ describeEmbeddedPostgres("manual-only agent policy (embedded Postgres)", () => {
     const completed = await waitForRun(db, run!.id);
     expect(completed?.status).toBe("succeeded");
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+  });
+
+  async function seedIssue(companyId: string, overrides: Partial<typeof issues.$inferInsert> = {}) {
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Human-bound task",
+      status: "todo",
+      priority: "medium",
+      ...overrides,
+    });
+    return issueId;
+  }
+
+  it("runs a human invocation bound to a task without assigning it (TAX-452 H6)", async () => {
+    const { companyId, agentId, ownerUserId } = await seed({ manualOnly: true });
+    const issueId = await seedIssue(companyId);
+    const run = await heartbeat.wakeup(agentId, {
+      manualUserWake: true,
+      source: "on_demand",
+      triggerDetail: "manual",
+      payload: { issueId, taskId: issueId },
+      requestedByActorType: "user",
+      requestedByActorId: ownerUserId,
+      contextSnapshot: { responsibleUserId: ownerUserId },
+    });
+    expect(run).not.toBeNull();
+    const completed = await waitForRun(db, run!.id);
+    expect({ status: completed?.status, errorCode: completed?.errorCode, error: completed?.error })
+      .toMatchObject({ status: "succeeded" });
+    expect(completed?.contextSnapshot).toMatchObject({
+      issueId,
+      manualInvocation: { userId: ownerUserId, issueId },
+    });
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    const [request] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(request).toMatchObject({ requestedByActorType: "user", requestedByActorId: ownerUserId });
+    expect(request?.payload).toMatchObject({ manualUserWake: true, issueId });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    // The binding is not an assignment and the lock stays persisted.
+    expect(issue?.assigneeAgentId).toBeNull();
+    const [agentRow] = await db.select().from(agents).where(eq(agents.id, agentId));
+    expect(agentAssignmentIsHardLocked(agentRow?.permissions)).toBe(true);
+    await expect(assertAssignableAgent(db, companyId, agentId)).rejects.toMatchObject({ status: 409 });
+
+    // The shared ownership predicate used by the native gates accepts this
+    // run and rejects it as soon as any persisted fact no longer agrees.
+    const bound = async () => (await db
+      .select({ ok: manualOnlyHumanBindingSql({
+        runId: run!.id, agentId, issueId, issueAssigneeAgentId: issues.assigneeAgentId,
+      }).mapWith(Boolean) })
+      .from(issues).where(eq(issues.id, issueId)))[0]?.ok;
+    expect(await bound()).toBe(true);
+    await db.update(agentWakeupRequests).set({ requestedByActorType: "system" })
+      .where(eq(agentWakeupRequests.id, request!.id));
+    expect(await bound()).toBe(false);
+    await db.update(agentWakeupRequests).set({ requestedByActorType: "user" })
+      .where(eq(agentWakeupRequests.id, request!.id));
+    await db.update(agents).set({ permissions: {} }).where(eq(agents.id, agentId));
+    expect(await bound()).toBe(false);
+  });
+
+  it("refuses a human invocation bound to a task another agent owns", async () => {
+    const { companyId, agentId, ownerUserId } = await seed({ manualOnly: true });
+    const ownerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: ownerAgentId, companyId, name: "owner", role: "general", status: "idle",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
+    const issueId = await seedIssue(companyId, { assigneeAgentId: ownerAgentId });
+    const run = await heartbeat.wakeup(agentId, {
+      manualUserWake: true, source: "on_demand", triggerDetail: "manual", payload: { issueId },
+      requestedByActorType: "user", requestedByActorId: ownerUserId, contextSnapshot: { responsibleUserId: ownerUserId },
+    });
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: "agent actor", actorType: "agent" as const },
+    { label: "system", actorType: "system" as const },
+  ])("refuses a $label manual wake bound to a task", async ({ actorType }) => {
+    const { companyId, agentId } = await seed({ manualOnly: true });
+    const issueId = await seedIssue(companyId);
+    await expect(heartbeat.wakeup(agentId, {
+      manualUserWake: true,
+      source: "on_demand",
+      triggerDetail: "manual",
+      payload: { issueId },
+      requestedByActorType: actorType,
+      requestedByActorId: actorType === "agent" ? agentId : "system",
+    })).rejects.toMatchObject({ status: 403 });
+    // Without the (route-only) manual marker the same wake is just skipped.
+    const run = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      payload: { issueId },
+      requestedByActorType: actorType,
+      requestedByActorId: actorType === "agent" ? agentId : "system",
+    });
+    expect(run).toBeNull();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(0);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it.each(["cross_company", "closed"] as const)("skips a human invocation bound to a %s task", async (variant) => {
+    const { companyId, agentId, ownerUserId } = await seed({ manualOnly: true });
+    let issueId: string;
+    if (variant === "cross_company") {
+      const other = await seed({ manualOnly: false });
+      issueId = await seedIssue(other.companyId);
+    } else {
+      issueId = await seedIssue(companyId, { status: "done" });
+    }
+    const run = await heartbeat.wakeup(agentId, {
+      manualUserWake: true,
+      source: "on_demand",
+      triggerDetail: "manual",
+      payload: { issueId },
+      requestedByActorType: "user",
+      requestedByActorId: ownerUserId,
+      contextSnapshot: { responsibleUserId: ownerUserId },
+    });
+    expect(run).toBeNull();
+    const [request] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(request).toMatchObject({ status: "skipped", reason: MANUAL_ONLY_SKIP_REASON });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
   });
 
   it("never schedules timer heartbeats for a manual-only agent", async () => {

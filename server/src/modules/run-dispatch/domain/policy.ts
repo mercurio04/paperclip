@@ -148,6 +148,12 @@ export type QueuedRunFacts = {
   isInteractionWake: boolean;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
+  /**
+   * TAX-452 H6: the run is an authenticated human invocation of an opt-in
+   * manual-only agent, bound to this issue by the invocation itself. Such an
+   * agent can never be the assignee, so ownership is the human binding.
+   */
+  isManualOnlyHumanInvocation?: boolean;
 
   resumeIntent: boolean;
   wakeCommentIdPresent: boolean;
@@ -170,6 +176,7 @@ type OwnershipFacts = {
   isInteractionWake?: boolean;
   isCurrentReviewParticipant?: boolean;
   isAuthorizedSourceScopedRecovery?: boolean;
+  isManualOnlyHumanInvocation?: boolean;
 };
 
 type OwnershipOutcome = "current_owner" | "reassigned";
@@ -185,6 +192,7 @@ function decideIssueOwnership(facts: OwnershipFacts): OwnershipOutcome {
   if (facts.isInteractionWake) return "current_owner";
   if (facts.isCurrentReviewParticipant) return "current_owner";
   if (facts.isAuthorizedSourceScopedRecovery) return "current_owner";
+  if (facts.isManualOnlyHumanInvocation) return "current_owner";
   return "reassigned";
 }
 
@@ -569,6 +577,7 @@ export function decideQueuedRunStaleness(
       facts.reviewParticipant.participantIsAgent &&
       facts.reviewParticipant.participantAgentId === facts.runAgentId,
     isAuthorizedSourceScopedRecovery: facts.isAuthorizedSourceScopedRecovery,
+    isManualOnlyHumanInvocation: facts.isManualOnlyHumanInvocation === true,
   });
   if (ownership === "reassigned") {
     return {
