@@ -278,7 +278,7 @@ describeEmbeddedPostgres("native permission decision claims (embedded Postgres)"
     const resumingRun = await newRun("failed");
     const resuming = await deliver(resumingRun, "perm-crash-resuming");
 
-    const audit = (entry: Parameters<typeof logActivity>[1]) => logActivity(db, entry);
+    const audit = (executor: typeof db, entry: Parameters<typeof logActivity>[1]) => logActivity(executor, entry);
     const first = await sweepTerminalNativePermissionOutcomes(db,
       { trigger: "startup_terminal_sweep", excludeRunIds: [resumingRun] }, audit);
     expect(first).toEqual({ runs: 3, recovered: 1, uncertain: 2, failedRunIds: [] });
@@ -319,5 +319,46 @@ describeEmbeddedPostgres("native permission decision claims (embedded Postgres)"
     await expect(sweepTerminalNativePermissionOutcomes(db,
       { trigger: "periodic_terminal_sweep", settledBefore: new Date(Date.now() + 60_000) }, audit))
       .resolves.toMatchObject({ runs: 2, uncertain: 2 });
+  });
+
+  it("QA must retry the audit after a transient terminal-sweep audit failure (H15)", async () => {
+    const auditRun = randomUUID();
+    const requestId = "qa-lost-audit";
+    await db.insert(heartbeatRuns).values({
+      id: auditRun, companyId, agentId, invocationSource: "on_demand", triggerDetail: "manual",
+      status: "cancelled", runtimeMode: "native", contextSnapshot: {}, finishedAt: new Date(),
+    });
+    const claim = await claimNativePermissionDecision(db, { ...claimInput("once"), runId: auditRun, requestId });
+    await settleNativePermissionDecision(db, { id: claim!.id, status: "delivered" });
+    // Real one-shot PostgreSQL INSERT failure; sequence increments survive statement rollback.
+    await db.execute(sql`create sequence qa_audit_failure_attempts`);
+    await db.execute(sql`create function qa_fail_first_audit() returns trigger language plpgsql as $$
+      begin
+        if NEW.action = 'heartbeat.runtime_permission_reconciled' and nextval('qa_audit_failure_attempts') = 1 then
+          raise exception 'QA transient audit write failure';
+        end if;
+        return NEW;
+      end
+    $$`);
+    await db.execute(sql`create trigger qa_fail_first_audit before insert on activity_log
+      for each row execute function qa_fail_first_audit()`);
+    const writer = (executor: typeof db, entry: Parameters<typeof logActivity>[1]) => logActivity(executor, entry);
+    const first = await sweepTerminalNativePermissionOutcomes(db, { trigger: "startup_terminal_sweep" }, writer);
+    const afterFailure = await db.select().from(nativePermissionDecisions).where(eq(nativePermissionDecisions.id, claim!.id));
+    await db.execute(sql`drop trigger qa_fail_first_audit on activity_log`);
+    await db.execute(sql`drop function qa_fail_first_audit()`);
+    await db.execute(sql`drop sequence qa_audit_failure_attempts`);
+    const second = await sweepTerminalNativePermissionOutcomes(db, { trigger: "periodic_terminal_sweep" }, writer);
+    const rows = await db.select().from(nativePermissionDecisions).where(eq(nativePermissionDecisions.id, claim!.id));
+    const audits = await db.select().from(activityLog).where(eq(activityLog.entityId, auditRun));
+    const redelivery = await claimNativePermissionDecision(db, { ...claimInput("once"), runId: auditRun, requestId });
+    expect(first.failedRunIds).toContain(auditRun);
+    // The failed audit rolled the transition back: still eligible, nothing lost.
+    expect(afterFailure[0]?.status).toBe("delivered");
+    expect(afterFailure[0]?.nativeOutcome).toBeNull();
+    expect(second.uncertain).toBe(1);
+    expect(rows[0]?.status).toBe("dispatch_uncertain");
+    expect(redelivery).toBeNull();
+    expect(audits.filter((a) => a.action === "heartbeat.runtime_permission_reconciled")).toHaveLength(1);
   });
 });

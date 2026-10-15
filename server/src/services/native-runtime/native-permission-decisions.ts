@@ -359,6 +359,15 @@ export interface NativePermissionReconciliationAudit {
 }
 
 /**
+ * Writes one reconciliation audit row with the executor of the enclosing
+ * transaction, so the audit commits atomically with the state transition.
+ */
+export type NativePermissionReconciliationAuditWriter = (
+  executor: Db,
+  entry: NativePermissionReconciliationAudit,
+) => Promise<unknown>;
+
+/**
  * Terminal reconciliation of one run plus its audit rows: one
  * `heartbeat.runtime_permission_native_outcome` per recovered outcome and one
  * `heartbeat.runtime_permission_reconciled` (delivered -> dispatch_uncertain)
@@ -369,16 +378,21 @@ export async function reconcileAndAuditTerminalNativePermissionOutcomes(
   db: Db,
   run: { readonly id: string; readonly companyId: string; readonly agentId: string },
   trigger: string,
-  audit: (entry: NativePermissionReconciliationAudit) => Promise<unknown>,
+  audit: NativePermissionReconciliationAuditWriter,
 ): Promise<{ recovered: number; uncertain: number }> {
   const reason = NATIVE_OUTCOME_UNOBSERVED_AT_TERMINAL;
-  const { recovered, uncertain } = await reconcileTerminalNativePermissionOutcomes(db, {
+  // The state transition and its audit rows commit or roll back together
+  // (QA H15): if any audit write fails, the claim stays `delivered` with a
+  // null outcome, so the next sweep retries and audits it exactly once.
+  return db.transaction(async (tx) => {
+  const executor = tx as unknown as Db;
+  const { recovered, uncertain } = await reconcileTerminalNativePermissionOutcomes(executor, {
     companyId: run.companyId,
     runId: run.id,
     reason,
   });
   for (const row of recovered) {
-    await audit({
+    await audit(executor, {
       companyId: run.companyId,
       actorType: "system",
       actorId: "paperclip-runner",
@@ -392,7 +406,7 @@ export async function reconcileAndAuditTerminalNativePermissionOutcomes(
     });
   }
   for (const row of uncertain) {
-    await audit({
+    await audit(executor, {
       companyId: run.companyId,
       actorType: "system",
       actorId: "native_terminal_reconciliation",
@@ -416,6 +430,7 @@ export async function reconcileAndAuditTerminalNativePermissionOutcomes(
     });
   }
   return { recovered: recovered.length, uncertain: uncertain.length };
+  });
 }
 
 /**
@@ -438,7 +453,7 @@ export async function sweepTerminalNativePermissionOutcomes(
     readonly settledBefore?: Date;
     readonly excludeRunIds?: readonly string[];
   },
-  audit: (entry: NativePermissionReconciliationAudit) => Promise<unknown>,
+  audit: NativePermissionReconciliationAuditWriter,
 ): Promise<{ runs: number; recovered: number; uncertain: number; failedRunIds: string[] }> {
   const conditions = [
     eq(nativePermissionDecisions.status, "delivered"),

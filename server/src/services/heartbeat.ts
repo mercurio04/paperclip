@@ -13682,7 +13682,7 @@ export function heartbeatService(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId">,
     trigger: string,
   ) {
-    return reconcileAndAuditTerminalNativePermissionOutcomes(db, run, trigger, (entry) => logActivity(db, entry));
+    return reconcileAndAuditTerminalNativePermissionOutcomes(db, run, trigger, (executor, entry) => logActivity(executor, entry));
   }
 
   /**
@@ -13710,7 +13710,7 @@ export function heartbeatService(
               : (options.settledBefore ?? undefined),
           excludeRunIds: options.excludeRunIds,
         },
-        (entry) => logActivity(db, entry),
+        (executor, entry) => logActivity(executor, entry),
       );
       if (result.recovered > 0 || result.uncertain > 0 || result.failedRunIds.length > 0)
         logger.warn({ ...result, trigger: options.trigger }, "native permission terminal sweep reconciled claims");
