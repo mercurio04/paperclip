@@ -740,11 +740,11 @@ async function main() {
     const onceRows = await onceDecisions(run.id);
     receipt.adversarial[`restart_${variant}`] = { runId: run.id, requestId: req.requestId, before, killed, afterBoot, probe1: { status: probe1.status, body: probe1.text.slice(0, 200) }, probe2: probe2.status, terminal: st, row, claims, opencodeLeft: ocLeft, fixtureAfterRestart: receipt.fixture.requests.slice(fixtureMark), digest: eventDigest(ev).slice(-14) };
     // A probe that slips in before reconciliation may insert a claim, but it
-    // must settle as `stale` (provably not dispatched); a pre-crash claim must
-    // stay blocked (claimed/dispatch_uncertain). Never `delivered`.
+    // must settle as `stale` (provably not dispatched); a pre-crash claim is
+    // reconciled by restart recovery to `dispatch_uncertain`. Never `delivered`.
     const expectedClaims = variant === "pending"
       ? claims.every((c) => c.status === "stale")
-      : claims.length === 1 && claims[0].decision === "once" && ["claimed", "dispatch_uncertain"].includes(claims[0].status);
+      : claims.length === 1 && claims[0].decision === "once" && claims[0].status === "dispatch_uncertain";
     record(`adv.restart_${variant}.no_replay`, `server SIGKILL with the permission ${variant === "pending" ? "pending (no decision)" : "claimed (row claimed, not dispatched)"}; after restart: once -> 409 (twice), 0 once resolutions, counter 0, no new mutating tool call from the provider, run terminal/reconciled, no OpenCode left${variant === "claimed" ? ", claim never delivered" : ", no claim"}`,
       { probe1: probe1.status, probe2: probe2.status, runStatus: st, errorCode: row?.error_code, once: onceRows.filter((o) => o.status === "delivered").length, counter: counterValue(cwd), replayedToolCalls: replayed.length, claims: claims.map((c) => `${c.decision}:${c.status}`), opencodeLeft: ocLeft.length, survivorsAfterKill: killed.survivors.map((p) => p.args.slice(0, 60)) },
       probe1.status === 409 && probe2.status === 409 && onceRows.filter((o) => o.status === "delivered").length === 0 && counterValue(cwd) === 0 && replayed.length === 0 && expectedClaims &&

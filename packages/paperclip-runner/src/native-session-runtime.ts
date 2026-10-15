@@ -157,6 +157,66 @@ export function completeTerminatedRemoteNativeSessionCleanup(binding: {
  * both exact local process identities and durably fenced their run. This removes
  * only cleanup ownership; the retained checkpoint is never made resumable.
  */
+const terminatedLocalCleanupAuthorizations = new Map<string, string>();
+const terminatedLocalCleanupKey = (companyId: string, runId: string) =>
+  JSON.stringify([companyId, runId]);
+
+/**
+ * The controller is about to terminate (and will prove absent) the exact
+ * local processes of this run. A close of that run's session that then fails
+ * as unrecoverable is retired instead of quarantining the whole cleanup
+ * domain. Only the given runner instance matches; `revoke` withdraws it (for
+ * example when a process survived). An already-present quarantine is retired
+ * now when nothing is in flight.
+ */
+export function authorizeTerminatedLocalNativeSessionCleanup(binding: {
+  companyId: string;
+  runId: string;
+  runnerInstanceId: string;
+}): { revoke: () => void } {
+  const key = terminatedLocalCleanupKey(binding.companyId, binding.runId);
+  terminatedLocalCleanupAuthorizations.set(key, binding.runnerInstanceId);
+  const expiry = setTimeout(() => {
+    if (terminatedLocalCleanupAuthorizations.get(key) === binding.runnerInstanceId)
+      terminatedLocalCleanupAuthorizations.delete(key);
+  }, 120_000);
+  expiry.unref?.();
+  return {
+    revoke: () => {
+      clearTimeout(expiry);
+      if (terminatedLocalCleanupAuthorizations.get(key) === binding.runnerInstanceId)
+        terminatedLocalCleanupAuthorizations.delete(key);
+    },
+  };
+}
+
+function consumeTerminatedLocalCleanupAuthorization(
+  session: NativeSession,
+  cleanupDomain: NativeSessionCleanupDomain,
+): boolean {
+  if ((JSON.parse(cleanupDomain) as string[]).length !== 3) return false;
+  const identity = session.identity();
+  const key = terminatedLocalCleanupKey(identity.companyId, identity.runId);
+  const runnerInstanceId = terminatedLocalCleanupAuthorizations.get(key);
+  if (runnerInstanceId === undefined ||
+      sessionOriginRunnerInstances.get(session) !== runnerInstanceId) return false;
+  terminatedLocalCleanupAuthorizations.delete(key);
+  return true;
+}
+
+/** True while a local cleanup of exactly this run is quarantined. Lets the
+ * controller retire it only after it proved the run's processes terminated. */
+export function localNativeSessionCleanupQuarantined(binding: {
+  companyId: string;
+  runId: string;
+}): boolean {
+  return [...quarantinedSessionCleanups].some(({ session, domain }) => {
+    const identity = session.identity();
+    return (JSON.parse(domain) as string[]).length === 3 &&
+      identity.companyId === binding.companyId && identity.runId === binding.runId;
+  });
+}
+
 export function completeTerminatedLocalNativeSessionCleanup(binding: {
   companyId: string;
   runId: string;
@@ -625,6 +685,8 @@ function quarantineSessionCleanup(
   const existing = [...quarantinedSessionCleanups].find(
     (entry) => entry.session === session,
   );
+  if (!existing && consumeTerminatedLocalCleanupAuthorization(session, cleanupDomain))
+    return;
   if (existing) {
     if (operatorRecoveryRequired) {
       existing.operatorRecoveryRequired = true;

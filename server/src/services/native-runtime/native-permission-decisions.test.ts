@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
@@ -15,6 +15,7 @@ import {
 } from "../../__tests__/helpers/embedded-postgres.js";
 import {
   claimNativePermissionDecision,
+  reconcileCrashedNativePermissionClaims,
   settleNativePermissionDecision,
 } from "./native-permission-decisions.js";
 
@@ -96,5 +97,31 @@ describeEmbeddedPostgres("native permission decision claims (embedded Postgres)"
       .where(eq(nativePermissionDecisions.id, row!.id));
     expect(after).toMatchObject({ status: "dispatch_uncertain", error: "timeout" });
     await expect(claimNativePermissionDecision(db, claimInput("once"))).resolves.toBeNull();
+  });
+
+  it("reconciles pre-crash claimed rows to dispatch_uncertain only, never touching later or settled rows", async () => {
+    const before = await claimNativePermissionDecision(db, { ...claimInput("once"), requestId: "perm-crash" });
+    const stale = await claimNativePermissionDecision(db, { ...claimInput("once"), requestId: "perm-stale" });
+    await settleNativePermissionDecision(db, { id: stale!.id, status: "stale" });
+    const [{ now }] = (await db.execute(sql`select clock_timestamp() as now`)) as unknown as Array<{ now: string }>;
+    const boundary = new Date(now);
+    await new Promise((r) => setTimeout(r, 20));
+    const after = await claimNativePermissionDecision(db, { ...claimInput("once"), requestId: "perm-live" });
+    const moved = await reconcileCrashedNativePermissionClaims(db, {
+      companyId, runId, claimedBefore: boundary, reason: "server_restart_dispatch_outcome_unknown",
+    });
+    expect(moved.map((row) => row.requestId)).toEqual(["perm-crash"]);
+    const rows = await db.select().from(nativePermissionDecisions)
+      .where(eq(nativePermissionDecisions.runId, runId));
+    const byRequest = Object.fromEntries(rows.map((row) => [row.requestId, row]));
+    expect(byRequest["perm-crash"]).toMatchObject({ id: before!.id, status: "dispatch_uncertain", error: "server_restart_dispatch_outcome_unknown" });
+    expect(byRequest["perm-stale"]).toMatchObject({ status: "stale" });
+    expect(byRequest["perm-live"]).toMatchObject({ id: after!.id, status: "claimed" });
+    // Never redelivered: a second decision for the reconciled request is refused.
+    await expect(claimNativePermissionDecision(db, { ...claimInput("once"), requestId: "perm-crash" })).resolves.toBeNull();
+    // Idempotent.
+    await expect(reconcileCrashedNativePermissionClaims(db, {
+      companyId, runId, claimedBefore: boundary, reason: "again",
+    })).resolves.toEqual([]);
   });
 });

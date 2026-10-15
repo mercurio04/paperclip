@@ -2414,6 +2414,28 @@ describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
     await h.session.close({ reason: "terminal test complete" });
   });
 
+  it("rejects a pending permission natively before /abort when the turn is interrupted (board cancel)", async () => {
+    const h = await harness();
+    const { turnId } = await h.session.startTurn({ message: { role: "user", text: "edit" } });
+    await h.next("runtime_request.created");
+    await h.session.interrupt?.({ turnId, reason: "Cancelled by a board operator" });
+    for (let attempt = 0; attempt < 50 && h.state.replies.length === 0; attempt += 1)
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+    expect(h.state.replies).toEqual([{ id: permissionId, body: { reply: "reject" } }]);
+    expect(h.state.aborts).toBe(1);
+    const cancelled = await h.next("runtime_request.cancelled");
+    expect(cancelled?.payload).toMatchObject({ reason: "turn_interrupted" });
+    expect(h.session.pendingRuntimeRequests?.()).toEqual([]);
+    // A late `once` can never reach OpenCode.
+    await expect(h.session.resolveRuntimeRequest?.({
+      requestId: permissionId,
+      turnId,
+      resolution: { action: "permission_decision", decision: "once", contractSha256: "0".repeat(64) },
+    })).rejects.toThrow();
+    expect(h.state.replies.filter((reply) => (reply.body as { reply: string }).reply === "once")).toEqual([]);
+    await h.session.close({ reason: "interrupt test complete" });
+  });
+
   it("freezes a typed, hash-bound request with fetched arguments and replies once when live state matches", async () => {
     const h = await harness();
     const { turnId } = await h.session.startTurn({

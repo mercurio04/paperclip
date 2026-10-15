@@ -29,6 +29,8 @@ import {
   executeNativeSession,
   completeTerminatedRemoteNativeSessionCleanup,
   completeTerminatedLocalNativeSessionCleanup,
+  localNativeSessionCleanupQuarantined,
+  authorizeTerminatedLocalNativeSessionCleanup,
   type ExecuteNativeSessionOptions,
 } from "./native-session-runtime.js";
 
@@ -4049,15 +4051,61 @@ describe("executeNativeSession recovery", () => {
     const options = { input: scopedInput, backend, controlPlane, runnerInstanceId: binding.runnerInstanceId,
       controlPlaneInstanceId: "control", requireSessionCloseBeforeReturn: true };
     await expect(executeNativeSession(options)).rejects.toBe(failure);
+    expect(localNativeSessionCleanupQuarantined(scopedIdentity)).toBe(true);
+    expect(localNativeSessionCleanupQuarantined({ ...scopedIdentity, runId: "other-run" })).toBe(false);
     completeTerminatedLocalNativeSessionCleanup({ ...binding, companyId: "other-company" });
     completeTerminatedLocalNativeSessionCleanup({ ...binding, runId: "other-run" });
     expect(completeTerminatedLocalNativeSessionCleanup({ ...binding, runnerInstanceId: "other-runner" })).toBe(false);
     await expect(executeNativeSession(options)).rejects.toBeInstanceOf(NativeSessionCleanupQuarantinedError);
     expect(backend.openSession).toHaveBeenCalledOnce();
     expect(completeTerminatedLocalNativeSessionCleanup(binding)).toBe(true);
+    expect(localNativeSessionCleanupQuarantined(scopedIdentity)).toBe(false);
     await expect(executeNativeSession(options)).rejects.toBe(failure);
     expect(backend.openSession).toHaveBeenCalledTimes(2);
     expect(controlPlane.completeRun).not.toHaveBeenCalled();
+    completeTerminatedLocalNativeSessionCleanup(binding);
+  });
+
+  it("does not quarantine an unrecoverable close of a run whose termination the controller pre-authorized", async () => {
+    const scopedIdentity = { ...identity, companyId: "auth-stop-company", runId: "auth-stop-run" };
+    const binding = { ...scopedIdentity, runnerInstanceId: "auth-runner" };
+    const scopedInput = { ...input, binding: { ...input.binding, companyId: scopedIdentity.companyId, runId: scopedIdentity.runId } };
+    const failure = new NativeSessionCloseUnrecoverableError();
+    const capabilities = { resume: true, typedEvents: true, steering: false, interruption: false, structuredResult: true };
+    const session: NativeSession = {
+      identity: () => scopedIdentity, capabilities: async () => capabilities,
+      async *events() { throw new Error("local transport stopped"); },
+      startTurn: async () => ({ turnId: "auth-turn" }), result: async () => null,
+      close: vi.fn(async () => { throw failure; }),
+    };
+    const backend: NativeSessionBackend = {
+      descriptor: async () => ({ kind: "local", name: "auth-stop-test", version: "1", capabilities }),
+      openSession: vi.fn(async () => session),
+    };
+    const controlPlane: ControlPlanePort = {
+      openRun: async () => {}, checkpointSession: async () => {},
+      appendEvent: async () => ({ cursor: 0, highestContiguousSourceSeq: 0, disposition: "committed" }),
+      replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }), completeRun: vi.fn(async () => {}),
+    };
+    const options = { input: scopedInput, backend, controlPlane, runnerInstanceId: binding.runnerInstanceId,
+      controlPlaneInstanceId: "control", requireSessionCloseBeforeReturn: true };
+    // Another runner instance's authorization never matches.
+    const foreign = authorizeTerminatedLocalNativeSessionCleanup({ ...binding, runnerInstanceId: "other-runner" });
+    await expect(executeNativeSession(options)).rejects.toBe(failure);
+    expect(localNativeSessionCleanupQuarantined(scopedIdentity)).toBe(true);
+    foreign.revoke();
+    expect(completeTerminatedLocalNativeSessionCleanup(binding)).toBe(true);
+    authorizeTerminatedLocalNativeSessionCleanup(binding);
+    await expect(executeNativeSession(options)).rejects.toBe(failure);
+    expect(localNativeSessionCleanupQuarantined(scopedIdentity)).toBe(false);
+    // Consumed: a later failure quarantines again.
+    await expect(executeNativeSession(options)).rejects.toBe(failure);
+    expect(localNativeSessionCleanupQuarantined(scopedIdentity)).toBe(true);
+    // A revoked authorization does not suppress anything.
+    completeTerminatedLocalNativeSessionCleanup(binding);
+    authorizeTerminatedLocalNativeSessionCleanup(binding).revoke();
+    await expect(executeNativeSession(options)).rejects.toBe(failure);
+    expect(localNativeSessionCleanupQuarantined(scopedIdentity)).toBe(true);
     completeTerminatedLocalNativeSessionCleanup(binding);
   });
 

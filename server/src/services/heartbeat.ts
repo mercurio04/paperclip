@@ -1,4 +1,6 @@
 import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
+import { terminateNativeDedicatedProcesses } from "./native-runtime/native-dedicated-process-reaper.js";
+import { reconcileCrashedNativePermissionClaims } from "./native-runtime/native-permission-decisions.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
 import { legacyControllerBootId, legacyControllerClaim, renewLegacyControllerLease, hasLiveLegacyController, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
@@ -9325,6 +9327,9 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+const NATIVE_CANCEL_REAP_SETTLE_MS = 15_000;
+const HEARTBEAT_PROCESS_LOADED_AT = new Date();
+
 export function heartbeatService(
   db: Db,
   options: HeartbeatServiceOptions = {},
@@ -13604,6 +13609,87 @@ export function heartbeatService(
     });
   }
 
+  /**
+   * Board cancel of a native run: the provider may never acknowledge the
+   * interrupt, which used to leave the run's dedicated runnerd/OpenCode alive
+   * after `cancelled`. The driver now rejects pending permissions so the
+   * session closes normally; this is the bounded backstop: after the settle
+   * window, SIGTERM then SIGKILL the identity-verified process groups (the
+   * session cleanup is then unproven and fails closed). Never throws.
+   */
+  function reapCancelledNativeRunProcesses(run: typeof heartbeatRuns.$inferSelect) {
+    if (run.runtimeMode !== "native") return;
+    void terminateNativeDedicatedProcesses({
+      db,
+      run,
+      reason: "board_cancel",
+      settleMs: NATIVE_CANCEL_REAP_SETTLE_MS,
+    }).then((outcome) => {
+      if (outcome && outcome.targets.length > 0)
+        logger.info({ runId: run.id, ...outcome }, "native cancel reaped dedicated processes");
+    }).catch((error) => {
+      logger.warn({ err: error, runId: run.id }, "native cancel process reap failed");
+    });
+  }
+
+  /**
+   * After restart recovery: (1) claimed permission decisions written by the
+   * crashed process have an unknown dispatch outcome and become
+   * `dispatch_uncertain` (never redelivered); (2) runs finalized as
+   * `native_restart_recovery_blocked` get their recorded runnerd/provider
+   * process groups terminated (identity-verified, bounded, background).
+   */
+  async function reconcileNativeRestartLeftovers(
+    dispositions: ReadonlyArray<{ kind: string; runId: string }>,
+  ) {
+    for (const disposition of dispositions) {
+      const run = await getRun(disposition.runId).catch(() => null);
+      if (!run || run.runtimeMode !== "native") continue;
+      try {
+        const reconciled = await reconcileCrashedNativePermissionClaims(db, {
+          companyId: run.companyId,
+          runId: run.id,
+          claimedBefore: HEARTBEAT_PROCESS_LOADED_AT,
+          reason: "server_restart_dispatch_outcome_unknown",
+        });
+        for (const row of reconciled) {
+          await logActivity(db, {
+            companyId: run.companyId,
+            actorType: "system",
+            actorId: "native_restart_recovery",
+            action: "heartbeat.runtime_permission_reconciled",
+            entityType: "heartbeat_run",
+            entityId: run.id,
+            agentId: run.agentId,
+            runId: run.id,
+            details: {
+              runId: run.id,
+              requestId: row.requestId,
+              turnId: row.turnId,
+              decision: row.decision,
+              contractSha256: row.contractSha256,
+              resolverUserId: row.resolverUserId,
+              previousStatus: "claimed",
+              status: "dispatch_uncertain",
+              reason: "server_restart_dispatch_outcome_unknown",
+            },
+          });
+        }
+      } catch (error) {
+        logger.warn({ err: error, runId: run.id }, "native permission claim reconciliation failed");
+      }
+      if (disposition.kind !== "blocked") continue;
+      void terminateNativeDedicatedProcesses({ db, run, reason: "restart_recovery_blocked" })
+        .then((outcome) => {
+          if (outcome && outcome.targets.length > 0)
+            logger.info({ runId: run.id, ...outcome }, "native restart recovery reaped orphaned dedicated processes");
+        })
+        .catch((error) => {
+          logger.warn({ err: error, runId: run.id }, "native restart orphan reap failed");
+        });
+    }
+  }
+
   async function appendRunEvent(
     run: typeof heartbeatRuns.$inferSelect,
     event: {
@@ -14869,6 +14955,7 @@ export function heartbeatService(
         });
       }
     }
+    await reconcileNativeRestartLeftovers(dispositions);
     for (const claim of claims) {
       const execution = executeRun(claim.runId, {
         nativeLeaseOwner: claim.leaseOwner,
@@ -28513,6 +28600,7 @@ export function heartbeatService(
               reason,
               runtimeMode: run.runtimeMode,
             });
+            reapCancelledNativeRunProcesses(run);
             if (running) {
               await terminateHeartbeatRunProcess({
                 pid: running.child.pid,
@@ -28698,6 +28786,7 @@ export function heartbeatService(
             reason,
             runtimeMode: run.runtimeMode,
           });
+          reapCancelledNativeRunProcesses(run);
         }
         const persistedCancellationResult =
           run.runtimeMode === "native"

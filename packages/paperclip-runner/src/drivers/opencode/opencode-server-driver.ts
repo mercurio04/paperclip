@@ -663,6 +663,12 @@ class OpenCodeHarnessSession implements HarnessSession {
       input.turnId !== this.#activeTurnId
     )
       throw new Error("stale OpenCode turn");
+    // restricted_v1: OpenCode 1.18 blocks the turn inside a pending
+    // permission and never acknowledges /abort while it waits, so a cancelled
+    // run kept its OpenCode (and runnerd) alive. Reject every pending typed
+    // permission natively first (exactly once, never `once`); the tool call
+    // then fails and the abort settles as a normal cancelled turn.
+    this.#invalidateTypedPermissions("turn_interrupted", null);
     await api(
       this.#fetch,
       this.#runtime,

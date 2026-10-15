@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, lt, sql } from "drizzle-orm";
 
 import type { Db } from "@paperclipai/db";
 import { nativePermissionDecisions } from "@paperclipai/db";
@@ -74,4 +74,44 @@ export async function settleNativePermissionDecision(
       eq(nativePermissionDecisions.id, input.id),
       eq(nativePermissionDecisions.status, "claimed"),
     ));
+}
+
+/**
+ * Crash reconciliation: a `claimed` row written by a previous server process
+ * has an unknown dispatch outcome (the process may have died before, during
+ * or after `request.resolve`). It becomes `dispatch_uncertain`, which is
+ * terminal and never redelivered. Only rows claimed before `claimedBefore`
+ * (this process' start) move, so a claim owned by a live dispatcher of the
+ * current process is never touched. `stale`/`delivered` rows are unchanged.
+ */
+export async function reconcileCrashedNativePermissionClaims(
+  db: Db,
+  input: {
+    readonly companyId: string;
+    readonly runId: string;
+    readonly claimedBefore: Date;
+    readonly reason: string;
+  },
+): Promise<Array<{ id: string; requestId: string; turnId: string; decision: string; contractSha256: string; resolverUserId: string }>> {
+  return db
+    .update(nativePermissionDecisions)
+    .set({
+      status: "dispatch_uncertain",
+      error: input.reason.slice(0, 2000),
+      updatedAt: sql`now()`,
+    })
+    .where(and(
+      eq(nativePermissionDecisions.companyId, input.companyId),
+      eq(nativePermissionDecisions.runId, input.runId),
+      eq(nativePermissionDecisions.status, "claimed"),
+      lt(nativePermissionDecisions.createdAt, input.claimedBefore),
+    ))
+    .returning({
+      id: nativePermissionDecisions.id,
+      requestId: nativePermissionDecisions.requestId,
+      turnId: nativePermissionDecisions.turnId,
+      decision: nativePermissionDecisions.decision,
+      contractSha256: nativePermissionDecisions.contractSha256,
+      resolverUserId: nativePermissionDecisions.resolverUserId,
+    });
 }
