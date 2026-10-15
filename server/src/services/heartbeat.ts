@@ -11189,7 +11189,7 @@ export function heartbeatService(
     });
 
     if (input.recoveryPolicy === "create_recovery_issue") {
-      let recoveryIssue = await findOpenIssueMonitorRecoveryIssue(
+      let recoveryIssue: Omit<typeof issues.$inferSelect, "monitorProbeState"> | null = await findOpenIssueMonitorRecoveryIssue(
         input.claimed,
       );
       if (!recoveryIssue) {

@@ -747,7 +747,7 @@ export function statusCardService(
 
   async function tickDueStatusCards(now = new Date()) {
     const due = await db.select().from(statusCards).where(and(isNull(statusCards.archivedAt), isNull(statusCards.generatingIssueId), isNotNull(statusCards.nextEvalAt), lte(statusCards.nextEvalAt, now)));
-    const enqueued: Array<{ cardId: string; generatingIssue: typeof issues.$inferSelect }> = [];
+    const enqueued: Array<{ cardId: string; generatingIssue: Omit<typeof issues.$inferSelect, "monitorProbeState"> }> = [];
     let evaluated = 0;
     for (const candidate of due) {
       const claimUntil = new Date(now.getTime() + 5 * 60 * 1000);

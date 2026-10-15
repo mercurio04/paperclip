@@ -1367,7 +1367,7 @@ function redactedActor(actor: {
   };
 }
 
-function redactedTask(task: typeof issues.$inferSelect) {
+function redactedTask(task: Omit<typeof issues.$inferSelect, "monitorProbeState">) {
   return {
     id: task.id,
     companyId: task.companyId,

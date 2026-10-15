@@ -458,7 +458,7 @@ type ParsedExecutionState = NonNullable<
 type NormalizedExecutionPolicy = NonNullable<
   ReturnType<typeof normalizeIssueExecutionPolicy>
 >;
-type IssueRouteSnapshot = typeof issueRows.$inferSelect;
+type IssueRouteSnapshot = Omit<typeof issueRows.$inferSelect, "monitorProbeState">;
 type RecoveryRevalidationTrigger =
   "issue_update" | "comment" | "document" | "work_product" | "read_projection";
 type CompanySearchService = {
@@ -9312,7 +9312,7 @@ export function issueRoutes(
               : undefined,
           );
         }
-        let issue = lockedIssue;
+        let issue: IssueRouteSnapshot = lockedIssue;
         const sourceStatusChanged = sourceIssueStatus !== lockedIssue.status;
         if (outcome === "blocked" && sourceStatusChanged) {
           const unresolvedBlockers = await tx

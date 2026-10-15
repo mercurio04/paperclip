@@ -515,7 +515,7 @@ async function validateGovernanceGate(
 async function materializeDecisionEffect(input: {
   tx: Db;
   companyId: string;
-  issue: typeof issues.$inferSelect;
+  issue: Omit<typeof issues.$inferSelect, "monitorProbeState">;
   runId: string;
   decisionId: string;
   effect: NativeStatusEffect;
@@ -1838,7 +1838,7 @@ export async function commitNativeStatusDecision(input: {
       );
     }
 
-    let updated: typeof issues.$inferSelect;
+    let updated: Omit<typeof issues.$inferSelect, "monitorProbeState">;
     if (input.decision.statusAction === "preserve") {
       updated = (await tx
         .select()
