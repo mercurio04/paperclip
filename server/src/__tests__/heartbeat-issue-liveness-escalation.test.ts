@@ -1,3 +1,5 @@
+import express from "express";
+import request from "supertest";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -16,6 +18,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueThreadInteractions,
   issueRelations,
   issueRecoveryActions,
   issueTreeHoldMembers,
@@ -339,7 +342,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       });
     }
 
-    return { companyId, agentId, blockedIssueId, blockerIssueId, executionWorkspaceId };
+    return { companyId, agentId, blockedIssueId, blockerIssueId, executionWorkspaceId, ownerUserId };
   }
 
   it("runs exactly one bounded review-path recovery before surfacing a stalled decision", async () => {
@@ -431,6 +434,188 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
         expect.objectContaining({ id: "choose_review_path", label: "Choose review path" }),
       ]),
     });
+  });
+
+  async function createDependencyApp(companyId: string, userId: string) {
+    const [{ issueRoutes }, { errorHandler }] = await Promise.all([
+      import("../routes/issues.js"), import("../middleware/index.js"),
+    ]);
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as any).actor = { type: "board", userId, companyIds: [companyId],
+        source: "local_implicit", isInstanceAdmin: false };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as any));
+    app.use(errorHandler);
+    return app;
+  }
+
+  async function seedPendingInteraction(
+    fixture: Awaited<ReturnType<typeof seedResolvedDependencyBackstopFixture>>,
+    continuationPolicy = "wake_assignee",
+  ) {
+    const [interaction] = await db.insert(issueThreadInteractions).values({
+      companyId: fixture.companyId, issueId: fixture.blockedIssueId,
+      kind: "request_confirmation", continuationPolicy,
+      createdByUserId: fixture.ownerUserId,
+      payload: { version: 1, prompt: "Continue the synthetic task?" },
+    }).returning();
+    return interaction!;
+  }
+
+  it.each(["wake_assignee", "wake_assignee_on_accept"])(
+    "pending %s: repeated PATCH produces no wake rows and a new startup pass still waits",
+    async (policy) => {
+      const fixture = await seedResolvedDependencyBackstopFixture();
+      const interaction = await seedPendingInteraction(fixture, policy);
+      const app = await createDependencyApp(fixture.companyId, fixture.ownerUserId);
+      for (let n = 0; n < 3; n++) {
+        await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, fixture.blockedIssueId));
+        const res = await request(app).patch(`/api/issues/${fixture.blockedIssueId}`).send({
+          status: "blocked", blockedByIssueIds: [fixture.blockerIssueId],
+        });
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+      }
+      await vi.waitFor(async () => expect(await db.select().from(activityLog).where(
+        eq(activityLog.action, "issue.blockers_resolved_wake_suppressed"))).toHaveLength(3));
+      expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+      const diagnostics = await db.select().from(activityLog).where(
+        eq(activityLog.action, "issue.blockers_resolved_wake_suppressed"));
+      expect(diagnostics).toHaveLength(3);
+      expect(diagnostics[0]?.details).toMatchObject({ interactionId: interaction.id });
+      const restartedService = heartbeatService(db);
+      const pass = await restartedService.reconcileResolvedDependencyWakes();
+      expect(pass.interactionSkipped).toBe(1);
+      expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+    },
+  );
+
+  it.each(["none", "other_issue", "other_company"])(
+    "does not suppress a restored wake for an unrelated wait (%s)",
+    async (mode) => {
+      const fixture = await seedResolvedDependencyBackstopFixture();
+      const interaction = await seedPendingInteraction(fixture, mode === "none" ? "none" : "wake_assignee");
+      if (mode === "other_issue") {
+        await db.update(issueThreadInteractions).set({ issueId: fixture.blockerIssueId })
+          .where(eq(issueThreadInteractions.id, interaction.id));
+      } else if (mode === "other_company") {
+        const [otherCompany] = await db.insert(companies).values({ name: "Synthetic other company",
+          issuePrefix: "OTHER" }).returning();
+        await db.update(issueThreadInteractions).set({ companyId: otherCompany!.id })
+          .where(eq(issueThreadInteractions.id, interaction.id));
+      }
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, fixture.blockedIssueId));
+      const app = await createDependencyApp(fixture.companyId, fixture.ownerUserId);
+      const res = await request(app).patch(`/api/issues/${fixture.blockedIssueId}`).send({
+        status: "blocked", blockedByIssueIds: [fixture.blockerIssueId],
+        unblockDescriptor: { owner: "board", action: "Review the synthetic dependency" },
+      });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      await vi.waitFor(async () => expect(await db.select().from(agentWakeupRequests)).toHaveLength(1));
+    },
+  );
+
+  it.each(["rejected", "expired", "cancelled"])(
+    "a %s interaction releases the untouched ready-state key to the backstop once",
+    async (status) => {
+      const fixture = await seedResolvedDependencyBackstopFixture();
+      const interaction = await seedPendingInteraction(fixture, "wake_assignee_on_accept");
+      expect((await heartbeatService(db).reconcileResolvedDependencyWakes()).interactionSkipped).toBe(1);
+      await db.update(issueThreadInteractions).set({ status, resolvedAt: new Date() })
+        .where(eq(issueThreadInteractions.id, interaction.id));
+      const first = await heartbeatService(db).reconcileResolvedDependencyWakes();
+      const second = await heartbeatService(db).reconcileResolvedDependencyWakes();
+      expect(first.healed).toBe(1);
+      expect(second.healed).toBe(0);
+      expect(await db.select().from(agentWakeupRequests)).toHaveLength(1);
+    },
+  );
+
+  it("keeps blocker_done evidence while the dependent has a pending interaction", async () => {
+    const fixture = await seedResolvedDependencyBackstopFixture();
+    await seedPendingInteraction(fixture);
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, fixture.blockerIssueId));
+    const app = await createDependencyApp(fixture.companyId, fixture.ownerUserId);
+    const res = await request(app).patch(`/api/issues/${fixture.blockerIssueId}`).send({ status: "done" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await vi.waitFor(async () => expect(await db.select().from(agentWakeupRequests)).toHaveLength(1));
+    expect((await db.select().from(agentWakeupRequests))[0]?.reason).toBe("issue_blockers_resolved");
+    expect((await heartbeatService(db).reconcileResolvedDependencyWakes()).healed).toBe(0);
+  });
+
+  it.each(["accept", "respond"])(
+    "a human %s starts one continuation and the backstop does not duplicate its live run",
+    async (endpoint) => {
+      const fixture = await seedResolvedDependencyBackstopFixture();
+      const interaction = await seedPendingInteraction(fixture);
+      if (endpoint === "respond") {
+        await db.update(issueThreadInteractions).set({ kind: "ask_user_questions",
+          payload: { version: 1, questions: [{ id: "continue", prompt: "Continue?",
+            selectionMode: "single", options: [{ id: "yes", label: "Continue" }] }] },
+        }).where(eq(issueThreadInteractions.id, interaction.id));
+      }
+      let releaseRun!: () => void;
+      const running = new Promise<void>((resolve) => { releaseRun = resolve; });
+      mockAdapterExecute.mockImplementationOnce(async () => {
+        await running;
+        return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+          summary: "Synthetic answer handled.", provider: "test", model: "test-model" };
+      });
+      const hb = heartbeatService(db);
+      try {
+        const app = await createDependencyApp(fixture.companyId, fixture.ownerUserId);
+        const res = await request(app)
+          .post(`/api/issues/${fixture.blockedIssueId}/interactions/${interaction.id}/${endpoint}`)
+          .send(endpoint === "respond" ? { answers: [{ questionId: "continue", optionIds: ["yes"] }] } : {});
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1));
+        expect((await hb.reconcileResolvedDependencyWakes()).healed).toBe(0);
+        expect(await db.select().from(agentWakeupRequests)).toHaveLength(1);
+      } finally {
+        releaseRun();
+        await hb.drainActiveRunExecutions();
+      }
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("coalesces a human acceptance concurrent with restored blocked into at most one effective run", async () => {
+    const fixture = await seedResolvedDependencyBackstopFixture();
+    const interaction = await seedPendingInteraction(fixture);
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, fixture.blockedIssueId));
+    const app = await createDependencyApp(fixture.companyId, fixture.ownerUserId);
+    const hb = heartbeatService(db);
+
+    let releaseRun!: () => void;
+    const running = new Promise<void>((resolve) => { releaseRun = resolve; });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await running;
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Synthetic response handled.", provider: "test", model: "test-model" };
+    });
+    try {
+      const [res, accepted] = await Promise.all([
+        request(app).patch(`/api/issues/${fixture.blockedIssueId}`).send({
+          status: "blocked", blockedByIssueIds: [fixture.blockerIssueId],
+          unblockDescriptor: { owner: "board", action: "Review the synthetic response" },
+        }),
+        request(app).post(`/api/issues/${fixture.blockedIssueId}/interactions/${interaction.id}/accept`).send({}),
+      ]);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+      await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1));
+      expect((await hb.reconcileResolvedDependencyWakes()).healed).toBe(0);
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, fixture.agentId));
+      expect(runs.length).toBeLessThanOrEqual(1);
+      const wakes = await db.select().from(agentWakeupRequests);
+      expect(wakes.some((wake) => (wake.payload as any)?.interactionId === interaction.id)).toBe(true);
+    } finally {
+      releaseRun();
+      await hb.drainActiveRunExecutions();
+    }
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
   });
 
   it("keeps resolved dependency wake reconciliation active", async () => {

@@ -1,4 +1,5 @@
 import express from "express";
+import { getTableName } from "drizzle-orm";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -16,6 +17,8 @@ import {
 // yet still below the 30s hook timeout.
 vi.setConfig({ testTimeout: 30000 });
 
+const mockPendingInteractions = vi.hoisted(() => ({ rows: [] as { id: string }[] }));
+const mockLogActivity = vi.hoisted(() => vi.fn(async (..._args: any[]) => undefined));
 const mockWakeup = vi.hoisted(() => vi.fn(async () => undefined));
 const mockFindExistingIssueBlockersResolvedWakeForReadyState = vi.hoisted(() => vi.fn(async () => null));
 const mockIssueService = vi.hoisted(() => ({
@@ -93,7 +96,7 @@ vi.mock("../services/index.js", () => ({
     expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
   }),
   issueService: () => mockIssueService,
-  logActivity: vi.fn(async () => undefined),
+  logActivity: mockLogActivity,
   projectService: () => ({
     getById: vi.fn(),
     listByIds: vi.fn(async () => []),
@@ -128,7 +131,9 @@ async function createApp() {
   query.where = vi.fn(() => whereResult);
   const routeDb = {
     select: vi.fn(() => ({
-      from: vi.fn(() => query),
+      from: vi.fn((table) => getTableName(table) === "issue_thread_interactions" ? {
+        where: () => ({ limit: async () => mockPendingInteractions.rows }),
+      } : query),
     })),
     transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
   };
@@ -160,6 +165,7 @@ describe("issue dependency wakeups in issue routes", () => {
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     vi.clearAllMocks();
+    mockPendingInteractions.rows = [];
     mockFindExistingIssueBlockersResolvedWakeForReadyState.mockResolvedValue(null);
     mockIssueService.getAncestors.mockResolvedValue([]);
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
@@ -427,6 +433,34 @@ describe("issue dependency wakeups in issue routes", () => {
       ...overrides,
     };
   }
+
+  it("suppresses repeated restored blocked wakes without consuming a key while an interaction is pending", async () => {
+    mockPendingInteractions.rows = [{ id: "interaction-1" }];
+    mockIssueService.getById.mockResolvedValue(issueRecord({ status: "in_progress" }));
+    mockIssueService.update.mockResolvedValue(issueRecord({ status: "blocked" }));
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      blockerIssueIds: ["11111111-1111-4111-8111-111111111111"],
+      unresolvedBlockerIssueIds: [], unresolvedBlockerCount: 0,
+      isDependencyReady: true,
+    });
+    const app = await createApp();
+    for (let n = 0; n < 3; n++) {
+      const res = await request(app).patch("/api/issues/issue-1").send({
+        status: "blocked", unblockDescriptor: { owner: "board", action: "Answer the pending question" },
+      });
+      expect(res.status).toBe(200);
+    }
+    await vi.waitFor(() => expect(mockLogActivity.mock.calls.filter((call) =>
+      call[1].action === "issue.blockers_resolved_wake_suppressed")).toHaveLength(3));
+    expect(mockWakeup).not.toHaveBeenCalled();
+    expect(mockFindExistingIssueBlockersResolvedWakeForReadyState).not.toHaveBeenCalled();
+    const events = mockLogActivity.mock.calls.filter((call) =>
+      (call[1] as any).action === "issue.blockers_resolved_wake_suppressed");
+    expect(events).toHaveLength(3);
+    expect(events[0][1]).toMatchObject({
+      entityId: "issue-1", details: expect.objectContaining({ interactionId: "interaction-1" }),
+    });
+  });
 
   it("wakes a Release-like dependent after a terminal reset using the current blocked cycle", async () => {
     const reviewIssueId = "11111111-1111-4111-8111-111111111111";

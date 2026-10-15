@@ -309,6 +309,23 @@ Unestimated issues default to 1 point for progress/velocity calculations.
 | `createdAt`  | timestamp      |                            |
 | `updatedAt`  | timestamp      |                            |
 
+For ordinary issue comments, `POST /api/issues/:id/comments` and
+`PATCH /api/issues/:id` with `comment` accept an optional `reopen` flag.
+A human comment on an assigned `done` or `cancelled` issue implicitly moves it
+to `todo` and wakes the assignee. The author can send `reopen: false` in that
+request to keep the issue closed. The server saves the comment. Explicit agent
+mentions still wake their targets. The flag applies to the state read at request
+start. It does not suppress an explicit resume or status change, and it does not
+change comment behavior on open issues.
+
+When a PATCH restores a dependency-ready `blocked` issue, a pending interaction
+on the same company and issue suppresses the dependency wake if its continuation
+policy is `wake_assignee` or `wake_assignee_on_accept`. The server records
+`issue.blockers_resolved_wake_suppressed` with the interaction ID. This check does
+not write a wake key or change issue status. A blocker that becomes `done` still
+emits its normal dependency wake. The recovery backstop keeps its existing wait
+and deduplication rules.
+
 ---
 
 ## Initiatives

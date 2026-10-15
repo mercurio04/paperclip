@@ -1,3 +1,4 @@
+import { findPendingWakeInteraction } from "../services/pending-wake-interaction.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
@@ -2289,6 +2290,7 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   checkoutRunId: string | null | undefined;
   executionRunId: string | null | undefined;
   requestAddsExplicitBlockers?: boolean;
+  reopen?: boolean;
 }) {
   // A request that wires a non-empty blockedByIssueIds list is declaring that
   // the issue is waiting on other work. The implicit reopen exists for plain
@@ -2296,6 +2298,9 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   // edits — flipping to todo here would contradict the caller's stated intent
   // in the same request.
   if (input.requestAddsExplicitBlockers) return false;
+  // Only the current author can opt out of the implicit reopen of closed work.
+  // Explicit resume/status changes and comments on open tasks keep their rules.
+  if (input.reopen === false && isClosedIssueStatus(input.issueStatus)) return false;
   // Local-CLI agents post comments under user auth, so the actor.type is "user"
   // even though the comment originates from the same heartbeat run that owns
   // the issue lock. Without this guard, an agent that closes its own issue and
@@ -12954,6 +12959,7 @@ export function issueRoutes(
         (explicitMoveToTodoRequested ||
           (!!commentBody &&
             shouldImplicitlyMoveCommentedIssueToTodo({
+              reopen: reopenRequested,
               issueStatus: existing.status,
               assigneeAgentId: requestedAssigneeAgentId,
               actorType: actor.actorType,
@@ -14741,15 +14747,37 @@ export function issueRoutes(
             readiness.isDependencyReady &&
             readiness.blockerIssueIds.length > 0
           ) {
-            await addDependencyResolvedWakeup({
-              agentId: issue.assigneeAgentId!,
-              dependentIssueId: issue.id,
-              resolvedBlockerIssueId,
-              blockerIssueIds: readiness.blockerIssueIds,
-              blockedTransitionAt: issue.blockedTransitionAt,
-              source: "issue.blockers_restored",
-              mutation: "blocked_dependency_restored",
-            });
+            const pendingInteraction = await findPendingWakeInteraction(
+              db, issue.companyId, issue.id,
+            );
+            if (pendingInteraction) {
+              await logActivity(db, {
+                companyId: issue.companyId,
+                actorType: actor.actorType,
+                actorId: actor.actorId,
+                agentId: actor.agentId,
+                runId: actor.runId,
+                agentApiKeyId: actor.agentApiKeyId,
+                action: "issue.blockers_resolved_wake_suppressed",
+                entityType: "issue",
+                entityId: issue.id,
+                details: {
+                  interactionId: pendingInteraction.id,
+                  source: "issue.blockers_restored",
+                  mutation: "blocked_dependency_restored",
+                },
+              });
+            } else {
+              await addDependencyResolvedWakeup({
+                agentId: issue.assigneeAgentId!,
+                dependentIssueId: issue.id,
+                resolvedBlockerIssueId,
+                blockerIssueIds: readiness.blockerIssueIds,
+                blockedTransitionAt: issue.blockedTransitionAt,
+                source: "issue.blockers_restored",
+                mutation: "blocked_dependency_restored",
+              });
+            }
           }
         }
 
@@ -17332,6 +17360,7 @@ export function issueRoutes(
         !assigneeSelfCommentOnTerminal &&
         (explicitMoveToTodoRequested ||
           shouldImplicitlyMoveCommentedIssueToTodo({
+            reopen: req.body.reopen,
             issueStatus: issue.status,
             assigneeAgentId: issue.assigneeAgentId,
             actorType: actor.actorType,
