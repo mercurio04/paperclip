@@ -39,6 +39,10 @@ A missing expected check with no other running expected checks also requires
 an agent decision. No checks is a missing-check event.
 
 A waiting poll saves its digest in server-owned `issues.monitor_probe_state`.
+Issue detail, list, mutation and conversation responses omit `monitorProbeState`.
+Diagnostics and portable exports use public field projections. The existing
+monitor schedule fields and structured `githubChecks` wake payload remain public.
+The scheduler reads the private column directly; API reads do not clear it.
 It updates the policy/state schedule and attempt projection together. The first
 interval is the declared interval, clamped to 5–30 minutes. Later waiting polls
 multiply it by 1.5, up to 30 minutes. The next poll never exceeds `timeoutAt`.
