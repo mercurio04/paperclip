@@ -80,6 +80,12 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import {
+  agentInvocationIsManualOnly,
+  inertAgentPermissions,
+  inertAgentRuntimeConfig,
+  preserveInertLocks,
+} from "../services/agent-invocation-policy.js";
 import { PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
@@ -4708,8 +4714,20 @@ export function agentRoutes(
       // The onboarding marker is not an agent column. The server consumes it to
       // seed the chief-of-staff persona; it never reaches the insert values.
       onboardingFirstAgent: createOnboardingFirstAgent,
+      // Opt-in inert creation (TAX-452) is not an agent column. It persists a
+      // paused, manual-only, assignment-locked agent without default grants.
+      inert: createInert,
       ...createInput
     } = req.body;
+    const inertCreate = createInert === true;
+    if (inertCreate) {
+      if (req.actor.type !== "board") {
+        throw forbidden("Only the board can create an inert agent");
+      }
+      if (createInput.role === "ceo") {
+        throw unprocessable("An inert agent cannot be the company CEO");
+      }
+    }
     createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
@@ -4773,8 +4791,20 @@ export function agentRoutes(
         id: agentId,
         ...createInput,
         adapterConfig: normalizedAdapterConfig,
-        runtimeConfig: normalizedRuntimeConfig,
-        status: "idle",
+        // Inert creation writes the paused status, disabled wakes and the
+        // persisted locks in the same insert/transaction as the agent row.
+        ...(inertCreate
+          ? {
+              runtimeConfig: inertAgentRuntimeConfig(normalizedRuntimeConfig),
+              permissions: inertAgentPermissions(createInput.permissions),
+              status: "paused",
+              pauseReason: "manual",
+              pausedAt: new Date(),
+            }
+          : {
+              runtimeConfig: normalizedRuntimeConfig,
+              status: "idle",
+            }),
         spentMonthlyCents: 0,
         lastHeartbeatAt: null,
       },
@@ -4816,6 +4846,7 @@ export function agentRoutes(
         name: agent.name,
         role: agent.role,
         desiredSkills: desiredSkillAssignment.desiredSkills,
+        ...(inertCreate ? { inert: true, invocationPolicy: "manual_only" } : {}),
       },
     });
     const telemetryClient = getTelemetryClient();
@@ -4823,12 +4854,15 @@ export function agentRoutes(
       trackAgentCreated(telemetryClient, { agentRole: agent.role, agentId: agent.id });
     }
 
-    await applyDefaultAgentTaskAssignGrant(
-      companyId,
-      agent.id,
-      req.actor.type === "board" ? (req.actor.userId ?? null) : null,
-    );
-    await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
+    // An inert agent receives no membership or principal grant at creation.
+    if (!inertCreate) {
+      await applyDefaultAgentTaskAssignGrant(
+        companyId,
+        agent.id,
+        req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+      );
+      await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
+    }
 
     if (agent.budgetMonthlyCents > 0) {
       await budgets.upsertPolicy(
@@ -4851,6 +4885,7 @@ export function agentRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
 
+    const existingManualOnly = agentInvocationIsManualOnly(existing.permissions);
     if (req.actor.type === "agent") {
       const actorAgent = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
       if (!actorAgent || actorAgent.companyId !== existing.companyId) {
@@ -4861,11 +4896,25 @@ export function agentRoutes(
         res.status(403).json({ error: "Only CEO can manage permissions" });
         return;
       }
+      if (existingManualOnly) {
+        res.status(403).json({ error: "Only the board can manage permissions of a manual-only agent" });
+        return;
+      }
     } else {
       await assertBoardCanManageAgentsForCompany(req, existing.companyId);
     }
 
-    const agent = await svc.updatePermissions(id, req.body);
+    // The inert manual-only locks (assignment block + invocation gate) survive
+    // any permissions rewrite; this route cannot drop them.
+    const agent = await svc.updatePermissions(
+      id,
+      existingManualOnly
+        ? preserveInertLocks(existing.permissions, {
+            ...(existing.permissions as Record<string, unknown> | null ?? {}),
+            ...req.body,
+          })
+        : req.body,
+    );
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;

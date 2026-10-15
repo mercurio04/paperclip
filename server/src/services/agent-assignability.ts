@@ -7,6 +7,7 @@ import {
   type AgentOrgChainHealth,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { agentAssignmentIsHardLocked } from "./agent-invocation-policy.js";
 
 type AgentAssignmentKind = "work" | "routine";
 
@@ -20,9 +21,15 @@ type AgentAssignmentConflictReason =
   | "ancestor_missing"
   | "ancestor_cross_company"
   | "ancestor_cycle"
-  | "ancestor_depth_exceeded";
+  | "ancestor_depth_exceeded"
+  | "assignment_blocked";
 
 function assignmentMessage(kind: AgentAssignmentKind, reason: AgentAssignmentConflictReason) {
+  if (reason === "assignment_blocked") {
+    return kind === "routine"
+      ? "Cannot assign routines to an agent whose assignment is blocked"
+      : "Cannot assign work to an agent whose assignment is blocked";
+  }
   if (reason === "pending_approval") {
     return kind === "routine"
       ? "Cannot assign routines to pending approval agents"
@@ -113,6 +120,20 @@ export async function assertAssignableAgent(
   if (!assignee) throw notFound("Assignee agent not found");
   if (assignee.companyId !== companyId) {
     throw unprocessable("Assignee must belong to same company");
+  }
+  // A persisted assignment block (e.g. an inert manual-only agent) is a hard
+  // deny for every actor and service path, including board and workflow paths.
+  const [policyRow] = await db
+    .select({ permissions: agents.permissions })
+    .from(agents)
+    .where(eq(agents.id, agentId));
+  if (agentAssignmentIsHardLocked(policyRow?.permissions)) {
+    throw conflict(assignmentMessage(kind, "assignment_blocked"), conflictDetails({
+      companyId,
+      assigneeAgentId: agentId,
+      reason: "assignment_blocked",
+      chain: [],
+    }));
   }
 
   const companyAgents = await listCompanyAgents(db, companyId);

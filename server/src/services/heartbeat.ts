@@ -33,6 +33,10 @@ import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERRO
 import { captureDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
 import {
+  agentInvocationIsManualOnly,
+  MANUAL_ONLY_SKIP_REASON,
+} from "./agent-invocation-policy.js";
+import {
   assertDurableChatWakeupReceipt,
   assertDurableChatWakeupRequest,
   authorizeFailedChatRunRetryWake,
@@ -16592,6 +16596,35 @@ export function heartbeatService(
     return null;
   }
 
+  async function cancelQueuedRunForManualOnlyAgent(
+    run: typeof heartbeatRuns.$inferSelect,
+  ) {
+    const now = new Date();
+    const reason =
+      "Cancelled because this agent only runs from an explicit human invocation";
+    const cancelled = await setRunStatus(run.id, "cancelled", {
+      finishedAt: now,
+      error: reason,
+      errorCode: MANUAL_ONLY_SKIP_REASON,
+    });
+    if (!cancelled) return null;
+    await setWakeupStatus(run.wakeupRequestId, "skipped", {
+      finishedAt: now,
+      error: reason,
+    });
+    await appendRunEvent(cancelled, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: reason,
+      payload: { reason: MANUAL_ONLY_SKIP_REASON },
+    });
+    await releaseIssueExecutionAndPromote(cancelled, {
+      suppressImmediateRecovery: true,
+    });
+    return cancelled;
+  }
+
   async function cancelQueuedRunForHeartbeatDailyCap(
     run: typeof heartbeatRuns.$inferSelect,
     dailyCapBlock: NonNullable<
@@ -17063,6 +17096,16 @@ export function heartbeatService(
         `Cancelled because the agent is not invokable: ${invokability.reason}`,
       );
       return null;
+    }
+    // Retry, recovery and wake-queue paths can insert runs without passing
+    // through enqueueWakeup. A manual-only agent executes only a run whose
+    // persisted wakeup receipt proves an authenticated human click.
+    if (agentInvocationIsManualOnly(agent.permissions)) {
+      const operator = await explicitOperatorRunIdentity(db, run).catch(() => null);
+      if (operator?.cause !== "manual_user_wake") {
+        await cancelQueuedRunForManualOnlyAgent(run);
+        return null;
+      }
     }
 
     const context = parseObject(run.contextSnapshot);
@@ -26113,6 +26156,18 @@ export function heartbeatService(
       return queuedResponsibleUserIdPromise;
     };
 
+    // Opt-in manual-only agents (TAX-452) run only from an explicit,
+    // authenticated human invocation. Every other wake (assignment, comment,
+    // mention, dependency, recovery, monitor, timer, automation) is recorded as
+    // skipped without an execution wait, so it is never replayed later.
+    const manualOnlyAgent = agentInvocationIsManualOnly(agent.permissions);
+    if (manualOnlyAgent && !opts.manualUserWake) {
+      await writeSkippedRequest(MANUAL_ONLY_SKIP_REASON, {
+        error: "This agent only runs from an explicit human invocation.",
+      });
+      return null;
+    }
+
     const budgetBlock = await budgets.getInvocationBlock(
       agent.companyId,
       agentId,
@@ -26152,7 +26207,12 @@ export function heartbeatService(
       await writeSkippedRequest("heartbeat.disabled", {}, { enabled: false });
       return null;
     }
-    if (source !== "timer" && !policy.wakeOnDemand) {
+    if (
+      source !== "timer" &&
+      !policy.wakeOnDemand &&
+      // The manual-only gate above already admitted only a human invocation.
+      !(manualOnlyAgent && opts.manualUserWake)
+    ) {
       await writeSkippedRequest("heartbeat.wakeOnDemand.disabled", {}, { wakeOnDemand: false });
       return null;
     }
@@ -29118,6 +29178,7 @@ export function heartbeatService(
           agentsByCompany.get(agent.companyId) ?? [],
         );
         if (!invokability.invokable) continue;
+        if (agentInvocationIsManualOnly(agent.permissions)) continue;
         const policy = parseHeartbeatPolicy(agent);
         if (!policy.enabled || policy.intervalSec <= 0) continue;
 
