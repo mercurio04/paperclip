@@ -387,7 +387,18 @@ export const issueExecutionStageSchema = z.object({
   participants: z.array(issueExecutionStageParticipantSchema).default([]),
 });
 
+const githubChecksMonitorFields = {
+  repo: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]+$/).max(200)
+    .refine(repo => ![".", ".."].includes(repo.split("/")[1]!), "Invalid repository").optional(),
+  prNumber: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  headSha: z.string().regex(/^[a-fA-F0-9]{40}$/).optional(),
+  expectedChecks: z.array(z.string().trim().min(1).max(200)).min(1).max(100)
+    .refine((names) => new Set(names).size === names.length, "Check names must be unique").optional(),
+  intervalMinutes: z.number().finite().positive().max(1440).optional(),
+};
+
 export const issueExecutionMonitorPolicySchema = z.object({
+  ...githubChecksMonitorFields,
   nextCheckAt: z.string().datetime(),
   notes: z.string().max(500).optional().nullable().default(null),
   scheduledBy: z
@@ -429,6 +440,11 @@ export const issueExecutionMonitorPolicySchema = z.object({
     .optional()
     .nullable()
     .default(null),
+}).superRefine((monitor, ctx) => {
+  if (monitor.kind !== "github_checks") return;
+  for (const key of ["repo", "prNumber", "headSha", "expectedChecks", "intervalMinutes", "timeoutAt", "maxAttempts"] as const) {
+    if (monitor[key] == null) ctx.addIssue({ code: "custom", path: [key], message: `${key} is required for github_checks` });
+  }
 });
 
 export const issueExecutionPolicySchema = z.object({
@@ -449,6 +465,7 @@ export const issueExecutionPolicySchema = z.object({
 });
 
 export const issueExecutionMonitorStateSchema = z.object({
+  ...githubChecksMonitorFields,
   status: z.enum(ISSUE_EXECUTION_MONITOR_STATE_STATUSES),
   nextCheckAt: z.string().datetime().nullable(),
   lastTriggeredAt: z.string().datetime().nullable(),

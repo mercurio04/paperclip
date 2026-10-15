@@ -1,0 +1,1 @@
+ALTER TABLE "issues" ADD COLUMN IF NOT EXISTS "monitor_probe_state" jsonb;

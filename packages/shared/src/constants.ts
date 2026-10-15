@@ -524,7 +524,7 @@ export type IssueExecutionStageType = (typeof ISSUE_EXECUTION_STAGE_TYPES)[numbe
 export const ISSUE_MONITOR_SCHEDULED_BY = ["assignee", "board"] as const;
 export type IssueMonitorScheduledBy = (typeof ISSUE_MONITOR_SCHEDULED_BY)[number];
 
-export const ISSUE_EXECUTION_MONITOR_KINDS = ["external_service"] as const;
+export const ISSUE_EXECUTION_MONITOR_KINDS = ["external_service", "github_checks"] as const;
 export type IssueExecutionMonitorKind = (typeof ISSUE_EXECUTION_MONITOR_KINDS)[number];
 
 export const PROVIDER_QUOTA_MONITOR_SERVICE_NAME = "AI provider quota";
