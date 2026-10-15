@@ -574,6 +574,42 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       .where(eq(agentWakeupRequests.reason, "issue_blockers_resolved"))).toHaveLength(1));
   });
 
+  it.each([
+    { ageMs: 60_000, receipt: null },
+    { ageMs: 86_400_000, receipt: null },
+    { ageMs: 1_000, receipt: "completed" },
+    { ageMs: 3_600_000, receipt: "completed" },
+    { ageMs: 1_000, receipt: "queued" },
+  ])("restores a wake without a current continuation (age $ageMs, previous-agent receipt $receipt)", async ({ ageMs, receipt }) => {
+    const fixture = await seedResolvedDependencyBackstopFixture();
+    const interaction = await seedPendingInteraction(fixture);
+    await db.update(issueThreadInteractions).set({ status: "accepted",
+      resolvedAt: new Date(Date.now() - ageMs) }).where(eq(issueThreadInteractions.id, interaction.id));
+    if (receipt) {
+      const previousAgentId = randomUUID();
+      await db.insert(agents).values({ id: previousAgentId, companyId: fixture.companyId,
+        name: "Previous synthetic assignee", role: "engineer", status: "idle", adapterType: "test_adapter",
+        adapterConfig: {}, permissions: {}, runtimeConfig: {} });
+      await db.insert(agentWakeupRequests).values({ companyId: fixture.companyId,
+        agentId: previousAgentId, source: "automation", status: receipt,
+        payload: { issueId: fixture.blockedIssueId, interactionId: interaction.id },
+      });
+    }
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, fixture.blockedIssueId));
+    const app = await createDependencyApp(fixture.companyId, fixture.ownerUserId);
+    const res = await request(app).patch(`/api/issues/${fixture.blockedIssueId}`).send({
+      status: "blocked", blockedByIssueIds: [fixture.blockerIssueId],
+      unblockDescriptor: { owner: "board", action: "Review independent work for the current assignee" },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await vi.waitFor(async () => expect(await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, fixture.agentId),
+      eq(agentWakeupRequests.reason, "issue_blockers_resolved"),
+    ))).toHaveLength(1));
+    expect(await db.select().from(activityLog).where(
+      eq(activityLog.action, "issue.blockers_resolved_wake_suppressed"))).toHaveLength(0);
+  });
+
   it("keeps blocker_done evidence while the dependent has a pending interaction", async () => {
     const fixture = await seedResolvedDependencyBackstopFixture();
     await seedPendingInteraction(fixture);
@@ -612,6 +648,10 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
           .send(endpoint === "respond" ? { answers: [{ questionId: "continue", optionIds: ["yes"] }] } : {});
         expect(res.status, JSON.stringify(res.body)).toBe(200);
         await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1));
+        // An active current-assignee receipt remains authoritative after the
+        // short no-receipt grace has elapsed.
+        await db.update(issueThreadInteractions).set({ resolvedAt: new Date(Date.now() - 3_600_000) })
+          .where(eq(issueThreadInteractions.id, interaction.id));
         const restored = await request(app).patch(`/api/issues/${fixture.blockedIssueId}`).send({
           status: "blocked", blockedByIssueIds: [fixture.blockerIssueId],
           unblockDescriptor: { owner: "board", action: "Await the live continuation" },

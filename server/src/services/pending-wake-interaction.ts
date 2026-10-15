@@ -23,10 +23,11 @@ export async function findPendingWakeInteraction(db: Db, companyId: string, issu
 
 /**
  * Only the restored-blocked route uses this race guard. A response committed
- * before the PATCH may not have a wake receipt yet. Leave that dispatch gap to
- * its normal continuation (or the unchanged recovery backstop). Once a receipt
- * exists, suppress only while that continuation is queued or running. Completed
- * historical continuations must not hide independent work.
+ * before the PATCH may not have a wake receipt yet. Allow a 30-second dispatch
+ * grace from resolvedAt, not an indefinite wait for a receipt that may never
+ * exist (e.g. resolution while unassigned). Correlate receipts across assignees;
+ * only a queued/running continuation for the current assignee should suppress
+ * its wake. Completed historical continuations must not hide independent work.
  */
 export async function findRestoredBlockedInteractionContinuation(
   db: Db,
@@ -48,13 +49,15 @@ export async function findRestoredBlockedInteractionContinuation(
         ),
       ),
       or(
-        sql`not exists (
-          select 1 from ${agentWakeupRequests}
-          where ${agentWakeupRequests.companyId} = ${companyId}
-            and ${agentWakeupRequests.agentId} = ${agentId}
-            and ${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}
-            and ${agentWakeupRequests.payload} ->> 'interactionId' = ${issueThreadInteractions.id}::text
-        )`,
+        and(
+          sql`${issueThreadInteractions.resolvedAt} >= now() - interval '30 seconds'`,
+          sql`not exists (
+            select 1 from ${agentWakeupRequests}
+            where ${agentWakeupRequests.companyId} = ${companyId}
+              and ${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}
+              and ${agentWakeupRequests.payload} ->> 'interactionId' = ${issueThreadInteractions.id}::text
+          )`,
+        ),
         sql`exists (
           select 1 from ${agentWakeupRequests}
           where ${agentWakeupRequests.companyId} = ${companyId}
