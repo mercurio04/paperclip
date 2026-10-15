@@ -1,7 +1,7 @@
 import { and, eq, isNull, lt, sql } from "drizzle-orm";
 
 import type { Db } from "@paperclipai/db";
-import { nativePermissionDecisions } from "@paperclipai/db";
+import { heartbeatRunEvents, nativePermissionDecisions } from "@paperclipai/db";
 
 import type { NativePermissionDecision } from "./runtime-request-resolution-authority.js";
 
@@ -254,4 +254,83 @@ export function nativePermissionOutcomeFromEvent(event: {
     return null;
   const nativeOutcome = parseNativePermissionOutcome(payload.nativeOutcome);
   return nativeOutcome ? { requestId: payload.requestId, nativeOutcome } : null;
+}
+
+/**
+ * Terminal-time reconciliation (TAX-452 H13). Once a run is terminal its event
+ * consumer is gone, so a `permission_native_outcome` reported after the
+ * terminal (cancel || once race) can no longer reach the claim. For every
+ * claim of the run still `delivered` without a native outcome:
+ * 1. recover the outcome from a `permission_native_outcome` diagnostic already
+ *    committed to the run's durable events (first write wins), else
+ * 2. move it to `dispatch_uncertain`: what OpenCode received is not observable
+ *    any more. Never redelivered; a later outcome may still be recorded.
+ * A plain `delivered` claim with a null outcome never survives this call.
+ */
+export async function reconcileTerminalNativePermissionOutcomes(
+  db: Db,
+  input: { readonly companyId: string; readonly runId: string; readonly reason: string },
+): Promise<{
+  recovered: Array<{ id: string; requestId: string; nativeOutcome: NativePermissionOutcome }>;
+  uncertain: Array<{ id: string; requestId: string; turnId: string; decision: string; contractSha256: string; resolverUserId: string }>;
+}> {
+  const scope = and(
+    eq(nativePermissionDecisions.companyId, input.companyId),
+    eq(nativePermissionDecisions.runId, input.runId),
+    eq(nativePermissionDecisions.status, "delivered"),
+    isNull(nativePermissionDecisions.nativeOutcome),
+  );
+  const open = await db
+    .select({ id: nativePermissionDecisions.id, requestId: nativePermissionDecisions.requestId })
+    .from(nativePermissionDecisions)
+    .where(scope);
+  const recovered: Array<{ id: string; requestId: string; nativeOutcome: NativePermissionOutcome }> = [];
+  if (open.length === 0) return { recovered, uncertain: [] };
+  const diagnostics = await db
+    .select({ payload: heartbeatRunEvents.payload })
+    .from(heartbeatRunEvents)
+    .where(and(
+      eq(heartbeatRunEvents.companyId, input.companyId),
+      eq(heartbeatRunEvents.runId, input.runId),
+      eq(heartbeatRunEvents.eventType, "harness.diagnostic"),
+    ));
+  const committed = new Map<string, NativePermissionOutcome>();
+  for (const row of diagnostics) {
+    const payload = row.payload && typeof row.payload === "object" && !Array.isArray(row.payload)
+      ? (row.payload as Record<string, unknown>)
+      : {};
+    const prp = payload.prpEvent && typeof payload.prpEvent === "object" && !Array.isArray(payload.prpEvent)
+      ? (payload.prpEvent as Record<string, unknown>)
+      : {};
+    const outcome = nativePermissionOutcomeFromEvent({ eventType: "harness.diagnostic", payload: prp.payload ?? payload });
+    if (outcome && !committed.has(outcome.requestId)) committed.set(outcome.requestId, outcome.nativeOutcome);
+  }
+  for (const claim of open) {
+    const nativeOutcome = committed.get(claim.requestId);
+    if (!nativeOutcome) continue;
+    const result = await recordNativePermissionOutcome(db, {
+      companyId: input.companyId,
+      runId: input.runId,
+      requestId: claim.requestId,
+      nativeOutcome,
+    });
+    if (result.kind === "recorded") recovered.push({ id: claim.id, requestId: claim.requestId, nativeOutcome });
+  }
+  const uncertain = await db
+    .update(nativePermissionDecisions)
+    .set({
+      status: "dispatch_uncertain",
+      error: input.reason.slice(0, 2000),
+      updatedAt: sql`now()`,
+    })
+    .where(scope)
+    .returning({
+      id: nativePermissionDecisions.id,
+      requestId: nativePermissionDecisions.requestId,
+      turnId: nativePermissionDecisions.turnId,
+      decision: nativePermissionDecisions.decision,
+      contractSha256: nativePermissionDecisions.contractSha256,
+      resolverUserId: nativePermissionDecisions.resolverUserId,
+    });
+  return { recovered, uncertain };
 }

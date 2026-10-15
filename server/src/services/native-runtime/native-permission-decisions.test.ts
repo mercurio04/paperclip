@@ -5,6 +5,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   nativePermissionDecisions,
 } from "@paperclipai/db";
@@ -18,6 +19,7 @@ import {
   claimNativePermissionDecision,
   nativePermissionOutcomeFromEvent,
   reconcileCrashedNativePermissionClaims,
+  reconcileTerminalNativePermissionOutcomes,
   settleNativePermissionDecision,
 } from "./native-permission-decisions.js";
 
@@ -194,5 +196,46 @@ describeEmbeddedPostgres("native permission decision claims (embedded Postgres)"
         },
       },
     ]);
+  });
+
+  it("terminal reconciliation never leaves a delivered claim without native outcome (H13)", async () => {
+    const delivered = async (requestId: string) => {
+      const claim = await claimNativePermissionDecision(db, { ...claimInput("once"), requestId });
+      await settleNativePermissionDecision(db, { id: claim!.id, status: "delivered" });
+      return claim!;
+    };
+    const committedLate = await delivered("perm-terminal-committed");
+    const lost = await delivered("perm-terminal-lost");
+    const settled = await delivered("perm-terminal-settled");
+    await applyNativePermissionSettle(db,
+      { companyId, agentId, runId, requestId: "perm-terminal-settled", nativeOutcome: "once_applied" },
+      async () => {});
+    // The runnerd relay was committed durably but its consumer callback never ran.
+    await db.insert(heartbeatRunEvents).values({
+      companyId, runId, agentId, seq: 9_001, eventType: "harness.diagnostic", stream: "system", level: "info",
+      payload: { prpEvent: { eventType: "harness.diagnostic", payload: {
+        code: "permission_native_outcome", requestId: "perm-terminal-committed", nativeOutcome: "rejected_terminal",
+      } } },
+    });
+    const result = await reconcileTerminalNativePermissionOutcomes(db, {
+      companyId, runId, reason: "native_outcome_unobserved_at_terminal",
+    });
+    expect(result.recovered).toEqual([
+      { id: committedLate.id, requestId: "perm-terminal-committed", nativeOutcome: "rejected_terminal" },
+    ]);
+    expect(result.uncertain.map((row) => row.requestId)).toEqual(["perm-terminal-lost"]);
+    const rows = await db.select().from(nativePermissionDecisions);
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    expect(byId.get(committedLate.id)).toMatchObject({ status: "delivered", nativeOutcome: "rejected_terminal" });
+    expect(byId.get(lost.id)).toMatchObject({
+      status: "dispatch_uncertain", nativeOutcome: null, error: "native_outcome_unobserved_at_terminal",
+    });
+    expect(byId.get(settled.id)).toMatchObject({ status: "delivered", nativeOutcome: "once_applied" });
+    expect(rows.filter((row) => row.runId === runId && row.status === "delivered" && row.nativeOutcome === null))
+      .toEqual([]);
+    // Idempotent.
+    await expect(reconcileTerminalNativePermissionOutcomes(db, {
+      companyId, runId, reason: "native_outcome_unobserved_at_terminal",
+    })).resolves.toEqual({ recovered: [], uncertain: [] });
   });
 });

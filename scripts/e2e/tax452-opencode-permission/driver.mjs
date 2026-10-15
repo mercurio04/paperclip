@@ -586,7 +586,15 @@ async function main() {
   };
   // runtime_request.resolved carries no decision: a `once` can only leave the
   // server through a claim, so the audit row + claim are the dispatch record.
-  const onceDecisions = async (runId) => pgSql`select details->>'requestId' as request_id, details->>'status' as status from activity_log where entity_id = ${runId} and action = 'heartbeat.runtime_permission_decided' and details->>'decision' = 'once'`;
+  // A delivered claim whose native outcome was never observed before the run
+  // went terminal is reconciled to dispatch_uncertain (audited separately as
+  // heartbeat.runtime_permission_reconciled, previousStatus delivered): the
+  // audit status is the latest durable transition of that request.
+  const onceDecisions = async (runId) => pgSql`select d.details->>'requestId' as request_id,
+      coalesce((select r.details->>'status' from activity_log r where r.entity_id = d.entity_id and r.action = 'heartbeat.runtime_permission_reconciled'
+        and r.details->>'requestId' = d.details->>'requestId' and r.details->>'previousStatus' = d.details->>'status' order by r.created_at desc limit 1),
+        d.details->>'status') as status
+    from activity_log d where d.entity_id = ${runId} and d.action = 'heartbeat.runtime_permission_decided' and d.details->>'decision' = 'once'`;
   const eventDigest = (ev) => ev.filter((e) => !/performance|^log|output|delta/.test(e.eventType ?? e.type ?? "")).map((e) => {
     const t = e.eventType ?? e.type; const p = eventPayload(e);
     return /diagnostic|fail|error|runtime_request|terminal|cancel|notice|item\./.test(t) ? `${t}:${JSON.stringify(p).slice(0, 300)}` : t;

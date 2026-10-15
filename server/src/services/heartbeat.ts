@@ -1,6 +1,9 @@
 import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { terminateNativeDedicatedProcesses } from "./native-runtime/native-dedicated-process-reaper.js";
-import { reconcileCrashedNativePermissionClaims } from "./native-runtime/native-permission-decisions.js";
+import {
+  reconcileCrashedNativePermissionClaims,
+  reconcileTerminalNativePermissionOutcomes,
+} from "./native-runtime/native-permission-decisions.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
 import { legacyControllerBootId, legacyControllerClaim, renewLegacyControllerLease, hasLiveLegacyController, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
@@ -9328,6 +9331,12 @@ export function resolveHeartbeatSchedulingSuppression(
 }
 
 const NATIVE_CANCEL_REAP_SETTLE_MS = 15_000;
+/**
+ * After a board cancel, how long a late `permission_native_outcome` may still
+ * be committed before claims left `delivered` without an outcome are
+ * reconciled (recovered from durable events, else `dispatch_uncertain`).
+ */
+const NATIVE_PERMISSION_OUTCOME_RECONCILE_MS = 4_000;
 const HEARTBEAT_PROCESS_LOADED_AT = new Date();
 
 export function heartbeatService(
@@ -13624,6 +13633,7 @@ export function heartbeatService(
    */
   function reapCancelledNativeRunProcesses(run: typeof heartbeatRuns.$inferSelect) {
     if (run.runtimeMode !== "native") return;
+    scheduleTerminalNativePermissionOutcomeReconciliation(run, "board_cancel");
     void terminateNativeDedicatedProcesses({
       db,
       run,
@@ -13635,6 +13645,77 @@ export function heartbeatService(
     }).catch((error) => {
       logger.warn({ err: error, runId: run.id }, "native cancel process reap failed");
     });
+  }
+
+  /**
+   * TAX-452 H13: a run that reached a terminal state has no event consumer
+   * left, so a native outcome reported after the terminal (cancel || once
+   * race) cannot reach its claim. After a bounded window, every claim of the
+   * run still `delivered` without `native_outcome` is reconciled: recovered
+   * from an already committed `permission_native_outcome`, otherwise moved to
+   * `dispatch_uncertain` (never redelivered) and audited. Never throws.
+   */
+  function scheduleTerminalNativePermissionOutcomeReconciliation(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId">,
+    trigger: string,
+    delayMs = NATIVE_PERMISSION_OUTCOME_RECONCILE_MS,
+  ) {
+    const timer = setTimeout(() => {
+      void reconcileTerminalNativePermissionOutcomesNow(run, trigger).catch((error) => {
+        logger.warn({ err: error, runId: run.id }, "native permission outcome reconciliation failed");
+      });
+    }, delayMs);
+    timer.unref?.();
+  }
+
+  async function reconcileTerminalNativePermissionOutcomesNow(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId">,
+    trigger: string,
+  ) {
+    const reason = "native_outcome_unobserved_at_terminal";
+    const { recovered, uncertain } = await reconcileTerminalNativePermissionOutcomes(db, {
+      companyId: run.companyId,
+      runId: run.id,
+      reason,
+    });
+    for (const row of recovered) {
+      await logActivity(db, {
+        companyId: run.companyId,
+        actorType: "system",
+        actorId: "paperclip-runner",
+        action: "heartbeat.runtime_permission_native_outcome",
+        entityType: "heartbeat_run",
+        entityId: run.id,
+        agentId: run.agentId,
+        runId: run.id,
+        details: { agentId: run.agentId, runId: run.id, requestId: row.requestId, nativeOutcome: row.nativeOutcome,
+          source: "terminal_reconciliation", trigger },
+      });
+    }
+    for (const row of uncertain) {
+      await logActivity(db, {
+        companyId: run.companyId,
+        actorType: "system",
+        actorId: "native_terminal_reconciliation",
+        action: "heartbeat.runtime_permission_reconciled",
+        entityType: "heartbeat_run",
+        entityId: run.id,
+        agentId: run.agentId,
+        runId: run.id,
+        details: {
+          runId: run.id,
+          requestId: row.requestId,
+          turnId: row.turnId,
+          decision: row.decision,
+          contractSha256: row.contractSha256,
+          resolverUserId: row.resolverUserId,
+          previousStatus: "delivered",
+          status: "dispatch_uncertain",
+          reason,
+          trigger,
+        },
+      });
+    }
   }
 
   /**
@@ -13684,6 +13765,9 @@ export function heartbeatService(
         logger.warn({ err: error, runId: run.id }, "native permission claim reconciliation failed");
       }
       if (disposition.kind !== "blocked") continue;
+      await reconcileTerminalNativePermissionOutcomesNow(run, "restart_recovery_blocked").catch((error) => {
+        logger.warn({ err: error, runId: run.id }, "native permission outcome reconciliation failed");
+      });
       void terminateNativeDedicatedProcesses({ db, run, reason: "restart_recovery_blocked" })
         .then((outcome) => {
           if (outcome && outcome.targets.length > 0)

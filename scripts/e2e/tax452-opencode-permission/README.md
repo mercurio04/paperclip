@@ -112,7 +112,11 @@ Runs are strictly serial; the fixture switches scenario between runs.
   outcome (the proxy reports `paperclip/runtimeRequestSettled{status:"applied",
   nativeOutcome}` after the delivery, runnerd relays it as the diagnostic
   `permission_native_outcome`, the server records it first-write-wins and
-  audits `heartbeat.runtime_permission_native_outcome`).
+  audits `heartbeat.runtime_permission_native_outcome`). A claim whose outcome
+  was not observed before the run went terminal is reconciled ~4s after the
+  board cancel: recovered from a committed `permission_native_outcome`, else
+  moved to `dispatch_uncertain` (audited `heartbeat.runtime_permission_reconciled`,
+  previousStatus `delivered`); the once-audit check uses that latest status.
   `TAX452_REQUIRE_NATIVE_OUTCOME=0` allows a null outcome (debug only).
 - `adv.stale_cascaded_permission_409`: fixture scenario `parallel2` asks two
   writes in one model response, so two permissions are pending in the same

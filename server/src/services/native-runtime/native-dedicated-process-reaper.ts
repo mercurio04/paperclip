@@ -52,15 +52,26 @@ function readBootTimeMs(): number | null {
   return bootTimeMs;
 }
 
+/**
+ * `null` only when /proc says there is no such pid (ENOENT/ESRCH). Any other
+ * failure (EACCES, EPERM, unparsable stat, no btime, not Linux) is
+ * `"unreadable"`: unknown identity, never proof of absence.
+ */
+export type LinuxProcessStatRead = LinuxProcessStat | null | "unreadable";
+
+function statOrNull(value: LinuxProcessStatRead): LinuxProcessStat | null {
+  return value && typeof value === "object" ? value : null;
+}
+
 /** Parse /proc/<pid>/stat. Start time has ~1s precision (btime is in seconds). */
-export function readLinuxProcessStat(pid: number): LinuxProcessStat | null {
-  if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid <= 1) return null;
+export function readLinuxProcessStat(pid: number): LinuxProcessStatRead {
+  if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid <= 1) return "unreadable";
   try {
     const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
     const fields = raw.slice(raw.lastIndexOf(")") + 2).trim().split(/\s+/);
     const boot = readBootTimeMs();
     const ticks = Number(fields[19]);
-    if (boot === null || !Number.isFinite(ticks)) return null;
+    if (boot === null || !Number.isFinite(ticks)) return "unreadable";
     return {
       pid,
       state: fields[0] ?? "?",
@@ -68,10 +79,18 @@ export function readLinuxProcessStat(pid: number): LinuxProcessStat | null {
       pgid: Number(fields[2]),
       startedAtMs: boot + (ticks * 1000) / 100, // USER_HZ is 100 on Linux
     };
-  } catch {
-    return null;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    return code === "ENOENT" || code === "ESRCH" ? null : "unreadable";
   }
 }
+
+/**
+ * Result of kill(2) on a process group: `true` delivered, `false` the kernel
+ * answered ESRCH (no process in the group: the only proof of absence), and
+ * `"error"` for EPERM or any other failure (the group may be alive: unknown).
+ */
+export type NativeDedicatedSignalResult = boolean | "error";
 
 export type NativeDedicatedProcessTarget = {
   role: "runnerd" | "provider";
@@ -82,8 +101,8 @@ export type NativeDedicatedProcessTarget = {
 };
 
 export type NativeDedicatedReaperDeps = {
-  readStat: (pid: number) => LinuxProcessStat | null;
-  signalGroup: (pgid: number, signal: NodeJS.Signals | 0) => boolean;
+  readStat: (pid: number) => LinuxProcessStatRead;
+  signalGroup: (pgid: number, signal: NodeJS.Signals | 0) => NativeDedicatedSignalResult;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
 };
@@ -95,13 +114,14 @@ const IDENTITY_TOLERANCE_MS = 10;
 const defaultDeps: NativeDedicatedReaperDeps = {
   readStat: readLinuxProcessStat,
   signalGroup: (pgid, signal) => {
-    if (!Number.isSafeInteger(pgid) || pgid <= 1) return false;
+    if (!Number.isSafeInteger(pgid) || pgid <= 1) return "error";
     try {
       process.kill(-pgid, signal);
       return true;
-    } catch {
-      // EPERM means alive but not ours: never treat it as ours.
-      return false;
+    } catch (error) {
+      // Only ESRCH proves the group is gone. EPERM means a live group we may
+      // not signal (never ours to treat as dead); anything else is unknown.
+      return (error as NodeJS.ErrnoException | null)?.code === "ESRCH" ? false : "error";
     }
   },
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms).unref?.()),
@@ -121,14 +141,14 @@ export function selectNativeDedicatedProcessTargets(input: {
   selfPid?: number;
 }): NativeDedicatedProcessTarget[] {
   const selfPid = input.selfPid ?? process.pid;
-  const selfGroup = input.deps.readStat(selfPid)?.pgid ?? null;
+  const selfGroup = statOrNull(input.deps.readStat(selfPid))?.pgid ?? null;
   const targets: NativeDedicatedProcessTarget[] = [];
   const forbidden = (pid: number) => pid <= 1 || pid === selfPid || pid === selfGroup;
   let runnerStartMs: number | null = null;
   let runnerAlivePid: number | null = null;
   const runner = input.runner;
   if (runner?.pid && runner.processGroupId === runner.pid && runner.startedAt && !forbidden(runner.pid)) {
-    const stat = input.deps.readStat(runner.pid);
+    const stat = statOrNull(input.deps.readStat(runner.pid));
     runnerStartMs = runner.startedAt.getTime();
     if (
       stat && stat.state !== "Z" && stat.pgid === runner.pid &&
@@ -143,7 +163,7 @@ export function selectNativeDedicatedProcessTargets(input: {
     const pid = spawn.processId;
     if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid !== spawn.processGroupId || forbidden(pid)) continue;
     if (targets.some((target) => target.processGroupId === pid) || lowerBound === null) continue;
-    const stat = input.deps.readStat(pid);
+    const stat = statOrNull(input.deps.readStat(pid));
     if (!stat || stat.state === "Z" || stat.pgid !== pid) continue;
     // The provider group leader must have started between this run's runnerd
     // start and runnerd's spawn report; a recycled PID starts later.
@@ -156,24 +176,30 @@ export function selectNativeDedicatedProcessTargets(input: {
   return targets;
 }
 
-type GroupState = "alive" | "gone" | "identity_changed";
+type GroupState = "alive" | "gone" | "identity_changed" | "unverifiable";
 
 /**
  * Re-verify a target from /proc right now. A matching live leader is alive. A
  * matching zombie leader still pins the PID (no reuse), so its group is probed
  * with the null signal. Any mismatch is a changed identity. A vanished leader
  * whose group still answers the null signal cannot be re-verified: ambiguous,
- * treated as a changed identity (never signalled again).
+ * treated as a changed identity (never signalled again). Only ESRCH proves a
+ * group gone; an unreadable /proc entry or an EPERM/other probe error leaves
+ * the identity unverifiable (never signalled again, never proof).
  */
 function inspectTarget(target: NativeDedicatedProcessTarget, deps: NativeDedicatedReaperDeps): GroupState {
-  const stat = deps.readStat(target.pid);
+  const read = deps.readStat(target.pid);
+  if (read === "unreadable") return "unverifiable";
+  const stat = read;
   if (stat) {
     if (stat.pid !== target.pid || stat.pgid !== target.processGroupId ||
         Math.abs(stat.startedAtMs - target.startedAtMs) > IDENTITY_TOLERANCE_MS) return "identity_changed";
     if (stat.state !== "Z") return "alive";
-    return deps.signalGroup(target.processGroupId, 0) ? "alive" : "gone";
+    const probe = deps.signalGroup(target.processGroupId, 0);
+    return probe === "error" ? "unverifiable" : probe ? "alive" : "gone";
   }
-  return deps.signalGroup(target.processGroupId, 0) ? "identity_changed" : "gone";
+  const probe = deps.signalGroup(target.processGroupId, 0);
+  return probe === "error" ? "unverifiable" : probe ? "identity_changed" : "gone";
 }
 
 export type NativeDedicatedSignalOutcome = {
@@ -181,8 +207,10 @@ export type NativeDedicatedSignalOutcome = {
   killed: NativeDedicatedProcessTarget[];
   survivors: NativeDedicatedProcessTarget[];
   identityChanged: Array<NativeDedicatedProcessTarget & { phase: string }>;
+  /** Targets whose /proc entry was unreadable or whose null-signal probe failed (EPERM, ...). */
+  unverifiable: Array<NativeDedicatedProcessTarget & { phase: string }>;
   signalErrors: Array<NativeDedicatedProcessTarget & { signal: NodeJS.Signals }>;
-  /** Every target is gone, none changed identity and every signal was delivered. */
+  /** Every target is gone (ESRCH), none changed identity or became unverifiable and every signal was delivered. */
   proven: boolean;
 };
 
@@ -197,6 +225,7 @@ export async function signalNativeDedicatedProcessGroups(
 ): Promise<NativeDedicatedSignalOutcome> {
   const changed = new Set<NativeDedicatedProcessTarget>();
   const identityChanged: NativeDedicatedSignalOutcome["identityChanged"] = [];
+  const unverifiable: NativeDedicatedSignalOutcome["unverifiable"] = [];
   const signalErrors: NativeDedicatedSignalOutcome["signalErrors"] = [];
   const check = (target: NativeDedicatedProcessTarget, phase: string): GroupState => {
     if (changed.has(target)) return "identity_changed";
@@ -204,6 +233,9 @@ export async function signalNativeDedicatedProcessGroups(
     if (state === "identity_changed") {
       changed.add(target);
       identityChanged.push({ ...target, phase });
+    } else if (state === "unverifiable") {
+      changed.add(target);
+      unverifiable.push({ ...target, phase });
     }
     return state;
   };
@@ -224,7 +256,7 @@ export async function signalNativeDedicatedProcessGroups(
       // Re-verified immediately before the signal; never sent on mismatch.
       if (check(target, phase) !== "alive") continue;
       sent.push(target);
-      if (!deps.signalGroup(target.processGroupId, signal)) signalErrors.push({ ...target, signal });
+      if (deps.signalGroup(target.processGroupId, signal) !== true) signalErrors.push({ ...target, signal });
     }
     return sent;
   };
@@ -240,8 +272,10 @@ export async function signalNativeDedicatedProcessGroups(
     killed,
     survivors,
     identityChanged,
+    unverifiable,
     signalErrors,
-    proven: survivors.length === 0 && identityChanged.length === 0 && signalErrors.length === 0,
+    proven: survivors.length === 0 && identityChanged.length === 0 && unverifiable.length === 0 &&
+      signalErrors.length === 0,
   };
 }
 
@@ -295,12 +329,13 @@ export async function terminateNativeDedicatedProcesses(input: {
 }
 
 /**
- * A recorded process that is not a selected target is proven dead when nothing
- * answers for its pid/group, or when its pid now belongs to a process that
- * started after the recorded spawn window (Linux never reuses a pid while a
- * process group with that id still exists, so our group is gone as well).
- * Anything else (live mismatch, zombie leader with a live group, malformed
- * record) is unknown and keeps the quarantine.
+ * A recorded process that is not a selected target is proven dead when /proc
+ * has no such pid AND the kernel answers ESRCH for its group, or when a
+ * readable /proc shows its pid now belongs to a process that started after the
+ * recorded spawn window (Linux never reuses a pid while a process group with
+ * that id still exists, so our group is gone as well). Anything else (live
+ * mismatch, zombie leader with a live group, unreadable /proc, EPERM or any
+ * other probe error, malformed record) is unknown and keeps the quarantine.
  */
 function recordedProcessProvenDead(
   pid: unknown,
@@ -309,10 +344,11 @@ function recordedProcessProvenDead(
 ): boolean {
   if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 1) return false;
   const stat = deps.readStat(pid);
+  if (stat === "unreadable") return false;
   if (stat) {
     return latestOwnStartMs !== null && stat.startedAtMs > latestOwnStartMs + START_TOLERANCE_MS;
   }
-  return !deps.signalGroup(pid, 0);
+  return deps.signalGroup(pid, 0) === false;
 }
 
 async function terminateVerifiedNativeDedicatedProcesses(
@@ -359,7 +395,7 @@ async function terminateVerifiedNativeDedicatedProcesses(
       !targets.some((target) => target.pid === pid) && !recordedProcessProvenDead(pid, latestOwnStartMs, deps))
     .map(({ role, processId }) => ({ role, processId }));
   if (targets.length === 0 && unverified.length === 0 && input.reason !== "board_cancel") {
-    return { targets: [], terminated: [], killed: [], survivors: [], identityChanged: [], signalErrors: [],
+    return { targets: [], terminated: [], killed: [], survivors: [], identityChanged: [], unverifiable: [], signalErrors: [],
       unverified: [], terminationProven: input.run.processPid != null, cleanupQuarantine: null };
   }
   const outcome = await signalNativeDedicatedProcessGroups(
@@ -396,7 +432,8 @@ async function terminateVerifiedNativeDedicatedProcesses(
       }
     }
   }
-  const anomaly = outcome.identityChanged.length > 0 || outcome.signalErrors.length > 0 || unverified.length > 0;
+  const anomaly = outcome.identityChanged.length > 0 || outcome.unverifiable.length > 0 ||
+    outcome.signalErrors.length > 0 || unverified.length > 0;
   await appendHeartbeatRunEvent(input.db, {
     companyId: input.run.companyId,
     runId: input.run.id,
@@ -415,6 +452,7 @@ async function terminateVerifiedNativeDedicatedProcesses(
       sigkilled: outcome.killed,
       survivors: outcome.survivors,
       identity_changed: outcome.identityChanged,
+      unverifiable: outcome.unverifiable,
       signalErrors: outcome.signalErrors,
       unverified,
       terminationProven,

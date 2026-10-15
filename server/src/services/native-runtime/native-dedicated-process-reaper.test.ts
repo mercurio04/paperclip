@@ -4,6 +4,8 @@ import {
   signalNativeDedicatedProcessGroups,
   terminateNativeDedicatedProcesses,
   type LinuxProcessStat,
+  type LinuxProcessStatRead,
+  type NativeDedicatedSignalResult,
 } from "./native-dedicated-process-reaper.js";
 
 const vendor = vi.hoisted(() => ({
@@ -91,8 +93,8 @@ describe("native dedicated process group signalling", () => {
     const signals: string[] = [];
     let clock = 0;
     const deps = {
-      readStat: (pid: number) => procs.get(pid) ?? null,
-      signalGroup: (pgid: number, signal: NodeJS.Signals | 0) => {
+      readStat: (pid: number): LinuxProcessStatRead => procs.get(pid) ?? null,
+      signalGroup: (pgid: number, signal: NodeJS.Signals | 0): NativeDedicatedSignalResult => {
         if (signal === 0) return procs.has(pgid);
         signals.push(`${signal}:${pgid}`);
         return true;
@@ -130,6 +132,35 @@ describe("native dedicated process group signalling", () => {
     const outcome = await signalNativeDedicatedProcessGroups([runnerd], { graceMs: 1_000, killWaitMs: 500 }, deps);
     expect(signals).toEqual([]);
     expect(outcome.identityChanged).toEqual([{ ...runnerd, phase: "before_sigterm" }]);
+    expect(outcome.proven).toBe(false);
+  });
+
+  it("stops and is not proven when the leader becomes unverifiable (EPERM probe of a zombie leader) (H14)", async () => {
+    const { procs, signals, deps } = harness();
+    procs.set(382, stat(382, 382, 100, T0 + 200, "Z"));
+    const signalGroup = deps.signalGroup;
+    deps.signalGroup = (pgid, signal) => signal === 0 && pgid === 382 ? "error" as const : signalGroup(pgid, signal);
+    const outcome = await signalNativeDedicatedProcessGroups([runnerd], { graceMs: 1_000, killWaitMs: 500 }, deps);
+    expect(signals).toEqual([]);
+    expect(outcome.unverifiable).toEqual([{ ...runnerd, phase: "before_sigterm" }]);
+    expect(outcome.proven).toBe(false);
+  });
+
+  it("stops and is not proven when /proc becomes unreadable during the grace (H14)", async () => {
+    const { procs, signals, deps } = harness();
+    let unreadable = false;
+    const readStat = deps.readStat;
+    deps.readStat = (pid: number) => unreadable && pid === 383 ? "unreadable" : readStat(pid);
+    const signalGroup = deps.signalGroup;
+    deps.signalGroup = (pgid, signal) => {
+      const result = signalGroup(pgid, signal);
+      if (signal === "SIGTERM" && pgid === 382) procs.delete(382);
+      if (signal === "SIGTERM" && pgid === 383) unreadable = true;
+      return result;
+    };
+    const outcome = await signalNativeDedicatedProcessGroups([runnerd, provider], { graceMs: 1_000, killWaitMs: 500 }, deps);
+    expect(signals).toEqual(["SIGTERM:382", "SIGTERM:383"]);
+    expect(outcome.unverifiable).toEqual([{ ...provider, phase: "grace" }]);
     expect(outcome.proven).toBe(false);
   });
 
@@ -250,8 +281,8 @@ describe("native dedicated process reaper proof when processes already exited", 
     let clock = T0 + 60_000;
     return {
       signals,
-      readStat: (pid: number) => procs.get(pid) ?? null,
-      signalGroup: (pgid: number, signal: NodeJS.Signals | 0) => {
+      readStat: (pid: number): LinuxProcessStatRead => procs.get(pid) ?? null,
+      signalGroup: (pgid: number, signal: NodeJS.Signals | 0): NativeDedicatedSignalResult => {
         signals.push([pgid, signal]);
         return signal === 0 ? procs.has(pgid) || groups.has(pgid) : true;
       },
@@ -308,6 +339,39 @@ describe("native dedicated process reaper proof when processes already exited", 
     expect(outcome?.cleanupQuarantine).toBe("kept");
     expect(vendor.released).toEqual([]);
     expect(vendor.log).toEqual(["begin:gone-run", "settle:gone-run"]);
+  });
+
+  it("keeps the quarantine when /proc says no such pid but the group probe fails with EPERM (H14)", async () => {
+    reset();
+    vendor.quarantined.add("gone-run");
+    const reaperDeps = deps(new Map());
+    reaperDeps.signalGroup = (pgid: number, signal: NodeJS.Signals | 0) => {
+      reaperDeps.signals.push([pgid, signal]);
+      return signal === 0 ? "error" as const : true;
+    };
+    const outcome = await terminateNativeDedicatedProcesses({
+      db: db([spawnEvent(383)]), run, reason: "board_cancel", quarantineWaitMs: 0, deps: reaperDeps,
+    });
+    expect(outcome?.unverified).toEqual([{ role: "runnerd", processId: 382 }, { role: "provider", processId: 383 }]);
+    expect(outcome?.terminationProven).toBe(false);
+    expect(outcome?.cleanupQuarantine).toBe("kept");
+    expect(reaperDeps.signals.filter(([, signal]) => signal !== 0)).toEqual([]);
+    expect(vendor.released).toEqual([]);
+  });
+
+  it("keeps the quarantine and never signals when /proc is unreadable even if the group answers ESRCH (H14)", async () => {
+    reset();
+    vendor.quarantined.add("gone-run");
+    const reaperDeps = deps(new Map());
+    reaperDeps.readStat = () => "unreadable" as const;
+    const outcome = await terminateNativeDedicatedProcesses({
+      db: db([]), run, reason: "board_cancel", quarantineWaitMs: 0, deps: reaperDeps,
+    });
+    expect(outcome?.unverified).toEqual([{ role: "runnerd", processId: 382 }]);
+    expect(outcome?.terminationProven).toBe(false);
+    expect(outcome?.cleanupQuarantine).toBe("kept");
+    expect(reaperDeps.signals).toEqual([]);
+    expect(vendor.released).toEqual([]);
   });
 
   it("keeps the quarantine when no runnerd identity was recorded", async () => {
