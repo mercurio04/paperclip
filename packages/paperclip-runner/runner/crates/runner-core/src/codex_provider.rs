@@ -37,6 +37,9 @@ const OPENCODE_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "PAPERCLIP_NATIVE_MCP_URL",
     "PAPERCLIP_NATIVE_MCP_TOKEN",
     "PAPERCLIP_OPENCODE_PERMISSION_MODE",
+    "PAPERCLIP_OPENCODE_PERMISSION_PROFILE",
+    "PAPERCLIP_OPENCODE_PERMISSION_TTL_MS",
+    "PAPERCLIP_OPENCODE_LLAMACPP_BASE_URL",
     "PAPERCLIP_OPENCODE_RUNTIME_DIR",
     "PAPERCLIP_RUNNER_INSTANCE_ID",
     "PAPERCLIP_RUN_ID",
@@ -53,6 +56,42 @@ const MAX_COMPLETED_TOOL_CALL_IDS: usize = 4_096;
 const MAX_PENDING_RUNTIME_REQUESTS: usize = 128;
 const MAX_PENDING_RUNTIME_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const OPENCODE_RUNTIME_REQUEST_METHOD: &str = "paperclip/runtimeRequest";
+/// Proxy -> runnerd notification: the driver settled a pending typed
+/// permission on its own (TTL expiry, provider cascade reject, terminal turn,
+/// SSE loss) and the native permission is already rejected. runnerd retires
+/// its pending request and publishes `runtime_request.expired|cancelled`, so
+/// the server refuses any later decision instead of dispatching it.
+const OPENCODE_RUNTIME_REQUEST_SETTLED_METHOD: &str = "paperclip/runtimeRequestSettled";
+const MAX_DELIVERED_PERMISSION_OUTCOMES: usize = 64;
+const PERMISSION_NATIVE_OUTCOMES: [&str; 5] = [
+    "once_applied",
+    "rejected_terminal",
+    "rejected_drift",
+    "rejected_expired",
+    "unknown",
+];
+const OPENCODE_PERMISSION_REQUEST_SCHEMA: &str = "paperclip.runtime_request.permission.v1";
+const OPENCODE_PERMISSION_CONTRACT_SCHEMA: &str = "paperclip.opencode_permission_contract.v1";
+const PERMISSION_DECISION_SCHEMA: &str = "paperclip.permission_decision.v1";
+const MAX_PERMISSION_CONTRACT_BYTES: usize = 64 * 1024;
+/// TAX-452 H9: the only (OpenCode permission, tool id) pairs a restricted_v1
+/// contract may carry. Verified against the OpenCode 1.18.29 binary: `edit`,
+/// `write` and `apply_patch` ask `edit`; `read`, `glob`, `grep` ask their own
+/// name; 1.18.29 registers no `list`/`multiedit`/`patch` tool. Mirrors
+/// `RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS` in the TS driver and the
+/// server; the shared permission fixture pins all three.
+const RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS: &[(&str, &[&str])] = &[
+    ("edit", &["apply_patch", "edit", "write"]),
+    ("glob", &["glob"]),
+    ("grep", &["grep"]),
+    ("read", &["read"]),
+];
+
+fn is_restricted_v1_approvable_permission_tool(permission: &str, tool_name: &str) -> bool {
+    RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS
+        .iter()
+        .any(|(name, tools)| *name == permission && tools.contains(&tool_name))
+}
 pub(crate) const MAX_SETTLED_PROVIDER_TURN_IDS: usize = 4_096;
 pub(crate) const MAX_DESCENDANT_THREAD_IDS: usize = 4_096;
 
@@ -466,6 +505,27 @@ pub enum CodexProviderEvent {
         request_id: String,
         question_set: Value,
     },
+    /// A validated, typed OpenCode permission request. `request` is the PRP
+    /// `paperclip.runtime_request.permission.v1` object with its `requestId`
+    /// already replaced by the runner-scoped id.
+    PermissionRequest {
+        request_id: String,
+        request: Value,
+    },
+    /// A malformed runtime request was answered with a JSON-RPC error (the
+    /// provider treats it as a rejection). The session stays healthy; this is a
+    /// non-terminal `harness.diagnostic`.
+    RuntimeRequestRejected {
+        diagnostic: Value,
+    },
+    /// The proxy settled a pending typed OpenCode permission (expired or
+    /// cancelled). The runner-scoped request is retired; `event_type` is
+    /// `runtime_request.expired|cancelled` and `diagnostic` an optional warning.
+    RuntimeRequestSettled {
+        event_type: &'static str,
+        payload: Value,
+        diagnostic: Option<Value>,
+    },
     Exited {
         exit_code: Option<i32>,
         success: bool,
@@ -565,14 +625,37 @@ struct PendingToolRequest {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+enum PendingRuntimeRequestKind {
+    Input {
+        question_set: Value,
+        option_labels: QuestionOptionLabels,
+    },
+    Permission {
+        contract_sha256: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct PendingRuntimeRequest {
     rpc_id: Value,
     turn_id: String,
     method: String,
     params: Value,
-    question_set: Value,
-    option_labels: QuestionOptionLabels,
+    kind: PendingRuntimeRequestKind,
     retained_bytes: usize,
+}
+
+/// What a delivered `request.resolve` answered, for the PRP resolved event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeRequestResolution {
+    Input,
+    Permission { decision: String },
+}
+
+enum PendingRuntimeRegistration {
+    Registered(String),
+    Duplicate,
+    Rejected(CodexProviderEvent),
 }
 
 struct BufferedProviderMessage {
@@ -606,6 +689,10 @@ pub struct CodexProvider {
     pending_tool_request_bytes: usize,
     pending_runtime_requests: BTreeMap<String, PendingRuntimeRequest>,
     pending_runtime_request_bytes: usize,
+    /// Typed permissions whose board decision was handed to the provider
+    /// (provider request id, Paperclip request id). Bounded; lets the proxy
+    /// report what the provider natively received after the delivery.
+    delivered_permission_requests: VecDeque<(String, String)>,
     runtime_request_scope: [u8; 16],
     next_runtime_request_sequence: u64,
     expected_shutdown: bool,
@@ -936,6 +1023,7 @@ impl CodexProvider {
             pending_tool_request_bytes: 0,
             pending_runtime_requests: BTreeMap::new(),
             pending_runtime_request_bytes: 0,
+            delivered_permission_requests: VecDeque::new(),
             runtime_request_scope,
             next_runtime_request_sequence: 1,
             expected_shutdown: false,
@@ -1250,7 +1338,10 @@ impl CodexProvider {
                     ));
                 }
                 Some(CodexProviderEvent::ToolCall { .. })
-                | Some(CodexProviderEvent::RuntimeRequest { .. }) => {
+                | Some(CodexProviderEvent::RuntimeRequest { .. })
+                | Some(CodexProviderEvent::PermissionRequest { .. })
+                | Some(CodexProviderEvent::RuntimeRequestRejected { .. })
+                | Some(CodexProviderEvent::RuntimeRequestSettled { .. }) => {
                     return Err(LocalRunnerError::invalid(
                         "Codex warm run attachment observed a post-terminal provider request",
                     ));
@@ -1890,7 +1981,7 @@ impl CodexProvider {
         &mut self,
         request_id: &str,
         response: &Value,
-    ) -> Result<(), LocalRunnerError> {
+    ) -> Result<RuntimeRequestResolution, LocalRunnerError> {
         let pending = self
             .pending_runtime_requests
             .get(request_id)
@@ -1904,6 +1995,35 @@ impl CodexProvider {
             ));
         }
         let result = codex_question_response(&pending, response)?;
+        if let PendingRuntimeRequestKind::Permission { .. } = pending.kind {
+            let decision = result
+                .pointer("/resolution/decision")
+                .and_then(Value::as_str)
+                .expect("validated permission decisions carry a decision")
+                .to_owned();
+            // A native permission is answered at most once: retire it before
+            // the send so neither a send failure nor a retry can answer it
+            // again. The provider maps a missing answer to its own timeout.
+            if let Some(completed) = self.pending_runtime_requests.remove(request_id) {
+                self.pending_runtime_request_bytes = self
+                    .pending_runtime_request_bytes
+                    .saturating_sub(completed.retained_bytes);
+            }
+            if let Some(provider_request_id) = pending
+                .params
+                .pointer("/request/requestId")
+                .and_then(Value::as_str)
+            {
+                if self.delivered_permission_requests.len() >= MAX_DELIVERED_PERMISSION_OUTCOMES {
+                    self.delivered_permission_requests.pop_front();
+                }
+                self.delivered_permission_requests
+                    .push_back((provider_request_id.to_owned(), request_id.to_owned()));
+            }
+            self.process
+                .send(&json!({"id": pending.rpc_id, "result": result}))?;
+            return Ok(RuntimeRequestResolution::Permission { decision });
+        }
         self.process
             .send(&json!({"id": pending.rpc_id, "result": result}))?;
         if let Some(completed) = self.pending_runtime_requests.remove(request_id) {
@@ -1911,7 +2031,311 @@ impl CodexProvider {
                 .pending_runtime_request_bytes
                 .saturating_sub(completed.retained_bytes);
         }
-        Ok(())
+        Ok(RuntimeRequestResolution::Input)
+    }
+
+    /// Shared bounded registration for every runtime request kind. A replay of
+    /// the same JSON-RPC id with identical content is idempotent; capacity
+    /// exhaustion is answered with a JSON-RPC error and a warning.
+    fn register_pending_runtime_request(
+        &mut self,
+        pending: PendingRuntimeRequest,
+        provider_request_id: &str,
+        reused_id_message: &'static str,
+    ) -> Result<PendingRuntimeRegistration, LocalRunnerError> {
+        let rpc_id = pending.rpc_id.clone();
+        if let Some(existing) = self
+            .pending_runtime_requests
+            .values()
+            .find(|existing| existing.rpc_id == rpc_id)
+        {
+            if existing != &pending {
+                return Err(LocalRunnerError::invalid(reused_id_message));
+            }
+            return Ok(PendingRuntimeRegistration::Duplicate);
+        }
+        let retained_request_bytes = retain_pending_runtime_request_bytes(
+            self.pending_runtime_request_bytes,
+            pending.retained_bytes,
+        );
+        if self.pending_runtime_requests.len() >= MAX_PENDING_RUNTIME_REQUESTS
+            || retained_request_bytes.is_none()
+        {
+            self.send_frame(&json!({
+                "id": rpc_id,
+                "error": {
+                    "code": -32000,
+                    "message": "Paperclip rejected this runtime request because the pending input capacity was reached",
+                },
+            }))?;
+            return Ok(PendingRuntimeRegistration::Rejected(
+                CodexProviderEvent::Notification {
+                    method: "warning".to_owned(),
+                    params: json!({
+                        "message": "rejected a Codex runtime request at the bounded pending-input limit",
+                        "providerMethod": bounded_method(&pending.method),
+                    }),
+                },
+            ));
+        }
+        let request_sequence = self.next_runtime_request_sequence;
+        self.next_runtime_request_sequence = self
+            .next_runtime_request_sequence
+            .checked_add(1)
+            .ok_or_else(|| {
+                LocalRunnerError::invalid("Codex runtime request sequence overflowed")
+            })?;
+        let request_id = scoped_runtime_request_id(
+            &self.runtime_request_scope,
+            &pending.turn_id,
+            provider_request_id,
+            request_sequence,
+        );
+        self.pending_runtime_requests
+            .insert(request_id.clone(), pending);
+        self.pending_runtime_request_bytes =
+            retained_request_bytes.expect("bounded runtime request bytes checked above");
+        Ok(PendingRuntimeRegistration::Registered(request_id))
+    }
+
+    /// Typed OpenCode permission intake. Any contract violation is answered
+    /// with a JSON-RPC error (the proxy rejects the native permission) and a
+    /// non-terminal diagnostic; it never fails the provider session.
+    fn intake_opencode_permission_request(
+        &mut self,
+        rpc_id: Value,
+        active_turn_id: String,
+        params: Value,
+    ) -> Result<Option<CodexProviderEvent>, LocalRunnerError> {
+        let validated = match validate_opencode_permission_request(&params, &active_turn_id) {
+            Ok(validated) => validated,
+            Err(reason) => return self.reject_invalid_permission_request(rpc_id, reason),
+        };
+        let retained_bytes = pending_runtime_request_size(
+            &rpc_id,
+            &active_turn_id,
+            OPENCODE_RUNTIME_REQUEST_METHOD,
+            &params,
+            &Value::Null,
+            &QuestionOptionLabels::new(),
+        )?;
+        let pending = PendingRuntimeRequest {
+            rpc_id,
+            turn_id: active_turn_id,
+            method: OPENCODE_RUNTIME_REQUEST_METHOD.to_owned(),
+            params,
+            kind: PendingRuntimeRequestKind::Permission {
+                contract_sha256: validated.contract_sha256,
+            },
+            retained_bytes,
+        };
+        match self.register_pending_runtime_request(
+            pending,
+            &validated.provider_request_id,
+            "OpenCode reused a runtime request id with a different permission",
+        )? {
+            PendingRuntimeRegistration::Registered(request_id) => {
+                let mut request = validated.request;
+                request["requestId"] = Value::String(request_id.clone());
+                Ok(Some(CodexProviderEvent::PermissionRequest {
+                    request_id,
+                    request,
+                }))
+            }
+            PendingRuntimeRegistration::Duplicate => Ok(None),
+            PendingRuntimeRegistration::Rejected(event) => Ok(Some(event)),
+        }
+    }
+
+    /// Retires a pending typed permission the proxy settled. The native
+    /// permission is already rejected; the outstanding JSON-RPC request is
+    /// answered with an error so the proxy never resolves it a second time.
+    fn settle_opencode_permission_request(
+        &mut self,
+        params: &Value,
+    ) -> Result<Option<CodexProviderEvent>, LocalRunnerError> {
+        if params.get("status").and_then(Value::as_str) == Some("applied") {
+            return Ok(Some(self.record_opencode_permission_native_outcome(params)));
+        }
+        let expired = match params.get("status").and_then(Value::as_str) {
+            Some("expired") => true,
+            Some("cancelled") => false,
+            _ => {
+                return Ok(Some(CodexProviderEvent::Notification {
+                    method: "warning".to_owned(),
+                    params: json!({
+                        "threadId": self.thread_id,
+                        "message": "ignored an OpenCode permission settlement with an unknown status",
+                        "providerMethod": OPENCODE_RUNTIME_REQUEST_SETTLED_METHOD,
+                    }),
+                }))
+            }
+        };
+        let reason = params
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|reason| {
+                !reason.is_empty()
+                    && reason.len() <= 64
+                    && reason
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            })
+            .unwrap_or(if expired {
+                "permission_expired"
+            } else {
+                "provider_settled"
+            })
+            .to_owned();
+        let provider_request_id = params.get("requestId").and_then(Value::as_str);
+        let found = provider_request_id.and_then(|provider_request_id| {
+            self.pending_runtime_requests
+                .iter()
+                .find(|(_, pending)| {
+                    matches!(pending.kind, PendingRuntimeRequestKind::Permission { .. })
+                        && pending.method == OPENCODE_RUNTIME_REQUEST_METHOD
+                        && pending
+                            .params
+                            .pointer("/request/requestId")
+                            .and_then(Value::as_str)
+                            == Some(provider_request_id)
+                })
+                .map(|(request_id, _)| request_id.clone())
+        });
+        let Some(request_id) = found else {
+            // The board decision was already delivered when the driver's own
+            // settlement arrived (cancel || once race): the request is no
+            // longer pending, but the settlement still reports what OpenCode
+            // natively received. Record it as that delivered request's outcome.
+            if params.get("nativeOutcome").is_some()
+                && provider_request_id.is_some_and(|provider_request_id| {
+                    self.delivered_permission_requests
+                        .iter()
+                        .any(|(delivered, _)| delivered == provider_request_id)
+                })
+            {
+                return Ok(Some(self.record_opencode_permission_native_outcome(params)));
+            }
+            return Ok(Some(CodexProviderEvent::Notification {
+                method: "warning".to_owned(),
+                params: json!({
+                    "threadId": self.thread_id,
+                    "message": "ignored the settlement of an OpenCode permission that is not pending",
+                    "providerMethod": OPENCODE_RUNTIME_REQUEST_SETTLED_METHOD,
+                }),
+            }));
+        };
+        let pending = self
+            .pending_runtime_requests
+            .remove(&request_id)
+            .expect("pending permission located above");
+        self.pending_runtime_request_bytes = self
+            .pending_runtime_request_bytes
+            .saturating_sub(pending.retained_bytes);
+        self.send_frame(&json!({
+            "id": pending.rpc_id,
+            "error": {
+                "code": -32000,
+                "message": "Paperclip settled the OpenCode permission request without a decision",
+            },
+        }))?;
+        Ok(Some(CodexProviderEvent::RuntimeRequestSettled {
+            event_type: if expired {
+                "runtime_request.expired"
+            } else {
+                "runtime_request.cancelled"
+            },
+            payload: json!({
+                "requestId": request_id,
+                "requestKind": "runtime",
+                "type": "permission",
+                "status": if expired { "expired" } else { "cancelled" },
+                "reason": reason,
+                "turnId": pending.turn_id,
+                "replayAllowed": false,
+            }),
+            diagnostic: expired.then(|| {
+                json!({
+                    "provider": self.config.provider,
+                    "code": "permission_expired",
+                    "severity": "warning",
+                    "message": "OpenCode permission expired before a decision; it was rejected natively",
+                    "requestId": request_id,
+                    "paperclipExecuted": false,
+                })
+            }),
+        }))
+    }
+
+    /// Post-delivery report of what OpenCode natively received for a typed
+    /// permission whose board decision runnerd already handed over (for
+    /// example `once` delivered, but the terminal state won and the driver
+    /// sent native `reject`). Only a decision this runnerd delivered is
+    /// accepted, at most once; it is published as a diagnostic so the server
+    /// records the claim's actual native outcome. It never re-answers OpenCode.
+    fn record_opencode_permission_native_outcome(&mut self, params: &Value) -> CodexProviderEvent {
+        let ignored = |message: &str| CodexProviderEvent::Notification {
+            method: "warning".to_owned(),
+            params: json!({
+                "threadId": self.thread_id,
+                "message": message,
+                "providerMethod": OPENCODE_RUNTIME_REQUEST_SETTLED_METHOD,
+            }),
+        };
+        let Some(native_outcome) = params
+            .get("nativeOutcome")
+            .and_then(Value::as_str)
+            .filter(|outcome| PERMISSION_NATIVE_OUTCOMES.contains(outcome))
+        else {
+            return ignored("ignored an OpenCode permission outcome with an unknown value");
+        };
+        let provider_request_id = params.get("requestId").and_then(Value::as_str);
+        let Some(index) = provider_request_id.and_then(|provider_request_id| {
+            self.delivered_permission_requests
+                .iter()
+                .position(|(delivered, _)| delivered == provider_request_id)
+        }) else {
+            return ignored("ignored the outcome of an OpenCode permission that was not delivered");
+        };
+        let (_, request_id) = self
+            .delivered_permission_requests
+            .remove(index)
+            .expect("delivered permission located above");
+        CodexProviderEvent::RuntimeRequestRejected {
+            diagnostic: json!({
+                "provider": self.config.provider,
+                "code": "permission_native_outcome",
+                "severity": "info",
+                "message": "OpenCode reported what it natively received for a delivered permission decision",
+                "requestId": request_id,
+                "nativeOutcome": native_outcome,
+                "paperclipExecuted": false,
+            }),
+        }
+    }
+
+    fn reject_invalid_permission_request(
+        &mut self,
+        rpc_id: Value,
+        reason: &'static str,
+    ) -> Result<Option<CodexProviderEvent>, LocalRunnerError> {
+        self.send_frame(&json!({
+            "id": rpc_id,
+            "error": {
+                "code": -32602,
+                "message": format!("Paperclip rejected the OpenCode permission request: {reason}"),
+            },
+        }))?;
+        Ok(Some(CodexProviderEvent::RuntimeRequestRejected {
+            diagnostic: json!({
+                "provider": self.config.provider,
+                "code": "permission_request_invalid",
+                "severity": "warning",
+                "message": format!("OpenCode permission request rejected: {reason}"),
+                "providerMethod": OPENCODE_RUNTIME_REQUEST_METHOD,
+                "paperclipExecuted": false,
+            }),
+        }))
     }
 
     fn reject_post_terminal_request(
@@ -2353,6 +2777,11 @@ impl CodexProvider {
                         "Codex runtime request arrived outside an active turn",
                     )
                 })?;
+                if method == OPENCODE_RUNTIME_REQUEST_METHOD
+                    && is_opencode_permission_request(&params)
+                {
+                    return self.intake_opencode_permission_request(rpc_id, active_turn_id, params);
+                }
                 if runtime_request_turn_id(&params) != Some(active_turn_id.as_str()) {
                     return Err(LocalRunnerError::invalid(
                         "Codex runtime request named another turn",
@@ -2377,65 +2806,26 @@ impl CodexProvider {
                     turn_id: active_turn_id.clone(),
                     method: method.to_owned(),
                     params,
-                    question_set: question_set.clone(),
-                    option_labels,
+                    kind: PendingRuntimeRequestKind::Input {
+                        question_set: question_set.clone(),
+                        option_labels,
+                    },
                     retained_bytes,
                 };
-                if let Some(existing) = self
-                    .pending_runtime_requests
-                    .values()
-                    .find(|existing| existing.rpc_id == rpc_id)
-                {
-                    if existing != &pending {
-                        return Err(LocalRunnerError::invalid(
-                            "Codex reused a runtime request id with different input",
-                        ));
-                    }
-                    return Ok(None);
-                }
-                let retained_request_bytes = retain_pending_runtime_request_bytes(
-                    self.pending_runtime_request_bytes,
-                    retained_bytes,
-                );
-                if self.pending_runtime_requests.len() >= MAX_PENDING_RUNTIME_REQUESTS
-                    || retained_request_bytes.is_none()
-                {
-                    self.send_frame(&json!({
-                        "id": rpc_id,
-                        "error": {
-                            "code": -32000,
-                            "message": "Paperclip rejected this runtime request because the pending input capacity was reached",
-                        },
-                    }))?;
-                    return Ok(Some(CodexProviderEvent::Notification {
-                        method: "warning".to_owned(),
-                        params: json!({
-                            "message": "rejected a Codex runtime request at the bounded pending-input limit",
-                            "providerMethod": bounded_method(method),
-                        }),
-                    }));
-                }
-                let request_sequence = self.next_runtime_request_sequence;
-                self.next_runtime_request_sequence = self
-                    .next_runtime_request_sequence
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        LocalRunnerError::invalid("Codex runtime request sequence overflowed")
-                    })?;
-                let request_id = scoped_runtime_request_id(
-                    &self.runtime_request_scope,
-                    &active_turn_id,
+                return match self.register_pending_runtime_request(
+                    pending,
                     &provider_request_id,
-                    request_sequence,
-                );
-                self.pending_runtime_requests
-                    .insert(request_id.clone(), pending);
-                self.pending_runtime_request_bytes =
-                    retained_request_bytes.expect("bounded runtime request bytes checked above");
-                return Ok(Some(CodexProviderEvent::RuntimeRequest {
-                    request_id,
-                    question_set,
-                }));
+                    "Codex reused a runtime request id with different input",
+                )? {
+                    PendingRuntimeRegistration::Registered(request_id) => {
+                        Ok(Some(CodexProviderEvent::RuntimeRequest {
+                            request_id,
+                            question_set,
+                        }))
+                    }
+                    PendingRuntimeRegistration::Duplicate => Ok(None),
+                    PendingRuntimeRegistration::Rejected(event) => Ok(Some(event)),
+                };
             }
             self.send_frame(&json!({
                 "id": rpc_id,
@@ -2449,6 +2839,9 @@ impl CodexProvider {
 
         if let Some(method) = message.get("method").and_then(Value::as_str) {
             let params = message.get("params").cloned().unwrap_or(Value::Null);
+            if method == OPENCODE_RUNTIME_REQUEST_SETTLED_METHOD {
+                return self.settle_opencode_permission_request(&params);
+            }
             let identity = match classify_notification_thread(
                 method,
                 &self.thread_id,
@@ -3729,12 +4122,351 @@ fn scoped_runtime_request_id(
     format!("runtime-request-{:x}", digest.finalize())
 }
 
+/// Accept exactly `{"schema","decision","contractSha256"}` for the pending
+/// contract. Anything else (a question response, `always`, a stale or foreign
+/// contract digest) is a command error and nothing reaches the provider.
+fn permission_decision_resolution(
+    contract_sha256: &str,
+    response: &Value,
+) -> Result<Value, LocalRunnerError> {
+    let response = response
+        .as_object()
+        .ok_or_else(|| LocalRunnerError::invalid("permission decision must be an object"))?;
+    if response.len() != 3
+        || response
+            .keys()
+            .any(|key| !matches!(key.as_str(), "schema" | "decision" | "contractSha256"))
+    {
+        return Err(LocalRunnerError::invalid(
+            "permission decision must contain exactly schema, decision, and contractSha256",
+        ));
+    }
+    if response.get("schema").and_then(Value::as_str) != Some(PERMISSION_DECISION_SCHEMA) {
+        return Err(LocalRunnerError::invalid(
+            "permission decision requires paperclip.permission_decision.v1",
+        ));
+    }
+    let decision = response
+        .get("decision")
+        .and_then(Value::as_str)
+        .filter(|decision| matches!(*decision, "once" | "reject"))
+        .ok_or_else(|| LocalRunnerError::invalid("permission decision must be once or reject"))?;
+    if response.get("contractSha256").and_then(Value::as_str) != Some(contract_sha256) {
+        return Err(LocalRunnerError::invalid(
+            "permission decision contractSha256 does not match the pending permission",
+        ));
+    }
+    Ok(json!({
+        "resolution": {
+            "action": "permission_decision",
+            "decision": decision,
+            "contractSha256": contract_sha256,
+        },
+    }))
+}
+
+struct ValidatedPermissionRequest {
+    provider_request_id: String,
+    request: Value,
+    contract_sha256: String,
+}
+
+fn is_opencode_permission_request(params: &Value) -> bool {
+    params.pointer("/request/schema").and_then(Value::as_str)
+        == Some(OPENCODE_PERMISSION_REQUEST_SCHEMA)
+        || params.pointer("/request/type").and_then(Value::as_str) == Some("permission")
+}
+
+fn exact_keys(
+    object: &serde_json::Map<String, Value>,
+    required: &[&str],
+    optional: &[&str],
+) -> bool {
+    required.iter().all(|key| object.contains_key(*key))
+        && object
+            .keys()
+            .all(|key| required.contains(&key.as_str()) || optional.contains(&key.as_str()))
+}
+
+fn bounded_permission_text(value: Option<&Value>, max_chars: usize) -> Option<&str> {
+    value.and_then(Value::as_str).filter(|text| {
+        !text.is_empty() && text.chars().count() <= max_chars && !text.chars().any(char::is_control)
+    })
+}
+
+fn string_array(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().all(Value::is_string))
+}
+
+/// Strictly validates `paperclip.runtime_request.permission.v1`. Reasons are
+/// static so they can be returned to the provider and recorded verbatim.
+fn validate_opencode_permission_request(
+    params: &Value,
+    active_turn_id: &str,
+) -> Result<ValidatedPermissionRequest, &'static str> {
+    let params = params.as_object().ok_or("params are not an object")?;
+    if params.len() != 1 {
+        return Err("params contain an unknown field");
+    }
+    let request = params
+        .get("request")
+        .and_then(Value::as_object)
+        .ok_or("request is required")?;
+    if !exact_keys(
+        request,
+        &[
+            "schema",
+            "requestKind",
+            "requestId",
+            "type",
+            "status",
+            "prompt",
+            "turnId",
+            "origin",
+            "decisions",
+            "permission",
+        ],
+        &["itemId"],
+    ) {
+        return Err("request fields do not match the permission contract");
+    }
+    if request.get("schema").and_then(Value::as_str) != Some(OPENCODE_PERMISSION_REQUEST_SCHEMA)
+        || request.get("requestKind").and_then(Value::as_str) != Some("runtime")
+        || request.get("type").and_then(Value::as_str) != Some("permission")
+        || request.get("status").and_then(Value::as_str) != Some("pending")
+    {
+        return Err("request discriminator is invalid");
+    }
+    let provider_request_id = bounded_permission_text(request.get("requestId"), 160)
+        .ok_or("requestId is invalid")?
+        .to_owned();
+    request
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|prompt| !prompt.is_empty() && prompt.chars().count() <= 4_000)
+        .ok_or("prompt is invalid")?;
+    let turn_id = bounded_provider_turn_id(request.get("turnId").and_then(Value::as_str))
+        .map_err(|_| "turnId is invalid")?;
+    if turn_id != active_turn_id {
+        return Err("turnId does not name the active turn");
+    }
+    if let Some(item_id) = request.get("itemId") {
+        bounded_provider_turn_id(item_id.as_str()).map_err(|_| "itemId is invalid")?;
+    }
+    let origin = request
+        .get("origin")
+        .and_then(Value::as_object)
+        .ok_or("origin is invalid")?;
+    if !exact_keys(origin, &["adapter", "provider", "method"], &[])
+        || origin.get("adapter").and_then(Value::as_str) != Some("opencode-server")
+        || origin.get("provider").and_then(Value::as_str) != Some("opencode")
+        || origin.get("method").and_then(Value::as_str) != Some("permission.asked")
+    {
+        return Err("origin is invalid");
+    }
+    if request.get("decisions") != Some(&json!(["once", "reject"])) {
+        return Err("decisions must be exactly [\"once\",\"reject\"]");
+    }
+    let permission_value = request.get("permission").ok_or("permission is required")?;
+    let permission = permission_value
+        .as_object()
+        .ok_or("permission is not an object")?;
+    if canonical_json(permission_value).len() > MAX_PERMISSION_CONTRACT_BYTES {
+        return Err("permission contract exceeds 64 KiB");
+    }
+    if !exact_keys(
+        permission,
+        &[
+            "schema",
+            "provider",
+            "providerVersion",
+            "providerSessionId",
+            "providerRequestId",
+            "permission",
+            "tool",
+            "patterns",
+            "always",
+            "metadata",
+            "arguments",
+            "cwd",
+            "targets",
+            "policy",
+            "contractSha256",
+        ],
+        &[],
+    ) {
+        return Err("permission fields do not match the contract");
+    }
+    if permission.get("schema").and_then(Value::as_str) != Some(OPENCODE_PERMISSION_CONTRACT_SCHEMA)
+    {
+        return Err("permission schema is invalid");
+    }
+    if permission.get("provider").and_then(Value::as_str) != Some("opencode") {
+        return Err("permission provider must be opencode");
+    }
+    if permission.get("providerVersion").and_then(Value::as_str) != Some(QUALIFIED_OPENCODE_VERSION)
+    {
+        return Err("permission providerVersion is not the qualified OpenCode release");
+    }
+    bounded_permission_text(permission.get("providerSessionId"), 256)
+        .ok_or("permission providerSessionId is invalid")?;
+    bounded_permission_text(permission.get("providerRequestId"), 256)
+        .ok_or("permission providerRequestId is invalid")?;
+    let permission_name = bounded_permission_text(permission.get("permission"), 160)
+        .ok_or("permission name is invalid")?;
+    // TAX-452 H10: the exact tool call and its complete input are mandatory;
+    // a contract without them is never approvable.
+    let tool = permission
+        .get("tool")
+        .and_then(Value::as_object)
+        .ok_or("permission tool must be an object")?;
+    if !exact_keys(tool, &["name", "messageId", "callId"], &[])
+        || bounded_permission_text(tool.get("messageId"), 256).is_none()
+        || bounded_permission_text(tool.get("callId"), 256).is_none()
+    {
+        return Err("permission tool is invalid");
+    }
+    let tool_name =
+        bounded_permission_text(tool.get("name"), 160).ok_or("permission tool name is invalid")?;
+    if !permission.get("arguments").is_some_and(Value::is_object) {
+        return Err("permission arguments must be the tool input object");
+    }
+    // TAX-452 H9: defense in depth over the driver's allowlist.
+    if !is_restricted_v1_approvable_permission_tool(permission_name, tool_name) {
+        return Err("permission tool is not approvable in restricted_v1");
+    }
+    if !string_array(permission.get("patterns")) || !string_array(permission.get("always")) {
+        return Err("permission patterns/always must be string arrays");
+    }
+    if !permission.get("metadata").is_some_and(Value::is_object) {
+        return Err("permission metadata must be an object");
+    }
+    let cwd_valid = permission
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| {
+            cwd.starts_with('/') && cwd.len() <= 4_096 && !cwd.chars().any(char::is_control)
+        })
+        .is_some();
+    if !cwd_valid {
+        return Err("permission cwd must be an absolute path");
+    }
+    let targets_valid = permission
+        .get("targets")
+        .and_then(Value::as_array)
+        .is_some_and(|targets| {
+            targets.iter().all(|target| {
+                target.as_object().is_some_and(|target| {
+                    exact_keys(target, &["pattern", "resolvedPath"], &[])
+                        && target.get("pattern").is_some_and(Value::is_string)
+                        && target
+                            .get("resolvedPath")
+                            .is_some_and(|path| path.is_null() || path.is_string())
+                })
+            })
+        });
+    if !targets_valid {
+        return Err("permission targets are invalid");
+    }
+    if permission.get("policy")
+        != Some(&json!({"profile": "restricted_v1", "permissionDefault": "ask"}))
+    {
+        return Err("permission policy is invalid");
+    }
+    let claimed_sha256 = permission
+        .get("contractSha256")
+        .and_then(Value::as_str)
+        .filter(|sha| {
+            sha.len() == 64
+                && sha
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or("permission contractSha256 must be lowercase hex sha256")?;
+    let contract_sha256 = permission_contract_sha256(permission_value);
+    if contract_sha256 != claimed_sha256 {
+        return Err("permission contractSha256 does not match the canonical contract");
+    }
+    // The durable outbox redacts credential-shaped text. A contract that would
+    // be rewritten cannot be shown verbatim, so it is rejected, never altered.
+    if !crate::durable::permission_contract_is_durably_representable(permission_value) {
+        return Err("permission contract contains credential-shaped material");
+    }
+    Ok(ValidatedPermissionRequest {
+        provider_request_id,
+        request: Value::Object(request.clone()),
+        contract_sha256,
+    })
+}
+
+/// sha256 hex of the canonical JSON of `permission` without `contractSha256`.
+fn permission_contract_sha256(permission: &Value) -> String {
+    let mut unsigned = permission.clone();
+    if let Some(object) = unsigned.as_object_mut() {
+        object.remove("contractSha256");
+    }
+    format!("{:x}", Sha256::digest(canonical_json(&unsigned).as_bytes()))
+}
+
+/// Canonical JSON shared with the TypeScript driver and server: object keys
+/// sorted recursively by UTF-16 code units (JavaScript's default sort), no
+/// whitespace, UTF-8. Sorting is explicit so it does not depend on whether
+/// serde_json's `preserve_order` feature is enabled anywhere in the build.
+fn canonical_json(value: &Value) -> String {
+    let mut out = String::new();
+    write_canonical_json(value, &mut out);
+    out
+}
+
+fn write_canonical_json(value: &Value, out: &mut String) {
+    match value {
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
+            out.push('{');
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(
+                    &serde_json::to_string(key).expect("JSON object keys always serialize"),
+                );
+                out.push(':');
+                write_canonical_json(&object[key], out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        scalar => out.push_str(&scalar.to_string()),
+    }
+}
+
 fn codex_question_response(
     pending: &PendingRuntimeRequest,
     response: &Value,
 ) -> Result<Value, LocalRunnerError> {
+    let (question_set, option_labels) = match &pending.kind {
+        PendingRuntimeRequestKind::Permission { contract_sha256 } => {
+            return permission_decision_resolution(contract_sha256, response);
+        }
+        PendingRuntimeRequestKind::Input {
+            question_set,
+            option_labels,
+        } => (question_set, option_labels),
+    };
     if pending.method == OPENCODE_RUNTIME_REQUEST_METHOD {
-        validate_question_response(&pending.question_set, response)?;
+        validate_question_response(question_set, response)?;
         return Ok(json!({
             "resolution": {
                 "action": "submit",
@@ -3762,8 +4494,7 @@ fn codex_question_response(
         .get("answers")
         .and_then(Value::as_object)
         .ok_or_else(|| LocalRunnerError::invalid("runtime response answers are required"))?;
-    let questions = pending
-        .question_set
+    let questions = question_set
         .get("questions")
         .and_then(Value::as_array)
         .ok_or_else(|| LocalRunnerError::invalid("pending question set is malformed"))?;
@@ -3826,8 +4557,7 @@ fn codex_question_response(
                 let option_id = selected[0]
                     .as_str()
                     .ok_or_else(|| LocalRunnerError::invalid("selected option id is invalid"))?;
-                vec![pending
-                    .option_labels
+                vec![option_labels
                     .get(id)
                     .and_then(|labels| labels.get(option_id))
                     .cloned()
@@ -4388,6 +5118,19 @@ done
     }
 
     #[test]
+    fn forwards_the_typed_permission_profile_environment() {
+        assert!(
+            OPENCODE_PROVIDER_ENVIRONMENT_KEYS.contains(&"PAPERCLIP_OPENCODE_PERMISSION_PROFILE")
+        );
+        assert!(
+            OPENCODE_PROVIDER_ENVIRONMENT_KEYS.contains(&"PAPERCLIP_OPENCODE_LLAMACPP_BASE_URL")
+        );
+        assert!(
+            OPENCODE_PROVIDER_ENVIRONMENT_KEYS.contains(&"PAPERCLIP_OPENCODE_PERMISSION_TTL_MS")
+        );
+    }
+
+    #[test]
     fn github_credentials_cross_only_the_bounded_provider_environment() {
         assert_eq!(GITHUB_CREDENTIAL_ENVIRONMENT_KEYS.len(), 95);
         for key in [
@@ -4462,8 +5205,10 @@ done
             turn_id: "turn-1".to_owned(),
             method: "item/tool/requestUserInput".to_owned(),
             params: Value::Null,
-            question_set,
-            option_labels: labels,
+            kind: PendingRuntimeRequestKind::Input {
+                question_set,
+                option_labels: labels,
+            },
             retained_bytes: 0,
         };
         let native = codex_question_response(
@@ -4557,8 +5302,10 @@ done
             turn_id: "turn-1".to_owned(),
             method: OPENCODE_RUNTIME_REQUEST_METHOD.to_owned(),
             params,
-            question_set,
-            option_labels,
+            kind: PendingRuntimeRequestKind::Input {
+                question_set,
+                option_labels,
+            },
             retained_bytes: 0,
         };
         let response = json!({
@@ -4579,24 +5326,326 @@ done
         );
     }
 
-    #[test]
-    fn rejects_non_input_and_malformed_opencode_runtime_requests() {
-        let permission = json!({
-            "request": {
-                "schema": "paperclip.runtime_request.v2",
-                "requestKind": "runtime",
-                "requestId": "permission-1",
-                "type": "permission",
-                "status": "pending",
-                "prompt": "Approve this operation?",
-                "turnId": "turn-1"
-            }
-        });
-        assert!(opencode_question_set(&permission)
-            .unwrap_err()
-            .to_string()
-            .contains("structured input"));
+    const PERMISSION_FIXTURE: &str =
+        include_str!("../../../../protocol/fixtures/permissions/opencode-permission-request.json");
 
+    fn permission_fixture() -> Value {
+        serde_json::from_str(PERMISSION_FIXTURE).expect("permission fixture is JSON")
+    }
+
+    fn permission_params() -> Value {
+        json!({"request": permission_fixture()["request"].clone()})
+    }
+
+    fn resign(params: &mut Value) {
+        let sha = permission_contract_sha256(&params["request"]["permission"]);
+        params["request"]["permission"]["contractSha256"] = Value::String(sha);
+    }
+
+    fn pending_permission(sha: &str) -> PendingRuntimeRequest {
+        PendingRuntimeRequest {
+            rpc_id: json!("proxy-permission-1"),
+            turn_id: "turn-1".to_owned(),
+            method: OPENCODE_RUNTIME_REQUEST_METHOD.to_owned(),
+            params: permission_params(),
+            kind: PendingRuntimeRequestKind::Permission {
+                contract_sha256: sha.to_owned(),
+            },
+            retained_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn accepts_the_canonical_typed_opencode_permission_contract() {
+        let fixture = permission_fixture();
+        let params = permission_params();
+        assert!(is_opencode_permission_request(&params));
+        let validated = validate_opencode_permission_request(&params, "turn-1")
+            .expect("the canonical fixture is a valid permission contract");
+        let sha = fixture["request"]["permission"]["contractSha256"]
+            .as_str()
+            .unwrap();
+        assert_eq!(validated.contract_sha256, sha);
+        assert_eq!(
+            validated.provider_request_id,
+            "per_01JFIXTUREPERMISSION0001"
+        );
+        assert_eq!(validated.request, fixture["request"]);
+        let mut unsigned = fixture["request"]["permission"].clone();
+        unsigned.as_object_mut().unwrap().remove("contractSha256");
+        assert_eq!(
+            canonical_json(&unsigned),
+            fixture["canonicalContractJson"].as_str().unwrap()
+        );
+
+        // The protocol JSON Schema branch accepts the same request.
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../../protocol/schemas/request.schema.json"
+        ))
+        .unwrap();
+        let branch = schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| {
+                branch.pointer("/properties/schema/const")
+                    == Some(&json!(OPENCODE_PERMISSION_REQUEST_SCHEMA))
+            })
+            .expect("request schema declares the typed permission branch")
+            .clone();
+        let validator = jsonschema::validator_for(&branch).unwrap();
+        assert!(validator.is_valid(&fixture["request"]));
+        let mut unknown = fixture["request"].clone();
+        unknown["permission"]["extra"] = json!(true);
+        assert!(!validator.is_valid(&unknown));
+        let mut always = fixture["request"].clone();
+        always["decisions"] = json!(["once", "always", "reject"]);
+        assert!(!validator.is_valid(&always));
+        // TAX-452 H9/H10: tool {name, messageId, callId} and object arguments.
+        let mut null_tool = fixture["request"].clone();
+        null_tool["permission"]["tool"] = Value::Null;
+        null_tool["permission"]["arguments"] = Value::Null;
+        assert!(!validator.is_valid(&null_tool));
+        let mut nameless = fixture["request"].clone();
+        nameless["permission"]["tool"]
+            .as_object_mut()
+            .unwrap()
+            .remove("name");
+        assert!(!validator.is_valid(&nameless));
+        let mut null_arguments = fixture["request"].clone();
+        null_arguments["permission"]["arguments"] = Value::Null;
+        assert!(!validator.is_valid(&null_arguments));
+    }
+
+    #[test]
+    fn permission_tool_allowlist_matches_the_shared_fixture() {
+        let fixture = permission_fixture();
+        let expected = fixture["restrictedApprovablePermissionTools"]
+            .as_object()
+            .expect("fixture pins the restricted_v1 allowlist");
+        let actual: serde_json::Map<String, Value> = RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS
+            .iter()
+            .map(|(permission, tools)| {
+                let mut tools: Vec<&str> = tools.to_vec();
+                tools.sort_unstable();
+                ((*permission).to_owned(), json!(tools))
+            })
+            .collect();
+        assert_eq!(&actual, expected);
+        for tool in ["apply_patch", "edit", "write"] {
+            assert!(is_restricted_v1_approvable_permission_tool("edit", tool));
+        }
+        assert!(!is_restricted_v1_approvable_permission_tool("edit", "bash"));
+        assert!(!is_restricted_v1_approvable_permission_tool("bash", "bash"));
+    }
+
+    #[test]
+    fn canonical_json_sorts_keys_recursively_by_utf16_and_is_compact() {
+        let value = json!({
+            "b": [{"z": 1, "a": "x\ny"}],
+            "a": null,
+            "\u{e9}": 1,
+            "\u{1F600}": 2,
+            "\u{FF61}": 3
+        });
+        // U+1F600 is a surrogate pair (0xD83D...) and sorts before U+FF61 in
+        // UTF-16 code-unit order, as JavaScript's default sort does.
+        assert_eq!(
+            canonical_json(&value),
+            "{\"a\":null,\"b\":[{\"a\":\"x\\ny\",\"z\":1}],\"\u{e9}\":1,\"\u{1F600}\":2,\"\u{FF61}\":3}"
+        );
+    }
+
+    #[test]
+    fn rejects_permission_requests_that_break_the_contract() {
+        let base = permission_params();
+        let mut cases: Vec<(&str, Value)> = Vec::new();
+
+        let mut unknown_request_key = base.clone();
+        unknown_request_key["request"]["choices"] = json!([]);
+        cases.push(("request fields", unknown_request_key));
+
+        let mut unknown_permission_key = base.clone();
+        unknown_permission_key["request"]["permission"]["extra"] = json!(1);
+        resign(&mut unknown_permission_key);
+        cases.push(("permission fields", unknown_permission_key));
+
+        let mut unknown_param_key = base.clone();
+        unknown_param_key["extra"] = json!(1);
+        cases.push(("params contain", unknown_param_key));
+
+        for decisions in [
+            json!(["once", "always", "reject"]),
+            json!(["reject", "once"]),
+            json!(["once"]),
+        ] {
+            let mut wrong_decisions = base.clone();
+            wrong_decisions["request"]["decisions"] = decisions;
+            cases.push(("decisions", wrong_decisions));
+        }
+
+        let mut wrong_version = base.clone();
+        wrong_version["request"]["permission"]["providerVersion"] = json!("1.18.30");
+        resign(&mut wrong_version);
+        cases.push(("providerVersion", wrong_version));
+
+        let mut wrong_provider = base.clone();
+        wrong_provider["request"]["permission"]["provider"] = json!("codex");
+        resign(&mut wrong_provider);
+        cases.push(("provider must be opencode", wrong_provider));
+
+        let mut sha_mismatch = base.clone();
+        sha_mismatch["request"]["permission"]["patterns"] = json!(["src/other.ts"]);
+        cases.push(("does not match the canonical contract", sha_mismatch));
+
+        let mut uppercase_sha = base.clone();
+        let upper = uppercase_sha["request"]["permission"]["contractSha256"]
+            .as_str()
+            .unwrap()
+            .to_uppercase();
+        uppercase_sha["request"]["permission"]["contractSha256"] = json!(upper);
+        cases.push(("lowercase hex", uppercase_sha));
+
+        let mut oversize = base.clone();
+        oversize["request"]["permission"]["metadata"]["diff"] =
+            json!("x".repeat(MAX_PERMISSION_CONTRACT_BYTES));
+        resign(&mut oversize);
+        cases.push(("64 KiB", oversize));
+
+        let mut empty_session = base.clone();
+        empty_session["request"]["permission"]["providerSessionId"] = json!("");
+        resign(&mut empty_session);
+        cases.push(("providerSessionId", empty_session));
+
+        let mut wrong_origin = base.clone();
+        wrong_origin["request"]["origin"]["method"] = json!("question.asked");
+        cases.push(("origin", wrong_origin));
+
+        let mut wrong_turn = base.clone();
+        wrong_turn["request"]["turnId"] = json!("turn-2");
+        cases.push(("active turn", wrong_turn));
+
+        let mut wrong_policy = base.clone();
+        wrong_policy["request"]["permission"]["policy"]["permissionDefault"] = json!("allow");
+        resign(&mut wrong_policy);
+        cases.push(("policy", wrong_policy));
+
+        let mut tool_without_arguments = base.clone();
+        tool_without_arguments["request"]["permission"]["arguments"] = Value::Null;
+        resign(&mut tool_without_arguments);
+        cases.push(("tool input object", tool_without_arguments));
+
+        // TAX-452 H10: neither the tool nor the arguments may be null/absent.
+        let mut null_tool = base.clone();
+        null_tool["request"]["permission"]["tool"] = Value::Null;
+        null_tool["request"]["permission"]["arguments"] = Value::Null;
+        resign(&mut null_tool);
+        cases.push(("tool must be an object", null_tool));
+
+        let mut array_arguments = base.clone();
+        array_arguments["request"]["permission"]["arguments"] = json!([]);
+        resign(&mut array_arguments);
+        cases.push(("tool input object", array_arguments));
+
+        // TAX-452 H9: the frozen tool identity carries its name.
+        let mut nameless_tool = base.clone();
+        nameless_tool["request"]["permission"]["tool"]
+            .as_object_mut()
+            .unwrap()
+            .remove("name");
+        resign(&mut nameless_tool);
+        cases.push(("permission tool is invalid", nameless_tool));
+
+        let mut empty_tool_name = base.clone();
+        empty_tool_name["request"]["permission"]["tool"]["name"] = json!("");
+        resign(&mut empty_tool_name);
+        cases.push(("tool name is invalid", empty_tool_name));
+
+        for (permission, tool_name) in [
+            ("unrecognized_mutation", "unrecognized_mutation"),
+            ("edit", "bash"),
+            ("read", "edit"),
+            ("bash", "bash"),
+            ("list", "list"),
+        ] {
+            let mut unknown_pair = base.clone();
+            unknown_pair["request"]["permission"]["permission"] = json!(permission);
+            unknown_pair["request"]["permission"]["tool"]["name"] = json!(tool_name);
+            resign(&mut unknown_pair);
+            cases.push(("not approvable in restricted_v1", unknown_pair));
+        }
+
+        let mut legacy_schema = base.clone();
+        legacy_schema["request"]["schema"] = json!("paperclip.runtime_request.v2");
+        cases.push(("discriminator", legacy_schema));
+
+        let mut credential = base.clone();
+        credential["request"]["permission"]["metadata"]["command"] =
+            json!("curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789'");
+        resign(&mut credential);
+        cases.push(("credential-shaped", credential));
+
+        for (expected, params) in cases {
+            assert!(is_opencode_permission_request(&params));
+            let error = validate_opencode_permission_request(&params, "turn-1")
+                .err()
+                .unwrap_or_else(|| panic!("{expected} case must be rejected"));
+            assert!(
+                error.contains(expected),
+                "{expected} case rejected for another reason: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_decisions_resolve_only_with_the_pending_contract() {
+        let fixture = permission_fixture();
+        let sha = fixture["request"]["permission"]["contractSha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let pending = pending_permission(&sha);
+        for decision in ["once", "reject"] {
+            assert_eq!(
+                codex_question_response(&pending, &fixture["decisions"][decision]).unwrap(),
+                fixture["resolutions"][decision]
+            );
+        }
+        let mut wrong_sha = fixture["decisions"]["once"].clone();
+        wrong_sha["contractSha256"] = json!("0".repeat(64));
+        let mut always = fixture["decisions"]["once"].clone();
+        always["decision"] = json!("always");
+        let mut extra = fixture["decisions"]["once"].clone();
+        extra["remember"] = json!(true);
+        let mut wrong_schema = fixture["decisions"]["once"].clone();
+        wrong_schema["schema"] = json!("paperclip.question_response.v1");
+        let question_response = json!({
+            "schema": "paperclip.question_response.v1",
+            "answers": {"environment": {"selectedOptionIds": ["staging"]}}
+        });
+        let mut missing_sha = fixture["decisions"]["once"].clone();
+        missing_sha
+            .as_object_mut()
+            .unwrap()
+            .remove("contractSha256");
+        for invalid in [
+            wrong_sha,
+            always,
+            extra,
+            wrong_schema,
+            question_response,
+            missing_sha,
+            json!("once"),
+        ] {
+            assert!(
+                codex_question_response(&pending, &invalid).is_err(),
+                "{invalid} must not resolve a permission"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_input_requests_still_reject_malformed_question_sets() {
         let duplicate_options = json!({
             "request": {
                 "schema": "paperclip.runtime_request.v2",

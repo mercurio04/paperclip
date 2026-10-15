@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { and, asc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { manualOnlyHumanBindingSql } from "../manual-invocation-binding.js";
 import {
   assets,
   heartbeatRuns,
@@ -266,6 +267,13 @@ export async function resolveCurrentWakeCommentsBinding(
       run: heartbeatRuns,
       issueAssigneeAgentId: issues.assigneeAgentId,
       issueExecutionRunId: issues.executionRunId,
+      // TAX-452 H6: a manual-only agent's human-bound run owns an unowned task.
+      humanBound: manualOnlyHumanBindingSql({
+        runId: input.runId,
+        agentId: input.agentId,
+        issueId: input.issueId,
+        issueAssigneeAgentId: issues.assigneeAgentId,
+      }).mapWith(Boolean),
     })
     .from(heartbeatRuns)
     .innerJoin(
@@ -286,7 +294,7 @@ export async function resolveCurrentWakeCommentsBinding(
     !bound ||
     bound.run.runtimeMode !== "native" ||
     bound.run.status !== "running" ||
-    bound.issueAssigneeAgentId !== input.agentId ||
+    (bound.issueAssigneeAgentId !== input.agentId && bound.humanBound !== true) ||
     bound.issueExecutionRunId !== input.runId
   ) {
     return null;
@@ -626,6 +634,13 @@ export async function readCurrentWakeComments(
         run: heartbeatRuns,
         issueAssigneeAgentId: issues.assigneeAgentId,
         issueExecutionRunId: issues.executionRunId,
+        // TAX-452 H6: a manual-only agent's human-bound run owns an unowned task.
+        humanBound: manualOnlyHumanBindingSql({
+          runId: binding.runId,
+          agentId: binding.agentId,
+          issueId: binding.issueId,
+          issueAssigneeAgentId: issues.assigneeAgentId,
+        }).mapWith(Boolean),
       })
       .from(heartbeatRuns)
       .innerJoin(
@@ -650,7 +665,7 @@ export async function readCurrentWakeComments(
       !locked ||
       locked.run.runtimeMode !== "native" ||
       locked.run.status !== "running" ||
-      locked.issueAssigneeAgentId !== binding.agentId ||
+      (locked.issueAssigneeAgentId !== binding.agentId && locked.humanBound !== true) ||
       locked.issueExecutionRunId !== binding.runId
     ) {
       throw new Error("paperclip_current_wake_comments_binding_not_authorized");
@@ -755,6 +770,13 @@ export async function assertCurrentWakeCommentsRead(
         resultJson: heartbeatRuns.resultJson,
         issueAssigneeAgentId: issues.assigneeAgentId,
         issueExecutionRunId: issues.executionRunId,
+        // TAX-452 H6: a manual-only agent's human-bound run owns an unowned task.
+        humanBound: manualOnlyHumanBindingSql({
+          runId: input.runId,
+          agentId: input.agentId,
+          issueId: input.issueId,
+          issueAssigneeAgentId: issues.assigneeAgentId,
+        }).mapWith(Boolean),
       })
       .from(heartbeatRuns)
       .innerJoin(
@@ -778,7 +800,7 @@ export async function assertCurrentWakeCommentsRead(
       .then((rows) => rows[0] ?? null);
     if (
       !locked ||
-      locked.issueAssigneeAgentId !== input.agentId ||
+      (locked.issueAssigneeAgentId !== input.agentId && locked.humanBound !== true) ||
       locked.issueExecutionRunId !== input.runId
     ) {
       throw new Error("native_current_wake_comments_binding_changed");

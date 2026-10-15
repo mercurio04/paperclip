@@ -1,4 +1,10 @@
 import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
+import { terminateNativeDedicatedProcesses } from "./native-runtime/native-dedicated-process-reaper.js";
+import {
+  reconcileAndAuditTerminalNativePermissionOutcomes,
+  reconcileCrashedNativePermissionClaims,
+  sweepTerminalNativePermissionOutcomes,
+} from "./native-runtime/native-permission-decisions.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
 import { legacyControllerBootId, legacyControllerClaim, renewLegacyControllerLease, hasLiveLegacyController, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
@@ -32,6 +38,10 @@ import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot } from "@paperclipai
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
 import { captureDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
+import {
+  agentInvocationIsManualOnly,
+  MANUAL_ONLY_SKIP_REASON,
+} from "./agent-invocation-policy.js";
 import {
   assertDurableChatWakeupReceipt,
   assertDurableChatWakeupRequest,
@@ -73,6 +83,7 @@ import {
   or,
   sql,
 } from "drizzle-orm";
+import { manualOnlyHumanBindingSql } from "./manual-invocation-binding.js";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -230,6 +241,7 @@ import {
   assertAgentCoreProfileRecoveryBinding,
   assertManagedProfileRecoveryBinding,
   resolvePaperclipRunnerNativeProviderInput,
+  resolvePaperclipRunnerOpenCodeRuntimeOptions,
 } from "./native-runtime/provider-profile.js";
 import {
   buildNativeHeartbeatPreparationSpans,
@@ -544,7 +556,11 @@ import {
   redactCurrentUserValue,
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
-import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import {
+  preserveNativePermissionContract,
+  redactEventPayload,
+  redactSensitiveText,
+} from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
@@ -9315,6 +9331,15 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+const NATIVE_CANCEL_REAP_SETTLE_MS = 15_000;
+/**
+ * After a board cancel, how long a late `permission_native_outcome` may still
+ * be committed before claims left `delivered` without an outcome are
+ * reconciled (recovered from durable events, else `dispatch_uncertain`).
+ */
+const NATIVE_PERMISSION_OUTCOME_RECONCILE_MS = 4_000;
+const HEARTBEAT_PROCESS_LOADED_AT = new Date();
+
 export function heartbeatService(
   db: Db,
   options: HeartbeatServiceOptions = {},
@@ -12605,6 +12630,11 @@ export function heartbeatService(
     if (!isHeartbeatRunTerminalStatus(updated.status)) return;
     if (previousStatus === updated.status) return;
     clearHeartbeatRunRuntimeStatus(updated.id);
+    // H13: every genuine terminal transition of a native run (not only board
+    // cancel) arms the post-terminal outcome window; the boot/periodic sweep
+    // is the durable backstop if this process dies first.
+    if (updated.runtimeMode === "native")
+      scheduleTerminalNativePermissionOutcomeReconciliation(updated, `terminal_${updated.status}`);
     void emitAgentTaskRun(db, updated);
     void reportRunFailure(db, updated);
   }
@@ -13594,6 +13624,164 @@ export function heartbeatService(
     });
   }
 
+  /**
+   * Board cancel of a native run: the provider may never acknowledge the
+   * interrupt, which used to leave the run's dedicated runnerd/OpenCode alive
+   * after `cancelled`. The driver now rejects pending permissions so the
+   * session closes normally; this is the bounded backstop: after the settle
+   * window, SIGTERM then SIGKILL the identity-verified process groups
+   * (identity re-verified before every signal). The owner's failed close
+   * quarantines the cleanup as usual; the reaper releases that run + runner
+   * entry only after proving every recorded group terminated (signalled to
+   * exit, or already verifiably gone), otherwise it stays quarantined. While
+   * the proof runs, the agent's next admission waits for that verdict instead
+   * of failing fast. Never throws.
+   */
+  function reapCancelledNativeRunProcesses(run: typeof heartbeatRuns.$inferSelect) {
+    if (run.runtimeMode !== "native") return;
+    scheduleTerminalNativePermissionOutcomeReconciliation(run, "board_cancel");
+    void terminateNativeDedicatedProcesses({
+      db,
+      run,
+      reason: "board_cancel",
+      settleMs: NATIVE_CANCEL_REAP_SETTLE_MS,
+    }).then((outcome) => {
+      if (outcome && (outcome.targets.length > 0 || outcome.unverified.length > 0 || outcome.cleanupQuarantine !== "not_observed"))
+        logger.info({ runId: run.id, ...outcome }, "native cancel reaped dedicated processes");
+    }).catch((error) => {
+      logger.warn({ err: error, runId: run.id }, "native cancel process reap failed");
+    });
+  }
+
+  /**
+   * TAX-452 H13: a run that reached a terminal state has no event consumer
+   * left, so a native outcome reported after the terminal (cancel || once
+   * race) cannot reach its claim. After a bounded window, every claim of the
+   * run still `delivered` without `native_outcome` is reconciled: recovered
+   * from an already committed `permission_native_outcome`, otherwise moved to
+   * `dispatch_uncertain` (never redelivered) and audited. Never throws.
+   */
+  const pendingTerminalPermissionReconciliations = new Set<string>();
+  function scheduleTerminalNativePermissionOutcomeReconciliation(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId">,
+    trigger: string,
+    delayMs = NATIVE_PERMISSION_OUTCOME_RECONCILE_MS,
+  ) {
+    if (pendingTerminalPermissionReconciliations.has(run.id)) return;
+    pendingTerminalPermissionReconciliations.add(run.id);
+    const timer = setTimeout(() => {
+      pendingTerminalPermissionReconciliations.delete(run.id);
+      void reconcileTerminalNativePermissionOutcomesNow(run, trigger).catch((error) => {
+        logger.warn({ err: error, runId: run.id }, "native permission outcome reconciliation failed");
+      });
+    }, delayMs);
+    timer.unref?.();
+  }
+
+  async function reconcileTerminalNativePermissionOutcomesNow(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId">,
+    trigger: string,
+  ) {
+    return reconcileAndAuditTerminalNativePermissionOutcomes(db, run, trigger, (executor, entry) => logActivity(executor, entry));
+  }
+
+  /**
+   * Durable side of H13: the fast-path timer above is process memory, so a
+   * crash inside its window (or any other lost timer) would leave a terminal
+   * run's `delivered` claim without native outcome forever. This sweep is
+   * DB-derived: boot runs it with no age filter (the previous process, the
+   * only possible outcome consumer, is gone) and the periodic scheduler tick
+   * runs it with `settledBefore = now - window` so it never pre-empts a live
+   * fast path. Never redelivers, never throws.
+   */
+  async function reconcileTerminalNativePermissionClaims(options: {
+    trigger?: string;
+    settledBefore?: Date | null;
+    excludeRunIds?: readonly string[];
+  } = {}) {
+    try {
+      const result = await sweepTerminalNativePermissionOutcomes(
+        db,
+        {
+          trigger: options.trigger ?? "periodic_terminal_sweep",
+          settledBefore:
+            options.settledBefore === undefined
+              ? new Date(Date.now() - NATIVE_PERMISSION_OUTCOME_RECONCILE_MS)
+              : (options.settledBefore ?? undefined),
+          excludeRunIds: options.excludeRunIds,
+        },
+        (executor, entry) => logActivity(executor, entry),
+      );
+      if (result.recovered > 0 || result.uncertain > 0 || result.failedRunIds.length > 0)
+        logger.warn({ ...result, trigger: options.trigger }, "native permission terminal sweep reconciled claims");
+      return result;
+    } catch (error) {
+      logger.warn({ err: error }, "native permission terminal sweep failed");
+      return { runs: 0, recovered: 0, uncertain: 0, failedRunIds: [] as string[] };
+    }
+  }
+
+  /**
+   * After restart recovery: (1) claimed permission decisions written by the
+   * crashed process have an unknown dispatch outcome and become
+   * `dispatch_uncertain` (never redelivered); (2) runs finalized as
+   * `native_restart_recovery_blocked` get their recorded runnerd/provider
+   * process groups terminated (identity-verified, bounded, background).
+   */
+  async function reconcileNativeRestartLeftovers(
+    dispositions: ReadonlyArray<{ kind: string; runId: string }>,
+  ) {
+    for (const disposition of dispositions) {
+      const run = await getRun(disposition.runId).catch(() => null);
+      if (!run || run.runtimeMode !== "native") continue;
+      try {
+        const reconciled = await reconcileCrashedNativePermissionClaims(db, {
+          companyId: run.companyId,
+          runId: run.id,
+          claimedBefore: HEARTBEAT_PROCESS_LOADED_AT,
+          reason: "server_restart_dispatch_outcome_unknown",
+        });
+        for (const row of reconciled) {
+          await logActivity(db, {
+            companyId: run.companyId,
+            actorType: "system",
+            actorId: "native_restart_recovery",
+            action: "heartbeat.runtime_permission_reconciled",
+            entityType: "heartbeat_run",
+            entityId: run.id,
+            agentId: run.agentId,
+            runId: run.id,
+            details: {
+              runId: run.id,
+              requestId: row.requestId,
+              turnId: row.turnId,
+              decision: row.decision,
+              contractSha256: row.contractSha256,
+              resolverUserId: row.resolverUserId,
+              previousStatus: "claimed",
+              status: "dispatch_uncertain",
+              reason: "server_restart_dispatch_outcome_unknown",
+            },
+          });
+        }
+      } catch (error) {
+        logger.warn({ err: error, runId: run.id }, "native permission claim reconciliation failed");
+      }
+      if (disposition.kind !== "blocked") continue;
+      await reconcileTerminalNativePermissionOutcomesNow(run, "restart_recovery_blocked").catch((error) => {
+        logger.warn({ err: error, runId: run.id }, "native permission outcome reconciliation failed");
+      });
+      void terminateNativeDedicatedProcesses({ db, run, reason: "restart_recovery_blocked" })
+        .then((outcome) => {
+          if (outcome && outcome.targets.length > 0)
+            logger.info({ runId: run.id, ...outcome }, "native restart recovery reaped orphaned dedicated processes");
+        })
+        .catch((error) => {
+          logger.warn({ err: error, runId: run.id }, "native restart orphan reap failed");
+        });
+    }
+  }
+
   async function appendRunEvent(
     run: typeof heartbeatRuns.$inferSelect,
     event: {
@@ -13619,12 +13807,18 @@ export function heartbeatService(
     const secretSanitizedPayload = boundedPayload
       ? redactEventPayload(boundedPayload)
       : boundedPayload;
-    const sanitizedPayload = secretSanitizedPayload
-      ? redactCurrentUserValue(
-          secretSanitizedPayload,
-          currentUserRedactionOptions,
-        )
-      : secretSanitizedPayload;
+    // The frozen TAX-452 permission contract must survive bounding and
+    // current-user masking byte-for-byte: the approver sees it and the
+    // resolution authority recomputes its contractSha256 from storage.
+    const sanitizedPayload = preserveNativePermissionContract(
+      event.payload,
+      secretSanitizedPayload
+        ? redactCurrentUserValue(
+            secretSanitizedPayload,
+            currentUserRedactionOptions,
+          )
+        : secretSanitizedPayload,
+    );
     const issueId = readRuntimeStatusIssueIdCandidate(run) ?? null;
     const progress = buildRunEventRuntimeProgress({
       eventType: event.eventType,
@@ -14853,6 +15047,19 @@ export function heartbeatService(
         });
       }
     }
+    await reconcileNativeRestartLeftovers(dispositions);
+    // H13 crash variant: claims left `delivered` without native outcome by a
+    // process that died inside its post-terminal window. Runs being resumed
+    // now (or scheduled to resume) are excluded; the sweep only reconciles,
+    // never redelivers.
+    const terminalPermissionSweep = await reconcileTerminalNativePermissionClaims({
+      trigger: "startup_terminal_sweep",
+      settledBefore: null,
+      excludeRunIds: [
+        ...claims.map((claim) => claim.runId),
+        ...scheduledNativeRetries.map((entry) => entry.runId),
+      ],
+    });
     for (const claim of claims) {
       const execution = executeRun(claim.runId, {
         nativeLeaseOwner: claim.leaseOwner,
@@ -14874,6 +15081,7 @@ export function heartbeatService(
       claims,
       dispositions,
       scheduledRetryRunIds: scheduledNativeRetries.map((entry) => entry.runId),
+      terminalPermissionSweep,
       awaitingEvidenceRunIds: dispositions
         .filter((entry) => entry.kind === "awaiting_evidence")
         .map((entry) => entry.runId),
@@ -16592,6 +16800,35 @@ export function heartbeatService(
     return null;
   }
 
+  async function cancelQueuedRunForManualOnlyAgent(
+    run: typeof heartbeatRuns.$inferSelect,
+  ) {
+    const now = new Date();
+    const reason =
+      "Cancelled because this agent only runs from an explicit human invocation";
+    const cancelled = await setRunStatus(run.id, "cancelled", {
+      finishedAt: now,
+      error: reason,
+      errorCode: MANUAL_ONLY_SKIP_REASON,
+    });
+    if (!cancelled) return null;
+    await setWakeupStatus(run.wakeupRequestId, "skipped", {
+      finishedAt: now,
+      error: reason,
+    });
+    await appendRunEvent(cancelled, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: reason,
+      payload: { reason: MANUAL_ONLY_SKIP_REASON },
+    });
+    await releaseIssueExecutionAndPromote(cancelled, {
+      suppressImmediateRecovery: true,
+    });
+    return cancelled;
+  }
+
   async function cancelQueuedRunForHeartbeatDailyCap(
     run: typeof heartbeatRuns.$inferSelect,
     dailyCapBlock: NonNullable<
@@ -17063,6 +17300,16 @@ export function heartbeatService(
         `Cancelled because the agent is not invokable: ${invokability.reason}`,
       );
       return null;
+    }
+    // Retry, recovery and wake-queue paths can insert runs without passing
+    // through enqueueWakeup. A manual-only agent executes only a run whose
+    // persisted wakeup receipt proves an authenticated human click.
+    if (agentInvocationIsManualOnly(agent.permissions)) {
+      const operator = await explicitOperatorRunIdentity(db, run).catch(() => null);
+      if (operator?.cause !== "manual_user_wake") {
+        await cancelQueuedRunForManualOnlyAgent(run);
+        return null;
+      }
     }
 
     const context = parseObject(run.contextSnapshot);
@@ -17587,8 +17834,18 @@ export function heartbeatService(
             eq(issues.id, claimedIssueId),
             eq(issues.companyId, claimed.companyId),
             // Mention/context runs can touch an issue, but only the current assignee
-            // owns the issue execution lock shown as the active run.
-            eq(issues.assigneeAgentId, claimed.agentId),
+            // owns the issue execution lock shown as the active run. A human
+            // invocation of a manual-only agent bound to an unowned task owns it
+            // too (TAX-452 H6).
+            or(
+              eq(issues.assigneeAgentId, claimed.agentId),
+              manualOnlyHumanBindingSql({
+                runId: claimed.id,
+                agentId: claimed.agentId,
+                issueId: claimedIssueId,
+                issueAssigneeAgentId: issues.assigneeAgentId,
+              }),
+            ),
             claimed.scheduledRetryReason === "native_safe_replacement"
               ? or(
                   isNull(issues.checkoutRunId),
@@ -23723,6 +23980,12 @@ export function heartbeatService(
                       backend:
                         options.nativeSessionBackendFactory?.(nativeExecution),
                       useRunnerd: agent.adapterType === "paperclip_runner",
+                      ...(agent.adapterType === "paperclip_runner"
+                        && nativeExecution.provider.kind === "opencode"
+                        ? resolvePaperclipRunnerOpenCodeRuntimeOptions(
+                            agent.adapterConfig,
+                          )
+                        : {}),
                       adapterType: agent.adapterType,
                       sessionGoalControl,
                       resumeSessionGoalHeartbeat:
@@ -26113,6 +26376,43 @@ export function heartbeatService(
       return queuedResponsibleUserIdPromise;
     };
 
+    // Opt-in manual-only agents (TAX-452) run only from an explicit,
+    // authenticated human invocation. Every other wake (assignment, comment,
+    // mention, dependency, recovery, monitor, timer, automation) is recorded as
+    // skipped without an execution wait, so it is never replayed later.
+    const manualOnlyAgent = agentInvocationIsManualOnly(agent.permissions);
+    if (manualOnlyAgent && !opts.manualUserWake) {
+      await writeSkippedRequest(MANUAL_ONLY_SKIP_REASON, {
+        error: "This agent only runs from an explicit human invocation.",
+      });
+      return null;
+    }
+    // A manual-only agent is never an assignee: the human invocation itself
+    // binds the task it runs in (TAX-452 H6). Only a live task of the agent's
+    // own company can be bound; the route already checked the user's access.
+    if (manualOnlyAgent && issueId) {
+      const [boundIssue] = await db
+        .select({ id: issues.id, status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
+        .limit(1);
+      if (
+        !boundIssue ||
+        boundIssue.status === "done" ||
+        boundIssue.status === "cancelled" ||
+        boundIssue.assigneeAgentId !== null
+      ) {
+        await writeSkippedRequest(MANUAL_ONLY_SKIP_REASON, {
+          error: "Manual invocation names a task outside this agent's company, a closed task, or a task an agent owns.",
+        });
+        return null;
+      }
+      enrichedContextSnapshot.manualInvocation = {
+        userId: opts.requestedByActorId ?? null,
+        issueId,
+      };
+    }
+
     const budgetBlock = await budgets.getInvocationBlock(
       agent.companyId,
       agentId,
@@ -26152,7 +26452,12 @@ export function heartbeatService(
       await writeSkippedRequest("heartbeat.disabled", {}, { enabled: false });
       return null;
     }
-    if (source !== "timer" && !policy.wakeOnDemand) {
+    if (
+      source !== "timer" &&
+      !policy.wakeOnDemand &&
+      // The manual-only gate above already admitted only a human invocation.
+      !(manualOnlyAgent && opts.manualUserWake)
+    ) {
       await writeSkippedRequest("heartbeat.wakeOnDemand.disabled", {}, { wakeOnDemand: false });
       return null;
     }
@@ -28400,6 +28705,7 @@ export function heartbeatService(
               reason,
               runtimeMode: run.runtimeMode,
             });
+            reapCancelledNativeRunProcesses(run);
             if (running) {
               await terminateHeartbeatRunProcess({
                 pid: running.child.pid,
@@ -28585,6 +28891,7 @@ export function heartbeatService(
             reason,
             runtimeMode: run.runtimeMode,
           });
+          reapCancelledNativeRunProcesses(run);
         }
         const persistedCancellationResult =
           run.runtimeMode === "native"
@@ -29032,6 +29339,7 @@ export function heartbeatService(
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     recoverNativeRunsAfterRestart,
+    reconcileTerminalNativePermissionClaims,
     reapOrphanedRuns,
     sweepPendingCleanupLeases,
     // Override-aware scheduling-suppression check (honors the worktree
@@ -29118,6 +29426,7 @@ export function heartbeatService(
           agentsByCompany.get(agent.companyId) ?? [],
         );
         if (!invokability.invokable) continue;
+        if (agentInvocationIsManualOnly(agent.permissions)) continue;
         const policy = parseHeartbeatPolicy(agent);
         if (!policy.enabled || policy.intervalSec <= 0) continue;
 

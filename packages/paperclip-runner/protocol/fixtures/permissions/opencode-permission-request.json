@@ -1,0 +1,113 @@
+{
+  "schema": "paperclip.opencode_permission_fixture.v1",
+  "description": "Canonical TAX-452 OpenCode permission bridge contract: driver->proxy->runnerd request, server decision, and runnerd->proxy resolutions. contractSha256 is sha256 of the canonical JSON (recursively sorted keys, compact, UTF-8) of request.permission without contractSha256.",
+  "canonicalContractJson": "{\"always\":[\"src/app.ts\"],\"arguments\":{\"filePath\":\"/workspace/project/src/app.ts\",\"newString\":\"export const answer = 42;\",\"oldString\":\"export const answer = 41;\"},\"cwd\":\"/workspace/project\",\"metadata\":{\"diff\":\"--- a/src/app.ts\\n+++ b/src/app.ts\\n@@ -1 +1 @@\\n-export const answer = 41;\\n+export const answer = 42;\\n\",\"filepath\":\"/workspace/project/src/app.ts\"},\"patterns\":[\"src/app.ts\"],\"permission\":\"edit\",\"policy\":{\"permissionDefault\":\"ask\",\"profile\":\"restricted_v1\"},\"provider\":\"opencode\",\"providerRequestId\":\"per_01JFIXTUREPERMISSION0001\",\"providerSessionId\":\"ses_01JFIXTUREPERMISSION0001\",\"providerVersion\":\"1.18.29\",\"schema\":\"paperclip.opencode_permission_contract.v1\",\"targets\":[{\"pattern\":\"src/app.ts\",\"resolvedPath\":\"/workspace/project/src/app.ts\"}],\"tool\":{\"callId\":\"call_fixture_edit_1\",\"messageId\":\"msg_01JFIXTUREPERMISSION0001\",\"name\":\"edit\"}}",
+  "request": {
+    "schema": "paperclip.runtime_request.permission.v1",
+    "requestKind": "runtime",
+    "requestId": "per_01JFIXTUREPERMISSION0001",
+    "type": "permission",
+    "status": "pending",
+    "prompt": "OpenCode requests permission to edit src/app.ts.",
+    "turnId": "turn-1",
+    "itemId": "call_fixture_edit_1",
+    "origin": {
+      "adapter": "opencode-server",
+      "provider": "opencode",
+      "method": "permission.asked"
+    },
+    "decisions": [
+      "once",
+      "reject"
+    ],
+    "permission": {
+      "schema": "paperclip.opencode_permission_contract.v1",
+      "provider": "opencode",
+      "providerVersion": "1.18.29",
+      "providerSessionId": "ses_01JFIXTUREPERMISSION0001",
+      "providerRequestId": "per_01JFIXTUREPERMISSION0001",
+      "permission": "edit",
+      "tool": {
+        "name": "edit",
+        "messageId": "msg_01JFIXTUREPERMISSION0001",
+        "callId": "call_fixture_edit_1"
+      },
+      "patterns": [
+        "src/app.ts"
+      ],
+      "always": [
+        "src/app.ts"
+      ],
+      "metadata": {
+        "filepath": "/workspace/project/src/app.ts",
+        "diff": "--- a/src/app.ts\n+++ b/src/app.ts\n@@ -1 +1 @@\n-export const answer = 41;\n+export const answer = 42;\n"
+      },
+      "arguments": {
+        "filePath": "/workspace/project/src/app.ts",
+        "oldString": "export const answer = 41;",
+        "newString": "export const answer = 42;"
+      },
+      "cwd": "/workspace/project",
+      "targets": [
+        {
+          "pattern": "src/app.ts",
+          "resolvedPath": "/workspace/project/src/app.ts"
+        }
+      ],
+      "policy": {
+        "profile": "restricted_v1",
+        "permissionDefault": "ask"
+      },
+      "contractSha256": "9460014fcfe686bf4a07802a92eac2225602984ef19f0d2c3e708dd6797b0dc8"
+    }
+  },
+  "decisions": {
+    "once": {
+      "schema": "paperclip.permission_decision.v1",
+      "decision": "once",
+      "contractSha256": "9460014fcfe686bf4a07802a92eac2225602984ef19f0d2c3e708dd6797b0dc8"
+    },
+    "reject": {
+      "schema": "paperclip.permission_decision.v1",
+      "decision": "reject",
+      "contractSha256": "9460014fcfe686bf4a07802a92eac2225602984ef19f0d2c3e708dd6797b0dc8"
+    }
+  },
+  "resolutions": {
+    "once": {
+      "resolution": {
+        "action": "permission_decision",
+        "decision": "once",
+        "contractSha256": "9460014fcfe686bf4a07802a92eac2225602984ef19f0d2c3e708dd6797b0dc8"
+      }
+    },
+    "reject": {
+      "resolution": {
+        "action": "permission_decision",
+        "decision": "reject",
+        "contractSha256": "9460014fcfe686bf4a07802a92eac2225602984ef19f0d2c3e708dd6797b0dc8"
+      }
+    },
+    "cancel": {
+      "resolution": {
+        "action": "cancel"
+      }
+    }
+  },
+  "restrictedApprovablePermissionTools": {
+    "edit": [
+      "apply_patch",
+      "edit",
+      "write"
+    ],
+    "glob": [
+      "glob"
+    ],
+    "grep": [
+      "grep"
+    ],
+    "read": [
+      "read"
+    ]
+  }
+}

@@ -1,8 +1,13 @@
+import { createHash } from "node:crypto";
+
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 
 import type { Db } from "@paperclipai/db";
 import { heartbeatRunEvents } from "@paperclipai/db";
-import type { HarnessRuntimeRequestKind } from "../../vendor/paperclip-runner/index.js";
+import type {
+  HarnessRuntimeRequestKind,
+  HarnessRuntimeRequestResolution,
+} from "../../vendor/paperclip-runner/index.js";
 
 const TERMINAL_RUNTIME_REQUEST_EVENTS = [
   "runtime_request.resolved",
@@ -22,6 +27,131 @@ const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 
 export type NativeRuntimeRequestKind = HarnessRuntimeRequestKind | "runtime";
 
+export const NATIVE_PERMISSION_REQUEST_SCHEMA = "paperclip.runtime_request.permission.v1";
+export const NATIVE_PERMISSION_CONTRACT_SCHEMA = "paperclip.opencode_permission_contract.v1";
+export const NATIVE_PERMISSION_DECISION_SCHEMA = "paperclip.permission_decision.v1";
+export type NativePermissionDecision = "once" | "reject";
+const PERMISSION_DECISIONS: readonly NativePermissionDecision[] = ["once", "reject"];
+const CONTRACT_SHA256_PATTERN = /^[0-9a-f]{64}$/;
+// Contract TAX-452 §1: unknown keys in the request or the permission object
+// are rejected. Keep these lists in lockstep with `.e2e/notes/contract.md`.
+const PERMISSION_REQUEST_KEYS = new Set([
+  "schema",
+  "requestKind",
+  "requestId",
+  "type",
+  "status",
+  "prompt",
+  "turnId",
+  "itemId",
+  "origin",
+  "decisions",
+  "permission",
+]);
+const PERMISSION_CONTRACT_KEYS = new Set([
+  "schema",
+  "provider",
+  "providerVersion",
+  "providerSessionId",
+  "providerRequestId",
+  "permission",
+  "tool",
+  "patterns",
+  "always",
+  "metadata",
+  "arguments",
+  "cwd",
+  "targets",
+  "policy",
+  "contractSha256",
+]);
+
+/**
+ * TAX-452 H9: the only (OpenCode permission, tool id) pairs a restricted_v1
+ * contract may carry; anything else is non-actionable (fail closed). Verified
+ * against OpenCode 1.18.29 (`edit`/`write`/`apply_patch` ask `edit`; `read`,
+ * `glob`, `grep` ask their own name; no `list` tool is registered). Mirrors
+ * `RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS` in the runner driver and the
+ * Rust runnerd; the shared permission fixture pins all three.
+ */
+export const RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS: Readonly<
+  Record<string, readonly string[]>
+> = Object.freeze({
+  edit: Object.freeze(["apply_patch", "edit", "write"]),
+  glob: Object.freeze(["glob"]),
+  grep: Object.freeze(["grep"]),
+  read: Object.freeze(["read"]),
+});
+const PERMISSION_TOOL_KEYS = ["callId", "messageId", "name"] as const;
+
+export function isRestrictedV1ApprovablePermissionTool(
+  permission: unknown,
+  toolName: unknown,
+): boolean {
+  return typeof permission === "string"
+    && typeof toolName === "string"
+    && Object.prototype.hasOwnProperty.call(RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS, permission)
+    && RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS[permission]!.includes(toolName);
+}
+
+/** TAX-452 H9/H10: `tool` is exactly `{name, messageId, callId}`, never null. */
+function isFrozenPermissionTool(value: unknown): value is Record<string, string> {
+  const tool = record(value);
+  if (!tool) return false;
+  const keys = Object.keys(tool).sort();
+  return keys.length === PERMISSION_TOOL_KEYS.length
+    && PERMISSION_TOOL_KEYS.every((key, index) => keys[index] === key)
+    && PERMISSION_TOOL_KEYS.every((key) => {
+      const entry = tool[key];
+      return typeof entry === "string"
+        && entry.length > 0
+        && entry.length <= (key === "name" ? 160 : 256);
+    });
+}
+
+/**
+ * Typed permission decision: the `permission_decision` member of the runner
+ * contract union in packages/paperclip-runner/src/contracts/harness-driver.ts.
+ */
+export type NativePermissionDecisionResolution = Extract<
+  HarnessRuntimeRequestResolution,
+  { action: "permission_decision" }
+>;
+
+/** Every resolution the server may hand to a native runtime. */
+export type NativeRuntimeResolutionPayload = HarnessRuntimeRequestResolution;
+
+/**
+ * Strictly parse a browser permission decision. Only `once`/`reject` exist;
+ * `always`, session grants, submits and approvals are never valid here.
+ */
+export function parseNativePermissionDecisionResolution(
+  value: unknown,
+): NativePermissionDecisionResolution | null {
+  const candidate = record(value);
+  if (!candidate) return null;
+  const keys = Object.keys(candidate).sort();
+  if (keys.join(",") !== "action,contractSha256,decision") return null;
+  if (
+    candidate.action !== "permission_decision"
+    || !PERMISSION_DECISIONS.includes(candidate.decision as NativePermissionDecision)
+    || typeof candidate.contractSha256 !== "string"
+    || !CONTRACT_SHA256_PATTERN.test(candidate.contractSha256)
+  ) return null;
+  return {
+    action: "permission_decision",
+    decision: candidate.decision as NativePermissionDecision,
+    contractSha256: candidate.contractSha256,
+  };
+}
+
+export interface PendingNativePermissionRequest {
+  readonly contractSha256: string;
+  /** Frozen persisted permission contract, exactly as the runner emitted it. */
+  readonly contract: Record<string, unknown>;
+  readonly decisions: readonly NativePermissionDecision[];
+}
+
 export interface PendingNativeRuntimeRequest {
   readonly companyId: string;
   readonly runId: string;
@@ -30,6 +160,8 @@ export interface PendingNativeRuntimeRequest {
   readonly turnId: string;
   /** Server-owned policy derived from the canonical request kind. */
   readonly resolverPolicy: "human_only" | "instance_admin";
+  /** Present only for `paperclip.runtime_request.permission.v1` requests. */
+  readonly permission?: PendingNativePermissionRequest;
 }
 
 export interface NativeRuntimeRequestResolver {
@@ -49,6 +181,80 @@ function record(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
+}
+
+function canonicalJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJsonValue);
+  if (value !== null && typeof value === "object") {
+    const source = value as Record<string, unknown>;
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(source).sort()) {
+      sorted[key] = canonicalJsonValue(source[key]);
+    }
+    return sorted;
+  }
+  return value;
+}
+
+/**
+ * Contract TAX-452 §1: sha256 hex of the canonical JSON (keys sorted
+ * recursively with the JS default sort, compact, UTF-8) of the `permission`
+ * object without `contractSha256`. The server recomputes it from storage and
+ * never trusts the runner-provided value alone.
+ */
+export function computeNativePermissionContractSha256(
+  contract: Record<string, unknown>,
+): string {
+  const { contractSha256: _ignored, ...unsigned } = contract;
+  return createHash("sha256")
+    .update(JSON.stringify(canonicalJsonValue(unsigned)), "utf8")
+    .digest("hex");
+}
+
+/**
+ * Parse the persisted permission request. Any deviation from the frozen
+ * contract makes the request non-actionable (fail closed): it can then only
+ * be cancelled by the runner, never approved.
+ */
+function canonicalPermissionRequest(
+  request: Record<string, unknown>,
+): PendingNativePermissionRequest | null {
+  if (
+    request.schema !== NATIVE_PERMISSION_REQUEST_SCHEMA
+    || request.requestKind !== "runtime"
+    || Object.keys(request).some((key) => !PERMISSION_REQUEST_KEYS.has(key))
+  ) return null;
+  const decisions = request.decisions;
+  if (
+    !Array.isArray(decisions)
+    || decisions.length !== PERMISSION_DECISIONS.length
+    || !PERMISSION_DECISIONS.every((decision) => decisions.includes(decision))
+  ) return null;
+  const contract = record(request.permission);
+  if (
+    !contract
+    || contract.schema !== NATIVE_PERMISSION_CONTRACT_SCHEMA
+    || Object.keys(contract).some((key) => !PERMISSION_CONTRACT_KEYS.has(key))
+    || typeof contract.contractSha256 !== "string"
+    || !CONTRACT_SHA256_PATTERN.test(contract.contractSha256)
+    || typeof contract.permission !== "string"
+    // TAX-452 H10: the exact tool call and its complete arguments are required.
+    || !isFrozenPermissionTool(contract.tool)
+    || !record(contract.arguments)
+    // TAX-452 H9: defense in depth over the driver/runnerd allowlist.
+    || !isRestrictedV1ApprovablePermissionTool(contract.permission, record(contract.tool)?.name)
+  ) return null;
+  // A stored contract that no longer hashes to its own contractSha256 was
+  // altered after the runner froze it (redaction, truncation, tampering): the
+  // human would be approving something other than what the driver verifies.
+  if (computeNativePermissionContractSha256(contract) !== contract.contractSha256) {
+    return null;
+  }
+  return {
+    contractSha256: contract.contractSha256,
+    contract,
+    decisions: [...PERMISSION_DECISIONS],
+  };
 }
 
 function canonicalPendingRequest(input: {
@@ -94,6 +300,21 @@ function canonicalPendingRequest(input: {
     return null;
   }
   const kind = requestKind as NativeRuntimeRequestKind;
+  if (request.type === "permission" || request.schema === NATIVE_PERMISSION_REQUEST_SCHEMA) {
+    const permission = canonicalPermissionRequest(request);
+    if (!permission) return null;
+    return {
+      companyId: input.companyId,
+      runId: input.runId,
+      requestId,
+      requestKind: kind,
+      turnId,
+      // Tool permissions mutate the workspace on the operator's behalf: they
+      // are privileged approvals regardless of the transport request kind.
+      resolverPolicy: "instance_admin",
+      permission,
+    };
+  }
   return {
     companyId: input.companyId,
     runId: input.runId,

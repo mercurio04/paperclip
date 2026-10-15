@@ -33,6 +33,11 @@ toml_edit.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
+[features]
+# E2E-only fault seams (TAX-452). Never enabled by default or in release
+# artifacts; the isolated harness builds it into its own target directory.
+e2e-fault-injection = []
+
 [[bin]]
 name = "conformance-tracer"
 path = "src/bin/conformance-tracer.rs"

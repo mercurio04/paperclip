@@ -8,6 +8,7 @@ import type {
 } from "../../contracts/harness-driver.js";
 import {
   PAPERCLIP_QUESTION_SET_SCHEMA,
+  PAPERCLIP_RUNTIME_REQUEST_PERMISSION_SCHEMA_V1,
   PAPERCLIP_RUNTIME_REQUEST_SCHEMA_V2,
   parsePaperclipQuestionSet,
 } from "../../contracts/harness-driver.js";
@@ -57,7 +58,16 @@ function boundedText(
     : `${candidate.slice(0, maxCharacters)}...[truncated]`;
 }
 
+/**
+ * Synthetic server-request method the runnerd transport uses to surface a
+ * typed provider permission (PRP `paperclip.runtime_request.permission.v1`)
+ * to the session. It never reaches a provider.
+ */
+export const PAPERCLIP_PERMISSION_BRIDGE_METHOD =
+  "paperclip/permission/requestDecision" as const;
+
 export function runtimeRequestKind(method: string): HarnessRuntimeRequestKind | null {
+  if (method === PAPERCLIP_PERMISSION_BRIDGE_METHOD) return "permission_approval";
   if (
     method === "item/commandExecution/requestApproval" ||
     method === "execCommandApproval"
@@ -445,6 +455,21 @@ export function normalizeCodexQuestionSet(
 }
 
 export function runtimeRequestProtocolPayload(request: HarnessRuntimeRequest): Record<string, unknown> {
+  if (request.permission !== undefined) {
+    return {
+      schema: PAPERCLIP_RUNTIME_REQUEST_PERMISSION_SCHEMA_V1,
+      requestKind: "runtime",
+      requestId: request.requestId,
+      type: "permission",
+      status: request.status,
+      prompt: request.prompt,
+      turnId: request.turnId,
+      itemId: request.itemId,
+      origin: structuredClone(request.origin),
+      decisions: [...(request.decisions ?? [])],
+      permission: structuredClone(request.permission),
+    };
+  }
   if (request.input !== undefined) {
     return {
       schema: PAPERCLIP_RUNTIME_REQUEST_SCHEMA_V2,
@@ -557,6 +582,11 @@ export function runtimeRequestResponse(
     if (resolution.action === "submit") {
       throw new Error(
         `${request.requestKind} does not accept submitted form data`,
+      );
+    }
+    if (resolution.action === "permission_decision") {
+      throw new Error(
+        `${request.requestKind} does not accept a typed permission decision`,
       );
     }
     const decisions = {

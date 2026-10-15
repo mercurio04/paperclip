@@ -12,6 +12,8 @@ pub mod claude_managed_provider;
 pub mod codex_provider;
 mod codex_startup_trust;
 pub mod durable;
+#[cfg(feature = "e2e-fault-injection")]
+pub mod e2e_fault;
 pub mod fake_harness;
 pub mod generated_acpx_sidecar_contract;
 pub mod local_runner;

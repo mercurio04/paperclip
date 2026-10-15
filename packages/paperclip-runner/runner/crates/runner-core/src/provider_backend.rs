@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 
 use crate::codex_provider::{
     CodexProvider, CodexProviderConfig, CodexProviderEvent, ProviderStartupObservation,
-    ProviderStartupStage, RejectedAcceptedTurn, MAX_SETTLED_PROVIDER_TURN_IDS,
+    ProviderStartupStage, RejectedAcceptedTurn, RuntimeRequestResolution,
+    MAX_SETTLED_PROVIDER_TURN_IDS,
 };
 use crate::durable::{
     create_private_temporary_file, current_unix_ms, open_private_regular_file,
@@ -3354,19 +3355,36 @@ impl CodexCommandExecutor {
         let response = payload
             .get("response")
             .ok_or_else(|| DurableRunnerError::invalid("request.resolve requires response"))?;
-        self.ensure_provider()?
+        let resolution = self
+            .ensure_provider()?
             .resolve_runtime_request(request_id, response)
             .map_err(|error| {
                 DurableRunnerError::invalid(format!(
                     "{provider_name} runtime response failed: {error}"
                 ))
             })?;
+        let resolved = match resolution {
+            RuntimeRequestResolution::Input => {
+                json!({"provider": provider_label, "requestId": request_id, "status": "delivered"})
+            }
+            RuntimeRequestResolution::Permission { decision } => {
+                #[cfg(feature = "e2e-fault-injection")]
+                crate::e2e_fault::crash_after_permission_delivery(request_id, &decision);
+                json!({
+                "provider": provider_label,
+                "requestId": request_id,
+                "status": "delivered",
+                "type": "permission",
+                "decision": decision,
+                })
+            }
+        };
         Ok(CommandExecution {
             result: json!({"status": "delivered", "requestId": request_id}),
             events: vec![(
                 "runtime_request.resolved".to_owned(),
                 EventPriority::P0,
-                json!({"provider": provider_label, "requestId": request_id, "status": "delivered"}),
+                resolved,
             )],
         })
     }
@@ -4280,6 +4298,71 @@ impl CodexCommandExecutor {
                                 },
                             },
                         }),
+                    };
+                    if receipt_limit_terminal_poll {
+                        state.push_receipt_limit_cleanup_event(event)?;
+                    } else {
+                        state.push_event(event)?;
+                    }
+                    self.save_state()?;
+                }
+                CodexProviderEvent::PermissionRequest {
+                    request_id: _,
+                    request,
+                } => {
+                    let state = self
+                        .state
+                        .as_mut()
+                        .expect("Codex state remains available while polling");
+                    let event = NormalizedProviderEvent {
+                        event_type: "runtime_request.created".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({ "request": request }),
+                    };
+                    if receipt_limit_terminal_poll {
+                        state.push_receipt_limit_cleanup_event(event)?;
+                    } else {
+                        state.push_event(event)?;
+                    }
+                    self.save_state()?;
+                }
+                CodexProviderEvent::RuntimeRequestSettled {
+                    event_type,
+                    payload,
+                    diagnostic,
+                } => {
+                    let state = self
+                        .state
+                        .as_mut()
+                        .expect("Codex state remains available while polling");
+                    let diagnostic = diagnostic.map(|payload| NormalizedProviderEvent {
+                        event_type: "harness.diagnostic".to_owned(),
+                        priority: EventPriority::P0,
+                        payload,
+                    });
+                    let settled = NormalizedProviderEvent {
+                        event_type: event_type.to_owned(),
+                        priority: EventPriority::P0,
+                        payload,
+                    };
+                    for event in diagnostic.into_iter().chain([settled]) {
+                        if receipt_limit_terminal_poll {
+                            state.push_receipt_limit_cleanup_event(event)?;
+                        } else {
+                            state.push_event(event)?;
+                        }
+                    }
+                    self.save_state()?;
+                }
+                CodexProviderEvent::RuntimeRequestRejected { diagnostic } => {
+                    let state = self
+                        .state
+                        .as_mut()
+                        .expect("Codex state remains available while polling");
+                    let event = NormalizedProviderEvent {
+                        event_type: "harness.diagnostic".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: diagnostic,
                     };
                     if receipt_limit_terminal_poll {
                         state.push_receipt_limit_cleanup_event(event)?;

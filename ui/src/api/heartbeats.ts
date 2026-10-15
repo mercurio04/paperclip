@@ -99,7 +99,13 @@ export type RuntimeRequestResolution =
   | { action: "accept" | "accept_for_session" | "decline" | "cancel" }
   | { action: "submit"; answers: Record<string, { answers: string[] }> }
   | { action: "submit"; content: Record<string, unknown> }
-  | { action: "submit"; response: import("@paperclipai/adapter-utils").PaperclipQuestionResponse };
+  | { action: "submit"; response: import("@paperclipai/adapter-utils").PaperclipQuestionResponse }
+  | {
+      /** Typed OpenCode permission (TAX-452): only once/reject, bound to the frozen contract sha. */
+      action: "permission_decision";
+      decision: "once" | "reject";
+      contractSha256: string;
+    };
 
 export interface HeartbeatRunListOptions {
   summary?: boolean;

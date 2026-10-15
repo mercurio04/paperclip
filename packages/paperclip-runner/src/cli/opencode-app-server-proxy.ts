@@ -22,7 +22,12 @@ import {
   assertOpenCodeProxyCollaborationMode,
   openCodeProxyCollaborationModes,
 } from "./opencode-proxy-collaboration-mode.js";
-import { parseOpenCodeProxyPermissionMode } from "./opencode-proxy-permission-mode.js";
+import {
+  parseOpenCodeProxyPermissionMode,
+  parseOpenCodeProxyPermissionProfile,
+  settleOpenCodeProxyPermissionRequest,
+  parseOpenCodeProxyPermissionTtlMs,
+} from "./opencode-proxy-permission-mode.js";
 import {
   trustedOpenCodeLaunchBinding,
   withoutAmbientOpenCodeCommand,
@@ -105,11 +110,25 @@ async function open(
         JSON.parse(readFileSync(runtimeContextPath, "utf8")),
       )
     : null;
+  const permissionProfile = parseOpenCodeProxyPermissionProfile(
+    process.env.PAPERCLIP_OPENCODE_PERMISSION_PROFILE,
+  );
+  const permissionTtlMs = parseOpenCodeProxyPermissionTtlMs(
+    process.env.PAPERCLIP_OPENCODE_PERMISSION_TTL_MS,
+  );
   driver = new OpenCodeServerDriver({
     model,
     permissionMode: parseOpenCodeProxyPermissionMode(
       process.env.PAPERCLIP_OPENCODE_PERMISSION_MODE,
     ),
+    ...(permissionProfile
+      ? {
+          permissionProfile,
+          ...(permissionTtlMs !== undefined ? { permissionTtlMs } : {}),
+          llamaCppBaseUrl:
+            process.env.PAPERCLIP_OPENCODE_LLAMACPP_BASE_URL?.trim() ?? "",
+        }
+      : {}),
     command: launchBinding.command,
     commandFd: launchBinding.commandFd,
     commandLifecycle: launchBinding.commandLifecycle,
@@ -184,9 +203,46 @@ function announceTurnStarted(opened: HarnessSession, turnId: string): void {
   });
 }
 
+/**
+ * Post-delivery report to runnerd of what OpenCode natively received for a
+ * typed permission whose board decision runnerd already delivered. runnerd
+ * accepts it only for a decision it delivered and publishes it so the server
+ * records the claim's native outcome; it never answers OpenCode again.
+ */
+function sendNativeOutcome(
+  opened: HarnessSession,
+  turnId: string | undefined,
+  requestId: string,
+  nativeOutcome: string,
+): void {
+  if (!requestId || !nativeOutcome) return;
+  send({
+    method: "paperclip/runtimeRequestSettled",
+    params: {
+      threadId: opened.ids().driverSessionId,
+      turnId,
+      requestId,
+      status: "applied",
+      nativeOutcome,
+    },
+  });
+}
+
+/** Typed permissions published to runnerd and not yet settled. */
+const typedPermissionRequestIds = new Set<string>();
+
 async function pumpEvents(opened: HarnessSession): Promise<void> {
   for await (const event of opened.events()) {
     const payload = record(event.payload);
+    if (
+      event.eventType === "harness.diagnostic" &&
+      payload.code === "permission_decision_after_terminal"
+    ) {
+      // The terminal state won after runnerd delivered the decision: OpenCode
+      // received native `reject`, never the late `once`. (Also forwarded as
+      // a warning below.)
+      sendNativeOutcome(opened, event.turnId, text(payload.providerRequestId), text(payload.nativeOutcome));
+    }
     if (event.eventType === "turn.started") {
       if (typeof event.turnId === "string")
         announceTurnStarted(opened, event.turnId);
@@ -253,6 +309,28 @@ async function pumpEvents(opened: HarnessSession): Promise<void> {
       // Keep consuming OpenCode SSE while the controller waits for the user.
       // If the underlying provider disappears, the stream can then fail the
       // proxy and runnerd will expire the still-pending canonical request.
+      if (request.type === "permission") {
+        typedPermissionRequestIds.add(requestId);
+        const isPending = () =>
+          (opened.pendingRuntimeRequests?.() ?? []).some(
+            (candidate) => candidate.requestId === requestId,
+          );
+        void settleOpenCodeProxyPermissionRequest({
+          ask: () => requestController("paperclip/runtimeRequest", { request }),
+          resolve: (resolution) =>
+            opened.resolveRuntimeRequest!({
+              requestId,
+              turnId,
+              resolution: resolution as HarnessRuntimeRequestResolution,
+            }),
+          isPending,
+          onFallback: (reason) =>
+            process.stderr.write(
+              `[opencode] permission ${requestId} settles as reject: ${reason}\n`,
+            ),
+        }).catch((error) => failProxy(error));
+        continue;
+      }
       void (async () => {
         const controllerResponse = record(
           await requestController("paperclip/runtimeRequest", {
@@ -267,6 +345,42 @@ async function pumpEvents(opened: HarnessSession): Promise<void> {
           ) as HarnessRuntimeRequestResolution,
         });
       })().catch((error) => failProxy(error));
+    } else if (
+      (event.eventType === "runtime_request.expired" ||
+        event.eventType === "runtime_request.cancelled") &&
+      typedPermissionRequestIds.delete(text(payload.requestId))
+    ) {
+      // restricted_v1: the driver settled a pending typed permission on its
+      // own (TTL expiry, provider cascade reject, terminal turn, SSE loss) and
+      // the native permission is already rejected. runnerd retires its pending
+      // request and publishes the settlement so the server refuses any later
+      // decision (no dispatch, no re-prompt).
+      send({
+        method: "paperclip/runtimeRequestSettled",
+        params: {
+          threadId: opened.ids().driverSessionId,
+          turnId: event.turnId,
+          requestId: text(payload.requestId),
+          status:
+            event.eventType === "runtime_request.expired"
+              ? "expired"
+              : "cancelled",
+          reason: text(payload.reason),
+          // What OpenCode natively received (driver-reported). runnerd
+          // rebuilds the expired/cancelled payload; the post-delivery
+          // `applied` report below is the path that carries the outcome.
+          ...(text(payload.nativeOutcome)
+            ? { nativeOutcome: text(payload.nativeOutcome) }
+            : {}),
+        },
+      });
+    } else if (
+      event.eventType === "runtime_request.resolved" &&
+      typedPermissionRequestIds.delete(text(payload.requestId))
+    ) {
+      // Settled by the decision runnerd delivered; nothing to retire. Report
+      // what OpenCode natively received so the claim records the outcome.
+      sendNativeOutcome(opened, event.turnId, text(payload.requestId), text(payload.nativeOutcome));
     } else if (event.eventType === "run.attached") {
       // OpenCode can retain one provider session across governed runs. Usage
       // totals are run-scoped, so a new attachment must not inherit the prior

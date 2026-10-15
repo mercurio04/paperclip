@@ -1,15 +1,18 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmod,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
+  readlink,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
 import { createServer } from "node:net";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, parse as parsePath, resolve, sep } from "node:path";
 
 import {
   CODEX_SKILLLESS_BASE_INSTRUCTIONS,
@@ -32,16 +35,23 @@ import type {
   HarnessRuntimeRequest,
   HarnessRuntimeRequestHandoff,
   HarnessRuntimeRequestResolution,
+  PaperclipOpenCodePermissionContract,
+  PaperclipPermissionDecision,
   PaperclipQuestion,
   PaperclipQuestionResponse,
   PaperclipQuestionSet,
 } from "../../contracts/harness-driver.js";
 import {
+  PAPERCLIP_OPENCODE_PERMISSION_CONTRACT_SCHEMA_V1,
+  PAPERCLIP_PERMISSION_DECISIONS,
+  PAPERCLIP_RUNTIME_REQUEST_PERMISSION_SCHEMA_V1,
   PAPERCLIP_QUESTION_SET_SCHEMA,
   PAPERCLIP_RUNTIME_REQUEST_SCHEMA_V2,
   harnessRuntimeInputExpiredOutcome,
   harnessRuntimeRequestOutcome,
+  isRestrictedV1ApprovablePermissionTool,
   parseHarnessRuntimeRequestResolution,
+  RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS,
   parsePaperclipQuestionSet,
 } from "../../contracts/harness-driver.js";
 import type {
@@ -74,6 +84,9 @@ import { materializeNativeRuntimeSkills } from "../runtime-context-materializer.
 
 export const OPENCODE_SERVER_DRIVER_KIND = "opencode_server" as const;
 export const QUALIFIED_OPENCODE_VERSION = "1.18.29" as const;
+/** restricted_v1: default and maximum lifetime of a pending typed permission. */
+export const DEFAULT_PERMISSION_TTL_MS = 15 * 60_000;
+const MAX_PERMISSION_TTL_MS = 24 * 60 * 60_000;
 export const QUALIFIED_OPENCODE_MODEL =
   "openrouter/deepseek/deepseek-v4-flash-0731" as const;
 
@@ -85,9 +98,26 @@ type DynamicToolHandler = (call: {
   arguments: unknown;
 }) => Promise<unknown>;
 
+export type OpenCodePermissionProfile = "restricted_v1";
+
 export interface OpenCodeServerDriverOptions {
   model: string;
   permissionMode?: "allow" | "ask" | "deny";
+  /**
+   * Opt-in TAX-452 profile. When set, every native permission becomes a typed,
+   * hash-bound Paperclip request, the provider is pinned to a loopback
+   * llama.cpp endpoint, and the child environment is reduced to an allowlist.
+   * Absent, the legacy behavior is unchanged.
+   */
+  permissionProfile?: OpenCodePermissionProfile;
+  /** Required with `restricted_v1`: http URL on 127.0.0.1, localhost, or ::1. */
+  llamaCppBaseUrl?: string;
+  /**
+   * restricted_v1: bounded lifetime of a pending typed permission. When it
+   * elapses the native permission is rejected exactly once and the request
+   * settles as `runtime_request.expired` (`permission_expired`). Default 15 min.
+   */
+  permissionTtlMs?: number;
   taskEnvelope?: CodexTaskEnvelope;
   runnerInstanceId?: string;
   command?: string;
@@ -121,6 +151,8 @@ interface OpenCodeRuntime {
   authHeader: string;
   version: string;
   permissionMode: "allow" | "ask" | "deny";
+  permissionProfile: OpenCodePermissionProfile | null;
+  permissionTtlMs: number;
   process: ChildProcess;
   bridge: OpenCodeMcpBridge;
   trace: ProviderTraceFileSink | null;
@@ -156,10 +188,36 @@ const CAPABILITIES: NativeSessionCapabilities = {
   unsupported: ["steering", "goals", "threadLineage"],
 };
 
+/**
+ * What OpenCode actually received for a typed permission. Carried as
+ * `nativeOutcome` on the driver's settle events (runtime_request.resolved /
+ * expired / cancelled, and the permission_decision_after_terminal diagnostic)
+ * and recorded on native_permission_decisions.native_outcome.
+ */
+export type PaperclipPermissionNativeOutcome =
+  | "once_applied"
+  | "rejected_terminal"
+  | "rejected_drift"
+  | "rejected_expired"
+  | "unknown";
+
 export class OpenCodeServerDriver implements HarnessDriver {
   readonly #options: OpenCodeServerDriverOptions;
 
   constructor(options: OpenCodeServerDriverOptions) {
+    if (options.permissionProfile !== undefined) {
+      if (options.permissionProfile !== "restricted_v1")
+        throw new Error("OpenCode permission profile is invalid");
+      restrictedLlamaCppModelId(options.model);
+      validateLoopbackLlamaCppBaseUrl(options.llamaCppBaseUrl);
+    }
+    if (
+      options.permissionTtlMs !== undefined &&
+      (!Number.isSafeInteger(options.permissionTtlMs) ||
+        options.permissionTtlMs < 1 ||
+        options.permissionTtlMs > MAX_PERMISSION_TTL_MS)
+    )
+      throw new Error("OpenCode permission TTL is invalid");
     this.#options = options;
   }
 
@@ -279,6 +337,10 @@ export class OpenCodeServerDriver implements HarnessDriver {
     );
     await mkdir(root, { recursive: true, mode: 0o700 });
     await writeFile(join(root, "workspace"), `${cwd}\n`, { mode: 0o600 });
+    // restricted_v1: frozen once per session; permission targets and cwd must
+    // stay inside the workspace and never reach the private runtime root.
+    const workspaceRealpath = await realpath(cwd);
+    const privateRootRealpath = await realpath(root);
     const trace = await createProviderTraceFileSink({
       path: this.#options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH,
       provider: "opencode",
@@ -328,6 +390,8 @@ export class OpenCodeServerDriver implements HarnessDriver {
           normalizedSessionId: input.normalizedSessionId,
           providerSessionId,
           workingDirectory: cwd,
+          workspaceRealpath,
+          privateRootRealpath,
           runnerInstanceId:
             this.#options.runnerInstanceId ??
             `paperclip-opencode-${input.runId}`,
@@ -372,6 +436,8 @@ class OpenCodeHarnessSession implements HarnessSession {
   readonly #normalizedSessionId: string;
   readonly #providerSessionId: string;
   readonly #workingDirectory: string;
+  readonly #workspaceRealpath: string;
+  readonly #privateRootRealpath: string;
   readonly #runnerInstanceId: string;
   readonly #model: string;
   readonly #taskEnvelope: CodexTaskEnvelope;
@@ -410,6 +476,24 @@ class OpenCodeHarnessSession implements HarnessSession {
       settling?: boolean;
     }
   >();
+  /** restricted_v1: native permission ids whose contract is being frozen. */
+  readonly #typedPermissionsInFlight = new Set<string>();
+  /** restricted_v1: every native permission reply Paperclip itself sent. */
+  readonly #paperclipPermissionReplies = new Map<
+    string,
+    PaperclipPermissionDecision
+  >();
+  /** restricted_v1: native permissions OpenCode itself settled as rejected. */
+  readonly #providerRejectedPermissions = new Set<string>();
+  /**
+   * restricted_v1: permissions invalidated by a terminal turn, SSE loss, or
+   * session close. A decision for any of these may never dispatch `once`.
+   */
+  readonly #invalidatedPermissions = new Set<string>();
+  /** restricted_v1: frozen resolution of tool-argument paths (not hashed). */
+  readonly #frozenArgumentTargets = new Map<string, string>();
+  /** restricted_v1: expiry timer of each published typed permission. */
+  readonly #permissionExpiryTimers = new Map<string, NodeJS.Timeout>();
   #activeTraceFrameId: number | null = null;
   #activeTraceEmittedEventIds: string[] = [];
   #sourceSequence: number;
@@ -433,6 +517,8 @@ class OpenCodeHarnessSession implements HarnessSession {
     normalizedSessionId: string;
     providerSessionId: string;
     workingDirectory: string;
+    workspaceRealpath: string;
+    privateRootRealpath: string;
     runnerInstanceId: string;
     model: string;
     taskEnvelope: CodexTaskEnvelope;
@@ -448,6 +534,8 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#normalizedSessionId = input.normalizedSessionId;
     this.#providerSessionId = input.providerSessionId;
     this.#workingDirectory = input.workingDirectory;
+    this.#workspaceRealpath = input.workspaceRealpath;
+    this.#privateRootRealpath = input.privateRootRealpath;
     this.#runnerInstanceId = input.runnerInstanceId;
     this.#model = input.model;
     this.#taskEnvelope = input.taskEnvelope;
@@ -476,8 +564,13 @@ class OpenCodeHarnessSession implements HarnessSession {
         model: input.model,
         modelProvider: input.model.split("/", 1)[0],
         workingDirectory: input.workingDirectory,
-        environmentKeys: sanitizedEnvironmentKeys(),
+        environmentKeys: input.runtime.permissionProfile
+          ? [...RESTRICTED_ENVIRONMENT_KEYS]
+          : sanitizedEnvironmentKeys(),
         permissionMode: input.runtime.permissionMode,
+        ...(input.runtime.permissionProfile
+          ? { permissionProfile: input.runtime.permissionProfile }
+          : {}),
       },
     });
     this.#emit(
@@ -602,6 +695,12 @@ class OpenCodeHarnessSession implements HarnessSession {
       input.turnId !== this.#activeTurnId
     )
       throw new Error("stale OpenCode turn");
+    // restricted_v1: OpenCode 1.18 blocks the turn inside a pending
+    // permission and never acknowledges /abort while it waits, so a cancelled
+    // run kept its OpenCode (and runnerd) alive. Reject every pending typed
+    // permission natively first (exactly once, never `once`); the tool call
+    // then fails and the abort settles as a normal cancelled turn.
+    this.#invalidateTypedPermissions("turn_interrupted", null);
     await api(
       this.#fetch,
       this.#runtime,
@@ -622,10 +721,13 @@ class OpenCodeHarnessSession implements HarnessSession {
     resolution: HarnessRuntimeRequestResolution;
   }): Promise<void> {
     const pending = this.#pendingRuntimeRequests.get(input.requestId);
-    if (!pending)
+    if (!pending) {
+      if (this.#invalidatedPermissions.has(input.requestId))
+        this.#emitDecisionAfterTerminal(input.requestId, input.turnId);
       throw new Error(
         `OpenCode request ${input.requestId} is no longer pending`,
       );
+    }
     if (
       pending.request.turnId !== input.turnId ||
       this.#activeTurnId !== input.turnId
@@ -638,12 +740,22 @@ class OpenCodeHarnessSession implements HarnessSession {
       pending.request.requestKind,
       input.resolution,
       pending.request.input,
+      pending.request.permission,
     );
     if (pending.settling)
       throw new Error(
         `OpenCode request ${input.requestId} is already settling`,
       );
     pending.settling = true;
+    if (pending.request.permission !== undefined) {
+      await this.#resolveTypedPermission(
+        input.requestId,
+        input.turnId,
+        pending,
+        resolution,
+      );
+      return;
+    }
     const submit = async (operation: Promise<unknown>) => {
       try {
         await operation;
@@ -848,6 +960,13 @@ class OpenCodeHarnessSession implements HarnessSession {
     if (this.#closed) return;
     this.#closed = true;
     this.#abort.abort();
+    for (const timer of this.#permissionExpiryTimers.values())
+      clearTimeout(timer);
+    this.#permissionExpiryTimers.clear();
+    for (const id of this.#typedPermissionsInFlight)
+      this.#invalidatedPermissions.add(id);
+    for (const [id, { request }] of this.#pendingRuntimeRequests)
+      if (request.permission !== undefined) this.#invalidatedPermissions.add(id);
     for (const { request } of this.#pendingRuntimeRequests.values()) {
       this.#emit(
         request.input === undefined
@@ -990,8 +1109,12 @@ class OpenCodeHarnessSession implements HarnessSession {
       : Array.isArray(record(value).permissions)
         ? (record(value).permissions as unknown[])
         : [];
-    for (const entry of pending)
-      this.#acceptPermission(record(entry), "permission.recovered");
+    for (const entry of pending) {
+      const permission = record(entry);
+      const sessionId = text(permission.sessionID, text(permission.sessionId));
+      if (sessionId && sessionId !== this.#providerSessionId) continue;
+      this.#acceptPermission(permission, "permission.recovered");
+    }
   }
 
   async #recoverPendingQuestions(): Promise<void> {
@@ -1092,6 +1215,10 @@ class OpenCodeHarnessSession implements HarnessSession {
   #acceptPermission(properties: Record<string, unknown>, method: string): void {
     const turnId = this.#activeTurnId;
     if (!turnId) return;
+    if (this.#runtime.permissionProfile === "restricted_v1") {
+      void this.#acceptTypedPermission(properties, turnId);
+      return;
+    }
     const permission = isRecord(properties.permission)
       ? properties.permission
       : isRecord(properties.request)
@@ -1143,6 +1270,665 @@ class OpenCodeHarnessSession implements HarnessSession {
       },
       { turnId, itemId: request.itemId },
     );
+  }
+
+  /**
+   * restricted_v1 (TAX-452 §1): freeze the exact native request into a
+   * hash-bound contract before anyone can approve it. Anything that cannot be
+   * represented losslessly is rejected natively instead of being shown.
+   */
+  async #acceptTypedPermission(
+    properties: Record<string, unknown>,
+    turnId: string,
+  ): Promise<void> {
+    const requestId = text(properties.id);
+    if (
+      !requestId ||
+      this.#pendingRuntimeRequests.has(requestId) ||
+      this.#typedPermissionsInFlight.has(requestId) ||
+      this.#paperclipPermissionReplies.has(requestId)
+    )
+      return;
+    this.#typedPermissionsInFlight.add(requestId);
+    try {
+      let contract: PaperclipOpenCodePermissionContract;
+      let argumentTargets: string[];
+      try {
+        ({ contract, argumentTargets } =
+          await this.#freezePermissionContract(properties));
+      } catch (error) {
+        this.#emit(
+          "harness.diagnostic",
+          {
+            code:
+              error instanceof PermissionUnknownToolError
+                ? "permission_unknown_tool"
+                : "permission_contract_unrepresentable",
+            adapter: "opencode-server",
+            providerRequestId: requestId,
+            reason: redact(
+              error instanceof Error ? error.message : String(error),
+              this.#runtime.sensitiveValues,
+            ).slice(0, 1_000),
+          },
+          { turnId, itemId: requestId },
+        );
+        if (!this.#providerRejectedPermissions.has(requestId)) {
+          const delivered = await this.#replyPermissionOnce(
+            requestId,
+            "reject",
+            turnId,
+          );
+          if (!delivered)
+            await this.#failTurnClosed(turnId, "permission_reply_uncertain");
+        }
+        return;
+      }
+      const escaped = this.#escapesWorkspace(contract, argumentTargets);
+      if (escaped !== null) {
+        // TAX-470 H1: a target (after symlink resolution of the deepest
+        // existing ancestor) or the cwd leaves the workspace, or reaches the
+        // private runtime root. Never ask a human to approve that.
+        this.#emit(
+          "harness.diagnostic",
+          {
+            code: "permission_target_outside_workspace",
+            adapter: "opencode-server",
+            providerRequestId: requestId,
+            permission: contract.permission,
+            reason: escaped,
+          },
+          { turnId, itemId: requestId },
+        );
+        if (
+          !this.#closed &&
+          !this.#paperclipPermissionReplies.has(requestId) &&
+          !this.#providerRejectedPermissions.has(requestId)
+        ) {
+          const delivered = await this.#replyPermissionOnce(
+            requestId,
+            "reject",
+            turnId,
+          );
+          if (!delivered)
+            await this.#failTurnClosed(turnId, "permission_reply_uncertain");
+        }
+        return;
+      }
+      if (
+        this.#closed ||
+        this.#activeTurnId !== turnId ||
+        !this.#typedPermissionsInFlight.has(requestId) ||
+        this.#invalidatedPermissions.has(requestId)
+      ) {
+        // The turn ended or a reply raced the freeze; never surface a request
+        // nobody can answer. A still-pending native request fails closed.
+        if (
+          !this.#closed &&
+          !this.#paperclipPermissionReplies.has(requestId) &&
+          !this.#providerRejectedPermissions.has(requestId)
+        )
+          await this.#replyPermissionOnce(requestId, "reject", turnId);
+        return;
+      }
+      const request: HarnessRuntimeRequest = {
+        requestId,
+        requestKind: "permission_approval",
+        method: "permission.asked",
+        turnId,
+        itemId: requestId,
+        status: "pending",
+        prompt: permissionPrompt(contract),
+        details: {},
+        origin: {
+          adapter: "opencode-server",
+          provider: "opencode",
+          method: "permission.asked",
+        },
+        permission: contract,
+        decisions: [...PAPERCLIP_PERMISSION_DECISIONS],
+      };
+      this.#pendingRuntimeRequests.set(requestId, {
+        request,
+        nativeQuestions: [],
+      });
+      this.#frozenArgumentTargets.set(requestId, canonicalJson(argumentTargets));
+      this.#emit(
+        "runtime_request.created",
+        {
+          request: {
+            schema: PAPERCLIP_RUNTIME_REQUEST_PERMISSION_SCHEMA_V1,
+            requestKind: "runtime",
+            requestId,
+            type: "permission",
+            status: "pending",
+            prompt: request.prompt,
+            turnId,
+            itemId: requestId,
+            origin: structuredClone(request.origin),
+            decisions: [...PAPERCLIP_PERMISSION_DECISIONS],
+            permission: structuredClone(contract),
+          },
+        },
+        { turnId, itemId: requestId },
+      );
+      const timer = setTimeout(
+        () => void this.#expireTypedPermission(requestId, turnId),
+        this.#runtime.permissionTtlMs,
+      );
+      timer.unref?.();
+      this.#permissionExpiryTimers.set(requestId, timer);
+    } finally {
+      this.#typedPermissionsInFlight.delete(requestId);
+    }
+  }
+
+  async #freezePermissionContract(properties: Record<string, unknown>): Promise<{
+    contract: PaperclipOpenCodePermissionContract;
+    argumentTargets: string[];
+  }> {
+    const providerRequestId = text(properties.id);
+    const sessionId = text(properties.sessionID);
+    const permission = text(properties.permission);
+    if (!providerRequestId) throw new Error("permission id is missing");
+    if (sessionId !== this.#providerSessionId)
+      throw new Error("permission sessionID does not match the session");
+    if (!permission) throw new Error("permission name is missing");
+    // TAX-452 H9: only the documented (permission, tool) pairs are approvable.
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS,
+        permission,
+      )
+    )
+      throw new PermissionUnknownToolError(
+        `permission ${JSON.stringify(permission.slice(0, 160))} is not approvable in restricted_v1`,
+      );
+    const patterns = stringArray(properties.patterns);
+    const always = stringArray(properties.always);
+    if (patterns === null) throw new Error("permission patterns are invalid");
+    if (always === null) throw new Error("permission always list is invalid");
+    if (!isRecord(properties.metadata))
+      throw new Error("permission metadata is missing");
+    // TAX-452 H10: without the exact tool call and its complete arguments
+    // there is nothing a human could approve. Never freeze a partial contract.
+    if (!isRecord(properties.tool))
+      throw new Error("permission tool reference is missing");
+    const messageId = text(properties.tool.messageID);
+    const callId = text(properties.tool.callID);
+    if (!messageId || !callId)
+      throw new Error("permission tool reference is incomplete");
+    const toolPart = await this.#fetchToolPart({ messageId, callId });
+    if (!isRestrictedV1ApprovablePermissionTool(permission, toolPart.name))
+      throw new PermissionUnknownToolError(
+        `tool ${JSON.stringify(toolPart.name.slice(0, 160))} is not approvable for permission ${JSON.stringify(permission.slice(0, 160))}`,
+      );
+    const tool: PaperclipOpenCodePermissionContract["tool"] = {
+      name: toolPart.name,
+      messageId,
+      callId,
+    };
+    const toolArguments = toolPart.arguments;
+    const cwd = await realpath(this.#workingDirectory);
+    const targets = await resolvePermissionTargets(cwd, patterns);
+    const unsigned = jsonClean({
+      schema: PAPERCLIP_OPENCODE_PERMISSION_CONTRACT_SCHEMA_V1,
+      provider: "opencode",
+      providerVersion: this.#runtime.version,
+      providerSessionId: sessionId,
+      providerRequestId,
+      permission,
+      tool,
+      patterns,
+      always,
+      metadata: properties.metadata,
+      arguments: toolArguments,
+      cwd,
+      targets,
+      policy: { profile: "restricted_v1", permissionDefault: "ask" },
+    });
+    const contract = {
+      ...unsigned,
+      contractSha256: permissionContractSha256(unsigned),
+    } as unknown as PaperclipOpenCodePermissionContract;
+    if (
+      Buffer.byteLength(canonicalJson(contract), "utf8") >
+      PERMISSION_CONTRACT_MAX_BYTES
+    )
+      throw new Error("permission contract exceeds 64 KiB");
+    return {
+      contract,
+      argumentTargets: await resolveArgumentTargets(cwd, toolArguments),
+    };
+  }
+
+  /** Returns why a frozen permission escapes the workspace, or null. */
+  #escapesWorkspace(
+    contract: PaperclipOpenCodePermissionContract,
+    argumentTargets: readonly string[],
+  ): string | null {
+    const check = (path: string | null, label: string): string | null => {
+      if (path === null) return `${label} is unresolved`;
+      if (!isWithin(path, this.#workspaceRealpath))
+        return `${label} resolves outside the workspace`;
+      if (isWithin(path, this.#privateRootRealpath))
+        return `${label} resolves into the private runtime root`;
+      return null;
+    };
+    return (
+      check(contract.cwd, "cwd") ??
+      contract.targets
+        .map((target, index) => check(target.resolvedPath, `target ${index}`))
+        .find((reason) => reason !== null) ??
+      argumentTargets
+        .map((target, index) => check(target, `argument path ${index}`))
+        .find((reason) => reason !== null) ??
+      null
+    );
+  }
+
+  /**
+   * restricted_v1 expiry: a typed permission nobody decided within the TTL is
+   * settled natively with exactly one `reject` and can never be granted later
+   * (no re-prompt: OpenCode treats the reject as the tool result). A decision
+   * already on the wire (reply sent) wins; one still being re-verified loses at
+   * its pre-POST re-check.
+   */
+  async #expireTypedPermission(
+    requestId: string,
+    turnId: string,
+  ): Promise<void> {
+    this.#permissionExpiryTimers.delete(requestId);
+    const entry = this.#pendingRuntimeRequests.get(requestId);
+    if (
+      !entry ||
+      entry.request.permission === undefined ||
+      this.#paperclipPermissionReplies.has(requestId) ||
+      this.#providerRejectedPermissions.has(requestId)
+    )
+      return;
+    this.#invalidatedPermissions.add(requestId);
+    this.#pendingRuntimeRequests.delete(requestId);
+    this.#frozenArgumentTargets.delete(requestId);
+    this.#emit(
+      "harness.diagnostic",
+      {
+        code: "permission_expired",
+        adapter: "opencode-server",
+        providerRequestId: requestId,
+        ttlMs: this.#runtime.permissionTtlMs,
+      },
+      { turnId: entry.request.turnId, itemId: requestId },
+    );
+    this.#emit(
+      "runtime_request.expired",
+      {
+        ...harnessRuntimeRequestOutcome(entry.request, {
+          reason: "permission_expired",
+        }),
+        nativeOutcome: "rejected_expired" satisfies PaperclipPermissionNativeOutcome,
+      },
+      { turnId: entry.request.turnId, itemId: entry.request.itemId },
+    );
+    if (this.#closed) return;
+    const delivered = await this.#replyPermissionOnce(
+      requestId,
+      "reject",
+      turnId,
+    );
+    if (!delivered)
+      await this.#failTurnClosed(turnId, "permission_reply_uncertain");
+  }
+
+  #emitDecisionAfterTerminal(requestId: string, turnId: string): void {
+    this.#emit(
+      "harness.diagnostic",
+      {
+        code: "permission_decision_after_terminal",
+        adapter: "opencode-server",
+        providerRequestId: requestId,
+        // The terminal state won: OpenCode receives (or already received)
+        // exactly one native `reject`, never the late `once`.
+        nativeOutcome:
+          "rejected_terminal" satisfies PaperclipPermissionNativeOutcome,
+      },
+      { turnId, itemId: requestId },
+    );
+  }
+
+  /**
+   * restricted_v1 (TAX-470 H2/H3): invalidate every typed permission that is
+   * pending or still being frozen. Each one is settled natively with exactly
+   * one `reject` (unless already settled) and can never be granted later.
+   */
+  #invalidateTypedPermissions(
+    reason: string,
+    diagnostic: string | null,
+  ): void {
+    if (this.#runtime.permissionProfile !== "restricted_v1") return;
+    const ids = new Set<string>(this.#typedPermissionsInFlight);
+    for (const [id, entry] of this.#pendingRuntimeRequests)
+      if (entry.request.permission !== undefined) ids.add(id);
+    for (const id of ids) {
+      this.#invalidatedPermissions.add(id);
+      const entry = this.#pendingRuntimeRequests.get(id);
+      const turnId = entry?.request.turnId ?? this.#activeTurnId ?? "";
+      if (diagnostic !== null)
+        this.#emit(
+          "harness.diagnostic",
+          {
+            code: diagnostic,
+            adapter: "opencode-server",
+            providerRequestId: id,
+          },
+          { turnId, itemId: id },
+        );
+      if (entry && this.#pendingRuntimeRequests.delete(id))
+        this.#emit(
+          "runtime_request.cancelled",
+          {
+            ...harnessRuntimeRequestOutcome(entry.request, { reason }),
+            nativeOutcome:
+              "rejected_terminal" satisfies PaperclipPermissionNativeOutcome,
+          },
+          { turnId: entry.request.turnId, itemId: entry.request.itemId },
+        );
+      if (
+        !this.#closed &&
+        !this.#paperclipPermissionReplies.has(id) &&
+        !this.#providerRejectedPermissions.has(id)
+      )
+        void this.#replyPermissionOnce(id, "reject", turnId);
+    }
+  }
+
+  async #fetchToolPart(tool: {
+    messageId: string;
+    callId: string;
+  }): Promise<{ name: string; arguments: Record<string, unknown> }> {
+    const message = record(
+      await api(
+        this.#fetch,
+        this.#runtime,
+        `/session/${encodeURIComponent(this.#providerSessionId)}/message/${encodeURIComponent(tool.messageId)}?directory=${encodeURIComponent(this.#workingDirectory)}`,
+      ),
+    );
+    const parts = Array.isArray(message.parts) ? message.parts.map(record) : [];
+    const matches = parts.filter(
+      (part) => text(part.type) === "tool" && text(part.callID) === tool.callId,
+    );
+    if (matches.length !== 1)
+      throw new Error("permission tool part is missing or ambiguous");
+    const name = text(matches[0]!.tool);
+    if (!name || name.length > 160)
+      throw new Error("permission tool part has no tool name");
+    const input = record(matches[0]!.state).input;
+    if (!isRecord(input)) throw new Error("permission tool input is missing");
+    return { name, arguments: jsonClean(input) as Record<string, unknown> };
+  }
+
+  /** TAX-452 §4: resolve one typed permission with exactly one native reply. */
+  async #resolveTypedPermission(
+    requestId: string,
+    turnId: string,
+    pending: { request: HarnessRuntimeRequest },
+    resolution: HarnessRuntimeRequestResolution,
+  ): Promise<void> {
+    const contract = pending.request.permission!;
+    // TAX-470 H2: re-checked after every await and immediately before the
+    // native POST. A terminal turn, SSE loss, close, or any settlement of this
+    // request wins over the decision; a losing decision never sends `once`.
+    const stillCurrent = () =>
+      !this.#closed &&
+      this.#activeTurnId === turnId &&
+      !this.#terminalTurns.has(turnId) &&
+      this.#pendingRuntimeRequests.get(requestId) === pending &&
+      !this.#invalidatedPermissions.has(requestId) &&
+      !this.#paperclipPermissionReplies.has(requestId) &&
+      !this.#providerRejectedPermissions.has(requestId);
+    const loseRace = async (): Promise<void> => {
+      this.#emitDecisionAfterTerminal(requestId, turnId);
+      this.#invalidatedPermissions.add(requestId);
+      if (
+        !this.#closed &&
+        !this.#paperclipPermissionReplies.has(requestId) &&
+        !this.#providerRejectedPermissions.has(requestId)
+      )
+        await this.#replyPermissionOnce(requestId, "reject", turnId);
+    };
+    if (!stillCurrent()) return loseRace();
+    let reply: PaperclipPermissionDecision = "reject";
+    let diagnostic: string | null = null;
+    if (resolution.action === "permission_decision") {
+      if (resolution.contractSha256 !== contract.contractSha256) {
+        diagnostic = "permission_contract_mismatch";
+      } else if (resolution.decision === "once") {
+        const live = await this.#permissionStillMatches(
+          requestId,
+          contract,
+        ).catch(() => false);
+        if (!stillCurrent()) return loseRace();
+        if (live) reply = "once";
+        else diagnostic = "permission_contract_drift";
+      }
+    }
+    if (diagnostic !== null)
+      this.#emit(
+        "harness.diagnostic",
+        {
+          code: diagnostic,
+          adapter: "opencode-server",
+          providerRequestId: contract.providerRequestId,
+        },
+        { turnId, itemId: requestId },
+      );
+    // No await between this check and the POST being issued.
+    if (!stillCurrent()) return loseRace();
+    const delivered = await this.#replyPermissionOnce(requestId, reply, turnId);
+    this.#frozenArgumentTargets.delete(requestId);
+    if (!this.#pendingRuntimeRequests.delete(requestId)) return;
+    if (!delivered) {
+      this.#emit(
+        "runtime_request.cancelled",
+        harnessRuntimeRequestOutcome(pending.request, {
+          reason: "permission_reply_uncertain",
+        }),
+        { turnId, itemId: pending.request.itemId },
+      );
+      // Never resend; stop the turn instead of leaving an unknown grant.
+      await this.#failTurnClosed(turnId, "permission_reply_uncertain");
+      return;
+    }
+    this.#emit(
+      "runtime_request.resolved",
+      {
+        ...harnessRuntimeRequestOutcome(pending.request, {
+          action: resolution.action,
+          reason: reply === "once" ? "permission_once" : "permission_rejected",
+        }),
+        nativeOutcome: (reply === "once"
+          ? "once_applied"
+          : diagnostic === "permission_contract_drift" ||
+              diagnostic === "permission_contract_mismatch"
+            ? "rejected_drift"
+            : "unknown") satisfies PaperclipPermissionNativeOutcome,
+      },
+      { turnId, itemId: pending.request.itemId },
+    );
+  }
+
+  async #permissionStillMatches(
+    requestId: string,
+    contract: PaperclipOpenCodePermissionContract,
+  ): Promise<boolean> {
+    const value = await api(
+      this.#fetch,
+      this.#runtime,
+      `/permission?directory=${encodeURIComponent(this.#workingDirectory)}`,
+    );
+    const live = (Array.isArray(value) ? value : [])
+      .map(record)
+      .find((entry) => text(entry.id) === contract.providerRequestId);
+    if (!live) return false;
+    if (
+      text(live.sessionID) !== contract.providerSessionId ||
+      text(live.permission) !== contract.permission ||
+      canonicalJson(stringArray(live.patterns)) !==
+        canonicalJson(contract.patterns)
+    )
+      return false;
+    // TAX-452 H9/H10: the frozen tool identity and complete arguments are
+    // mandatory; re-verify the live tool part (name included) before `once`.
+    if (
+      !isRecord(contract.tool) ||
+      !isRecord(contract.arguments) ||
+      !isRestrictedV1ApprovablePermissionTool(
+        contract.permission,
+        contract.tool.name,
+      )
+    )
+      return false;
+    const liveTool = record(live.tool);
+    if (
+      text(liveTool.messageID) !== contract.tool.messageId ||
+      text(liveTool.callID) !== contract.tool.callId
+    )
+      return false;
+    const livePart = await this.#fetchToolPart(contract.tool);
+    if (livePart.name !== contract.tool.name) return false;
+    if (
+      sha256Hex(canonicalJson(livePart.arguments)) !==
+      sha256Hex(canonicalJson(contract.arguments))
+    )
+      return false;
+    const cwd = await realpath(this.#workingDirectory);
+    if (cwd !== contract.cwd) return false;
+    const targets = await resolvePermissionTargets(cwd, contract.patterns);
+    if (canonicalJson(targets) !== canonicalJson(contract.targets)) return false;
+    const argumentTargets = await resolveArgumentTargets(cwd, contract.arguments);
+    if (
+      canonicalJson(argumentTargets) !==
+      this.#frozenArgumentTargets.get(requestId)
+    )
+      return false;
+    return this.#escapesWorkspace(contract, argumentTargets) === null;
+  }
+
+  /**
+   * Sends exactly one native reply. Never "always", never retried: a failed or
+   * timed-out POST is reported as uncertain and the caller fails closed.
+   */
+  async #replyPermissionOnce(
+    requestId: string,
+    reply: PaperclipPermissionDecision,
+    turnId: string,
+  ): Promise<boolean> {
+    this.#paperclipPermissionReplies.set(requestId, reply);
+    try {
+      await api(
+        this.#fetch,
+        this.#runtime,
+        `/permission/${encodeURIComponent(requestId)}/reply?directory=${encodeURIComponent(this.#workingDirectory)}`,
+        { method: "POST", body: JSON.stringify({ reply }) },
+      );
+      return true;
+    } catch (error) {
+      this.#emit(
+        "harness.diagnostic",
+        {
+          code: "permission_reply_uncertain",
+          adapter: "opencode-server",
+          providerRequestId: requestId,
+          reply,
+          reason: redact(String(error), this.#runtime.sensitiveValues).slice(
+            0,
+            1_000,
+          ),
+        },
+        { turnId, itemId: requestId },
+      );
+      return false;
+    }
+  }
+
+  #observeRestrictedPermissionReply(
+    properties: Record<string, unknown>,
+    turnId: string,
+  ): void {
+    const requestId = text(
+      properties.requestID,
+      text(properties.requestId, text(properties.id)),
+    );
+    const nativeReply = text(properties.reply, text(properties.response));
+    const sent = this.#paperclipPermissionReplies.get(requestId);
+    const pending = this.#pendingRuntimeRequests.get(requestId);
+    if (sent !== undefined && sent === nativeReply) return;
+    if (sent === undefined && nativeReply === "reject") {
+      // OpenCode cascades a reject (and an abort) to the session's other
+      // pending permissions. That only narrows authority, so it settles the
+      // request as a provider cancellation rather than a breach.
+      this.#typedPermissionsInFlight.delete(requestId);
+      if (requestId) this.#providerRejectedPermissions.add(requestId);
+      if (pending && this.#pendingRuntimeRequests.delete(requestId))
+        this.#emit(
+          "runtime_request.cancelled",
+          harnessRuntimeRequestOutcome(pending.request, {
+            reason: "provider_rejected",
+          }),
+          { turnId, itemId: pending.request.itemId },
+        );
+      return;
+    }
+    // A grant (or a reply differing from ours) that Paperclip did not send.
+    this.#typedPermissionsInFlight.delete(requestId);
+    this.#emit(
+      "harness.diagnostic",
+      {
+        code: "permission_out_of_band_reply",
+        adapter: "opencode-server",
+        providerRequestId: requestId,
+        reply: nativeReply,
+      },
+      { turnId, ...(requestId ? { itemId: requestId } : {}) },
+    );
+    if (pending && this.#pendingRuntimeRequests.delete(requestId))
+      this.#emit(
+        "runtime_request.cancelled",
+        harnessRuntimeRequestOutcome(pending.request, {
+          reason: "permission_out_of_band_reply",
+        }),
+        { turnId, itemId: pending.request.itemId },
+      );
+    void this.#failTurnClosed(turnId, "permission_out_of_band_reply");
+  }
+
+  /** Terminal fail-closed stop: the turn fails now, the provider is aborted. */
+  async #failTurnClosed(turnId: string, code: string): Promise<void> {
+    if (this.#activeTurnId === turnId) {
+      this.#invalidateTypedPermissions(code, null);
+      for (const [id, entry] of this.#pendingRuntimeRequests) {
+        this.#pendingRuntimeRequests.delete(id);
+        this.#emit(
+          "runtime_request.cancelled",
+          harnessRuntimeRequestOutcome(entry.request, { reason: code }),
+          { turnId: entry.request.turnId, itemId: entry.request.itemId },
+        );
+      }
+      this.#activeTurnId = null;
+      this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
+      this.#emit(
+        "turn.failed",
+        { status: "failed", error: { code, message: code } },
+        { turnId },
+      );
+      this.#events.close();
+    }
+    await api(
+      this.#fetch,
+      this.#runtime,
+      `/session/${encodeURIComponent(this.#providerSessionId)}/abort`,
+      { method: "POST" },
+    ).catch(() => undefined);
   }
 
   async #pumpEvents(): Promise<void> {
@@ -1224,6 +2010,28 @@ class OpenCodeHarnessSession implements HarnessSession {
         );
       } catch (error) {
         if (this.#closed || this.#abort.signal.aborted) return;
+        if (this.#runtime.permissionProfile === "restricted_v1") {
+          // TAX-470 H3: events (replies, aborts, new asks) may have been lost
+          // in the gap. Never keep an approval alive across it: invalidate
+          // every pending permission and fail the turn for reconciliation.
+          this.#invalidateTypedPermissions(
+            "permission_invalidated_sse_lost",
+            "permission_invalidated_sse_lost",
+          );
+          const turnId = this.#activeTurnId;
+          if (turnId !== null) {
+            this.#emit(
+              "harness.diagnostic",
+              {
+                code: "opencode_sse_lost",
+                adapter: "opencode-server",
+                message: redact(String(error), this.#runtime.sensitiveValues),
+              },
+              { turnId },
+            );
+            await this.#failTurnClosed(turnId, "opencode_sse_lost");
+          }
+        }
         attempts += 1;
         if (attempts > 3) {
           this.#emit("harness.diagnostic", {
@@ -1312,6 +2120,14 @@ class OpenCodeHarnessSession implements HarnessSession {
       turnId
     ) {
       this.#acceptPermission(properties, type);
+      return;
+    }
+    if (
+      (type === "permission.replied" || type === "permission.v2.replied") &&
+      turnId &&
+      this.#runtime.permissionProfile === "restricted_v1"
+    ) {
+      this.#observeRestrictedPermissionReply(properties, turnId);
       return;
     }
     if (
@@ -1450,6 +2266,7 @@ class OpenCodeHarnessSession implements HarnessSession {
         status: "completed",
         semanticResult: this.#resultFingerprint,
       });
+      this.#invalidateTypedPermissions("turn_completed", null);
       this.#terminalTurns.set(turnId, fingerprint);
       this.#emitSettledFinalAgentMessage(turnId);
       const workspace = this.#workspaceChangesByTurn.get(turnId);
@@ -1479,6 +2296,8 @@ class OpenCodeHarnessSession implements HarnessSession {
         // card. Preserve the provider fact as a cancelled terminal event; the
         // native session loop independently commits the authoritative yielded
         // result when this abort followed a governed wait.
+        this.#invalidateTypedPermissions("turn_cancelled", null);
+        this.#terminalTurns.set(turnId, canonicalJson({ status: "cancelled" }));
         this.#activeTurnId = null;
         this.#emit(
           "turn.cancelled",
@@ -1488,7 +2307,6 @@ class OpenCodeHarnessSession implements HarnessSession {
           },
           { turnId },
         );
-        this.#terminalTurns.set(turnId, canonicalJson({ status: "cancelled" }));
         this.#events.close();
         return;
       }
@@ -1509,13 +2327,14 @@ class OpenCodeHarnessSession implements HarnessSession {
         },
         { turnId, itemId: `${turnId}:session-error` },
       );
+      this.#invalidateTypedPermissions("turn_failed", null);
+      this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
       this.#activeTurnId = null;
       this.#emit(
         "turn.failed",
         { status: "failed", error: bounded(properties.error ?? properties) },
         { turnId },
       );
-      this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
       this.#events.close();
     }
   }
@@ -1824,10 +2643,13 @@ async function startRuntime(input: {
   const configHome = join(input.root, "config");
   const dataHome = join(input.root, "data");
   const cacheHome = join(input.root, "cache");
+  const stateHome = join(input.root, "state");
+  const restricted = input.options.permissionProfile === "restricted_v1";
   await Promise.all([
     mkdir(join(configHome, "opencode"), { recursive: true, mode: 0o700 }),
     mkdir(dataHome, { recursive: true, mode: 0o700 }),
     mkdir(cacheHome, { recursive: true, mode: 0o700 }),
+    ...(restricted ? [mkdir(stateHome, { recursive: true, mode: 0o700 })] : []),
   ]);
   // HOME contains a read-only skill snapshot, whose destination must be fresh.
   // Keep OpenCode's XDG data stable for provider-session recovery while giving
@@ -1868,7 +2690,14 @@ async function startRuntime(input: {
     input.options.runtimeContext?.instructions.bundle.rootPath;
   const [modelProvider, ...modelIdParts] = input.options.model.split("/");
   const providerModelId = modelIdParts.join("/");
-  const config = {
+  const config = restricted
+    ? restrictedOpenCodeConfig({
+        model: input.options.model,
+        llamaCppBaseUrl: input.options.llamaCppBaseUrl,
+        bridge,
+        assignedMcp,
+      })
+    : {
     $schema: "https://opencode.ai/config.json",
     model: input.options.model,
     small_model: input.options.model,
@@ -1927,18 +2756,25 @@ async function startRuntime(input: {
     `${JSON.stringify(config, null, 2)}\n`,
     { mode: 0o600 },
   );
-  const environment = sanitizedEnvironment(
-    input.options.environment ?? process.env,
-    {
-      HOME: isolatedHome,
-      XDG_CONFIG_HOME: configHome,
-      XDG_DATA_HOME: dataHome,
-      XDG_CACHE_HOME: cacheHome,
-      OPENCODE_DISABLE_PROJECT_CONFIG: "true",
-      OPENCODE_SERVER_USERNAME: username,
-      OPENCODE_SERVER_PASSWORD: password,
-    },
-  );
+  const environment = restricted
+    ? restrictedEnvironment(input.options.environment ?? process.env, {
+        HOME: isolatedHome,
+        XDG_CONFIG_HOME: configHome,
+        XDG_DATA_HOME: dataHome,
+        XDG_CACHE_HOME: cacheHome,
+        XDG_STATE_HOME: stateHome,
+        OPENCODE_SERVER_USERNAME: username,
+        OPENCODE_SERVER_PASSWORD: password,
+      })
+    : sanitizedEnvironment(input.options.environment ?? process.env, {
+        HOME: isolatedHome,
+        XDG_CONFIG_HOME: configHome,
+        XDG_DATA_HOME: dataHome,
+        XDG_CACHE_HOME: cacheHome,
+        OPENCODE_DISABLE_PROJECT_CONFIG: "true",
+        OPENCODE_SERVER_USERNAME: username,
+        OPENCODE_SERVER_PASSWORD: password,
+      });
   const isolateProcessGroup = input.options.isolateProcessGroup ?? true;
   const stdio: Array<"ignore" | "pipe" | number> = ["ignore", "ignore", "pipe"];
   if (input.options.commandFd !== undefined) {
@@ -2029,7 +2865,12 @@ async function startRuntime(input: {
       baseUrl,
       authHeader,
       version,
-      permissionMode: input.options.permissionMode ?? "allow",
+      permissionMode: restricted
+        ? "ask"
+        : (input.options.permissionMode ?? "allow"),
+      permissionProfile: restricted ? "restricted_v1" : null,
+      permissionTtlMs:
+        input.options.permissionTtlMs ?? DEFAULT_PERMISSION_TTL_MS,
       process: child,
       bridge,
       trace: input.trace,
@@ -2472,6 +3313,301 @@ function sanitizedEnvironmentKeys(): string[] {
   ];
 }
 
+/**
+ * TAX-452 restricted_v1: only locale/PATH survive from the ambient
+ * environment. No proxies, TLS overrides, or provider API keys reach OpenCode
+ * or anything it spawns; every writable XDG/HOME root lives in the session
+ * root. The OPENCODE_DISABLE_* names were verified in the 1.18.29 binary.
+ */
+const RESTRICTED_ENVIRONMENT_KEYS = [
+  "PATH",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ",
+] as const;
+
+const RESTRICTED_OPENCODE_FLAGS = {
+  OPENCODE_DISABLE_PROJECT_CONFIG: "true",
+  OPENCODE_DISABLE_MODELS_FETCH: "1",
+  OPENCODE_DISABLE_AUTOUPDATE: "1",
+  OPENCODE_DISABLE_SHARE: "1",
+  OPENCODE_DISABLE_LSP_DOWNLOAD: "1",
+  OPENCODE_DISABLE_DEFAULT_PLUGINS: "1",
+  OPENCODE_DISABLE_CLAUDE_CODE: "1",
+  OPENCODE_DISABLE_EXTERNAL_SKILLS: "1",
+} as const;
+
+function restrictedEnvironment(
+  source: NodeJS.ProcessEnv,
+  overrides: Record<string, string>,
+): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = {};
+  for (const key of RESTRICTED_ENVIRONMENT_KEYS)
+    if (source[key] !== undefined) result[key] = source[key];
+  return { ...result, ...RESTRICTED_OPENCODE_FLAGS, ...overrides };
+}
+
+/**
+ * Paperclip MCP bridge inventory (server/src/services/native-runtime/
+ * paperclip-runner-tool-authority.ts IMPLEMENTED_OPERATIONS plus the runner's
+ * terminal tools in mcp-bridge.ts). OpenCode names bridge tools
+ * `paperclip_<operation>`; `mcp__paperclip__<operation>` is kept as the alias
+ * form the legacy config also covers.
+ *
+ * Read-only (allowed): get_task_context, get_task_history, search_tasks,
+ *   list_documents, read_document, list_document_revisions, list_agents,
+ *   get_agent, list_approvals, get_approval, get_approval_context,
+ *   list_projects, list_project_repositories, search_api (catalog search).
+ * Terminal result protocol (allowed; proposes a governed result, no side
+ *   effect by itself): paperclip_finish, paperclip_block.
+ * Mutating or open-ended (denied via the paperclip_* deny): call_api,
+ *   report_progress, request_human_input, create_task, set_dependencies,
+ *   create_project, register_deliverable, write_document, and any tool not
+ *   listed here (unknown future tools fail closed).
+ */
+export const RESTRICTED_READ_ONLY_PAPERCLIP_TOOLS = [
+  "get_task_context",
+  "get_task_history",
+  "search_tasks",
+  "list_documents",
+  "read_document",
+  "list_document_revisions",
+  "list_agents",
+  "get_agent",
+  "list_approvals",
+  "get_approval",
+  "get_approval_context",
+  "list_projects",
+  "list_project_repositories",
+  "search_api",
+] as const;
+
+const RESTRICTED_TERMINAL_PAPERCLIP_TOOLS = [
+  PRP_COMPLETION_TOOL_NAME,
+  PRP_BLOCK_TOOL_NAME,
+] as const;
+
+const RESTRICTED_DENIED_NATIVE_TOOLS = [
+  "bash",
+  "webfetch",
+  "websearch",
+  "task",
+] as const;
+
+function restrictedPermissionRules(): Record<string, string> {
+  // OpenCode evaluates the last matching rule, so the blanket ask and the
+  // paperclip denies precede the explicit read-only allows. "*" is never allow.
+  const rules: Record<string, string> = {
+    "*": "ask",
+    "paperclip_*": "deny",
+    "mcp__paperclip__*": "deny",
+  };
+  for (const tool of [
+    ...RESTRICTED_READ_ONLY_PAPERCLIP_TOOLS,
+    ...RESTRICTED_TERMINAL_PAPERCLIP_TOOLS,
+  ]) {
+    rules[`paperclip_${tool}`] = "allow";
+    rules[`mcp__paperclip__${tool}`] = "allow";
+  }
+  rules.question = "allow";
+  rules.external_directory = "deny";
+  // TAX-470 H4: no tool that can spawn a process, reach the network, or start
+  // a subagent. A shell could read /proc/<opencode pid>/environ or the private
+  // config regardless of workspace checks (same OS uid).
+  for (const tool of RESTRICTED_DENIED_NATIVE_TOOLS) rules[tool] = "deny";
+  return rules;
+}
+
+function restrictedLlamaCppModelId(model: string): string {
+  const slash = model.indexOf("/");
+  const provider = slash > 0 ? model.slice(0, slash) : "";
+  const id = slash > 0 ? model.slice(slash + 1) : "";
+  if (provider !== "llamacpp" || !id.trim())
+    throw new Error(
+      "OpenCode restricted_v1 requires a llamacpp/<model> model",
+    );
+  return id;
+}
+
+function validateLoopbackLlamaCppBaseUrl(value: string | undefined): string {
+  let url: URL;
+  try {
+    url = new URL(String(value ?? ""));
+  } catch {
+    throw new Error("OpenCode restricted_v1 requires a llamaCppBaseUrl");
+  }
+  if (
+    url.protocol !== "http:" ||
+    !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) ||
+    url.username ||
+    url.password
+  )
+    throw new Error(
+      "OpenCode restricted_v1 llamaCppBaseUrl must be an http loopback URL",
+    );
+  return url.toString().replace(/\/$/, "");
+}
+
+function restrictedOpenCodeConfig(input: {
+  model: string;
+  llamaCppBaseUrl: string | undefined;
+  bridge: OpenCodeMcpBridge;
+  assignedMcp: ReturnType<typeof nativeMcpLaunchBinding>;
+}): Record<string, unknown> {
+  const modelId = restrictedLlamaCppModelId(input.model);
+  const baseURL = validateLoopbackLlamaCppBaseUrl(input.llamaCppBaseUrl);
+  const model = `llamacpp/${modelId}`;
+  return {
+    $schema: "https://opencode.ai/config.json",
+    model,
+    small_model: model,
+    share: "disabled",
+    autoupdate: false,
+    instructions: [],
+    plugin: [],
+    enabled_providers: ["llamacpp"],
+    provider: {
+      llamacpp: {
+        npm: "@ai-sdk/openai-compatible",
+        name: "llama.cpp",
+        options: { baseURL },
+        models: { [modelId]: { name: modelId, tool_call: true } },
+      },
+    },
+    tools: { question: true },
+    permission: restrictedPermissionRules(),
+    mcp: {
+      paperclip: {
+        type: "remote",
+        url: input.bridge.url,
+        enabled: true,
+        oauth: false,
+        headers: { Authorization: `Bearer ${input.bridge.secret}` },
+        timeout: 30_000,
+      },
+      ...(input.assignedMcp
+        ? {
+            [input.assignedMcp.name]: {
+              type: "remote",
+              url: input.assignedMcp.url,
+              enabled: true,
+              oauth: false,
+              headers: { Authorization: `Bearer ${input.assignedMcp.token}` },
+              timeout: 30_000,
+            },
+          }
+        : {}),
+    },
+  };
+}
+
+const PERMISSION_CONTRACT_MAX_BYTES = 64 * 1024;
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+/** sha256 over canonical JSON (recursively sorted keys, compact, UTF-8). */
+export function permissionContractSha256(
+  unsigned: Record<string, unknown>,
+): string {
+  const { contractSha256: _ignored, ...rest } = unsigned;
+  return sha256Hex(canonicalJson(rest));
+}
+
+function jsonClean<T>(value: T): T {
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined) throw new Error("value is not JSON");
+  return JSON.parse(serialized) as T;
+}
+
+function stringArray(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string"))
+    return null;
+  return [...(value as string[])];
+}
+
+/**
+ * TAX-470 H1: every target is frozen as the realpath of its deepest existing
+ * ancestor plus the remaining non-existent suffix (dangling symlinks are
+ * followed), so a changed ancestor symlink changes the frozen value even when
+ * the leaf does not exist yet. Never null.
+ */
+async function resolvePermissionTargets(
+  cwd: string,
+  patterns: readonly string[],
+): Promise<Array<{ pattern: string; resolvedPath: string }>> {
+  return Promise.all(
+    patterns.map(async (pattern) => ({
+      pattern,
+      resolvedPath: await resolveTargetPath(resolve(cwd, pattern)),
+    })),
+  );
+}
+
+const ARGUMENT_PATH_KEYS = ["filePath", "filepath", "file_path", "path"];
+
+/** Paths a native tool actually acts on, resolved like OpenCode (vs cwd). */
+async function resolveArgumentTargets(
+  cwd: string,
+  toolArguments: Record<string, unknown> | null | undefined,
+): Promise<string[]> {
+  if (!toolArguments) return [];
+  const paths = ARGUMENT_PATH_KEYS.map((key) => toolArguments[key]).filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  );
+  return Promise.all(paths.map((path) => resolveTargetPath(resolve(cwd, path))));
+}
+
+async function resolveTargetPath(absolute: string, hops = 0): Promise<string> {
+  if (hops > 40) throw new Error("permission target has too many symlinks");
+  const parsed = parsePath(absolute);
+  const parts = absolute
+    .slice(parsed.root.length)
+    .split(sep)
+    .filter((part) => part.length > 0);
+  let current = parsed.root;
+  for (let index = 0; index < parts.length; index += 1) {
+    const next = join(current, parts[index]!);
+    let info;
+    try {
+      info = await lstat(next);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR")
+        return join(next, ...parts.slice(index + 1));
+      throw error;
+    }
+    if (info.isSymbolicLink()) {
+      current = await resolveTargetPath(
+        resolve(current, await readlink(next)),
+        hops + 1,
+      );
+    } else current = next;
+  }
+  return current;
+}
+
+function isWithin(path: string, root: string): boolean {
+  return (
+    path === root ||
+    path.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)
+  );
+}
+
+function permissionPrompt(
+  contract: PaperclipOpenCodePermissionContract,
+): string {
+  const scope = contract.patterns.length
+    ? `: ${contract.patterns.join(", ")}`
+    : "";
+  return `OpenCode requests ${contract.permission} permission${scope}.`.slice(
+    0,
+    4000,
+  );
+}
+
 function sessionRoot(
   runtimeDirectory: string,
   normalizedSessionId: string,
@@ -2516,6 +3652,9 @@ function bounded(value: unknown): Record<string, unknown> {
 function record(value: unknown): Record<string, unknown> {
   return isRecord(value) ? value : {};
 }
+/** TAX-452 H9: the permission or its tool part is outside the allowlist. */
+class PermissionUnknownToolError extends Error {}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

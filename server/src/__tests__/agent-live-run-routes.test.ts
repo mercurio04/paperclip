@@ -3,6 +3,7 @@ import request from "supertest";
 import { type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { computeNativePermissionContractSha256 } from "../services/native-runtime/runtime-request-resolution-authority.js";
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -58,6 +59,10 @@ const mockWorkspaceDiffReprojection = vi.hoisted(() => ({
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockQueueRuntimeRequestResolution = vi.hoisted(() => vi.fn());
+const mockPermissionDecisions = vi.hoisted(() => ({
+  claimNativePermissionDecision: vi.fn(),
+  settleNativePermissionDecision: vi.fn(),
+}));
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(),
   decide: vi.fn(),
@@ -112,6 +117,11 @@ function registerModuleMocks() {
     projectCodexWorkspaceDiffsFromTrace: mockWorkspaceDiffReprojection.project,
     persistReprojectedWorkspaceDiffs: mockWorkspaceDiffReprojection.persist,
   }));
+
+  vi.doMock(
+    "../services/native-runtime/native-permission-decisions.js",
+    () => mockPermissionDecisions,
+  );
 
   vi.doMock("../realtime/runner-prp-ws.js", async () => {
     const actual = await vi.importActual<typeof import("../realtime/runner-prp-ws.js")>(
@@ -888,6 +898,111 @@ describe("agent live run routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(202);
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "agent:wake" }));
     expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(routeAgentId, expect.objectContaining({ manualUserWake: true }));
+  });
+
+  describe("manual-only human task binding (TAX-452 H6)", () => {
+    const boundIssueId = "55555555-5555-4555-8555-555555555555";
+    const manualOnlyAgent = {
+      id: routeAgentId,
+      companyId: "company-1",
+      name: "Bombero",
+      adapterType: "paperclip_runner",
+      status: "idle",
+      permissions: {
+        invocationPolicy: { mode: "manual_only" },
+        authorizationPolicy: { protectedAgent: { blockAssignment: true } },
+      },
+    };
+    const openIssue = {
+      id: boundIssueId,
+      companyId: "company-1",
+      projectId: null,
+      parentId: null,
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      conversationAgentId: null,
+      status: "todo",
+    };
+    beforeEach(() => {
+      mockAgentService.getById.mockResolvedValue(manualOnlyAgent);
+      mockIssueService.getById.mockResolvedValue(openIssue);
+      mockHeartbeatService.wakeup.mockResolvedValue({ id: "run-manual", status: "queued" });
+    });
+
+    it.each(["wakeup", "heartbeat/invoke"])("binds an accessible task to a board %s without assigning it", async (endpoint) => {
+      const res = await requestApp(await createApp(), (url) =>
+        request(url).post(`/api/agents/${routeAgentId}/${endpoint}`).send({ payload: { issueId: boundIssueId } }));
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "issue:comment",
+        resource: expect.objectContaining({ issueId: boundIssueId, companyId: "company-1" }),
+      }));
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(routeAgentId, expect.objectContaining({
+        manualUserWake: true,
+        requestedByActorType: "user",
+        requestedByActorId: "local-board",
+        payload: expect.objectContaining({ issueId: boundIssueId, taskId: boundIssueId }),
+      }));
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "heartbeat.invoked",
+        actorType: "user",
+        details: expect.objectContaining({ manualInvocation: { userId: "local-board", issueId: boundIssueId } }),
+      }));
+    });
+
+    it("denies a task from another company as not found", async () => {
+      mockIssueService.getById.mockResolvedValue({ ...openIssue, companyId: "company-2" });
+      const res = await requestApp(await createApp(), (url) =>
+        request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({ payload: { issueId: boundIssueId } }));
+      expect(res.status).toBe(404);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("denies a task the human cannot act on", async () => {
+      mockAccessService.decide.mockImplementation(async ({ action }) => ({
+        allowed: action !== "issue:comment", explanation: "Missing issue access",
+      }));
+      const res = await requestApp(await createApp(undefined, {
+        type: "board", userId: "operator", source: "session", companyIds: ["company-1"],
+      }), (url) => request(url).post(`/api/agents/${routeAgentId}/heartbeat/invoke`).send({ payload: { issueId: boundIssueId } }));
+      expect(res.status).toBe(403);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { label: "mismatched issueId/taskId", payload: { issueId: boundIssueId, taskId: "66666666-6666-4666-8666-666666666666" }, status: 400 },
+      { label: "a closed task", payload: { issueId: boundIssueId }, issue: { status: "done" }, status: 409 },
+      { label: "a chat conversation", payload: { issueId: boundIssueId }, issue: { conversationAgentId: routeAgentId }, status: 409 },
+      { label: "a task another agent owns", payload: { issueId: boundIssueId }, issue: { assigneeAgentId: "77777777-7777-4777-8777-777777777777" }, status: 409 },
+    ])("rejects $label", async ({ payload, issue, status }) => {
+      if (issue) mockIssueService.getById.mockResolvedValue({ ...openIssue, ...issue });
+      const res = await requestApp(await createApp(), (url) =>
+        request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({ payload }));
+      expect(res.status, JSON.stringify(res.body)).toBe(status);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("leaves an agent actor's self-wake unbound (the manual-only gate skips it)", async () => {
+      const res = await requestApp(await createApp(undefined, {
+        type: "agent", agentId: routeAgentId, companyId: "company-1", source: "agent_key",
+      }), (url) => request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({ payload: { issueId: boundIssueId } }));
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockIssueService.getById).not.toHaveBeenCalled();
+      const [, opts] = mockHeartbeatService.wakeup.mock.calls[0]!;
+      expect(opts.manualUserWake).toBeUndefined();
+      expect(opts.requestedByActorType).toBe("agent");
+    });
+
+    it("does not touch task binding for a regular agent (regression)", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...manualOnlyAgent, permissions: {} });
+      const res = await requestApp(await createApp(), (url) =>
+        request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({ payload: { issueId: boundIssueId } }));
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockIssueService.getById).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(routeAgentId, expect.objectContaining({
+        payload: { issueId: boundIssueId },
+      }));
+    });
   });
 
   describe("exact failed chat run retry", () => {
@@ -1724,5 +1839,238 @@ describe("agent live run routes", () => {
     expect(res.status).toBe(403);
     expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
     expect(mockWorkspaceDiffReprojection.persist).not.toHaveBeenCalled();
+  });
+
+  describe("typed OpenCode permission decisions (TAX-452)", () => {
+    const unsignedContract = {
+      schema: "paperclip.opencode_permission_contract.v1",
+      provider: "opencode",
+      providerVersion: "1.18.29",
+      providerSessionId: "ses_1",
+      providerRequestId: "per_1",
+      permission: "edit",
+      tool: { name: "edit", messageId: "msg_1", callId: "call_1" },
+      patterns: ["src/a.ts"],
+      always: ["*"],
+      metadata: {},
+      arguments: { filePath: "src/a.ts" },
+      cwd: "/work",
+      targets: [{ pattern: "src/a.ts", resolvedPath: "/work/src/a.ts" }],
+      policy: { profile: "restricted_v1", permissionDefault: "ask" },
+    };
+    const sha = computeNativePermissionContractSha256(unsignedContract);
+    const permissionRun = {
+      id: "run-1",
+      companyId: "company-1",
+      agentId: "agent-1",
+      status: "running",
+      runtimeMode: "native",
+    };
+    const adminActor = {
+      type: "board",
+      userId: "instance-admin",
+      companyIds: ["company-1"],
+      source: "session",
+      isInstanceAdmin: true,
+    };
+    function permissionEvent(overrides: Record<string, unknown> = {}) {
+      return {
+        eventType: "runtime_request.created",
+        payload: {
+          prpEvent: {
+            schema: "paperclip.prp.event.v1",
+            eventType: "runtime_request.created",
+            sourceKind: "runner",
+            runId: "run-1",
+            turnId: "turn-1",
+            payload: {
+              request: {
+                schema: "paperclip.runtime_request.permission.v1",
+                requestKind: "runtime",
+                requestId: "perm-1",
+                type: "permission",
+                status: "pending",
+                prompt: "edit file",
+                turnId: "turn-1",
+                origin: { adapter: "opencode-server", provider: "opencode", method: "permission.asked" },
+                decisions: ["once", "reject"],
+                permission: { ...unsignedContract, contractSha256: sha },
+                ...overrides,
+              },
+            },
+          },
+        },
+      };
+    }
+    async function post(
+      actor: Record<string, unknown>,
+      body: unknown,
+      event: ReturnType<typeof permissionEvent> = permissionEvent(),
+    ) {
+      const app = await createApp(createRuntimeRequestDbStub(event), actor);
+      return requestApp(app, (baseUrl) => request(baseUrl)
+        .post("/api/heartbeat-runs/run-1/runtime-requests/perm-1/resolve")
+        .send(body as object));
+    }
+    const once = { resolution: { action: "permission_decision", decision: "once", contractSha256: sha } };
+
+    beforeEach(() => {
+      mockHeartbeatService.getRun.mockResolvedValue(permissionRun);
+      mockPermissionDecisions.claimNativePermissionDecision.mockReset();
+      mockPermissionDecisions.settleNativePermissionDecision.mockReset();
+      mockPermissionDecisions.claimNativePermissionDecision.mockResolvedValue({ id: "claim-1" });
+      mockPermissionDecisions.settleNativePermissionDecision.mockResolvedValue(undefined);
+      mockQueueRuntimeRequestResolution.mockReset();
+      mockQueueRuntimeRequestResolution.mockReturnValue({ commandId: "cmd-1" });
+    });
+
+    it("rejects ordinary board members (instance_admin policy)", async () => {
+      const res = await post({ ...adminActor, userId: "member", isInstanceAdmin: false }, once);
+      expect(res.status).toBe(403);
+      expect(mockPermissionDecisions.claimNativePermissionDecision).not.toHaveBeenCalled();
+      expect(mockQueueRuntimeRequestResolution).not.toHaveBeenCalled();
+    });
+
+    it("rejects agent actors", async () => {
+      const res = await post({ type: "agent", agentId: "agent-1", companyId: "company-1", runId: "run-1" }, once);
+      expect(res.status).toBe(403);
+      expect(mockQueueRuntimeRequestResolution).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      [{ action: "accept" }],
+      [{ action: "accept_for_session" }],
+      [{ action: "submit", response: { schema: "paperclip.question_response.v1", answers: {} } }],
+      [{ action: "cancel" }],
+      [{ action: "permission_decision", decision: "always", contractSha256: "a".repeat(64) }],
+      [{ action: "permission_decision", decision: "once" }],
+      [{ action: "permission_decision", decision: "once", contractSha256: "a".repeat(64), extra: true }],
+      [{ action: "permission_decision", decision: "once", contractSha256: "XYZ" }],
+    ])("rejects non-canonical permission resolution %j with 400", async (resolution) => {
+      const res = await post(adminActor, { resolution });
+      expect(res.status).toBe(400);
+      expect(mockPermissionDecisions.claimNativePermissionDecision).not.toHaveBeenCalled();
+      expect(mockQueueRuntimeRequestResolution).not.toHaveBeenCalled();
+    });
+
+    it("rejects a contract sha mismatch with 409", async () => {
+      const res = await post(adminActor, {
+        resolution: { action: "permission_decision", decision: "once", contractSha256: "b".repeat(64) },
+      });
+      expect(res.status).toBe(409);
+      expect(mockPermissionDecisions.claimNativePermissionDecision).not.toHaveBeenCalled();
+      expect(mockQueueRuntimeRequestResolution).not.toHaveBeenCalled();
+    });
+
+    it("answers 409 when the stored contract no longer hashes to its contractSha256", async () => {
+      // The persisted contract was altered after the runner signed it (e.g. a
+      // redaction pass); the server recomputes the sha and refuses to act.
+      const tampered = permissionEvent({
+        permission: {
+          ...unsignedContract,
+          arguments: { filePath: "src/other.ts" },
+          contractSha256: sha,
+        },
+      });
+      const res = await post(adminActor, once, tampered);
+      expect(res.status).toBe(409);
+      expect(mockPermissionDecisions.claimNativePermissionDecision).not.toHaveBeenCalled();
+      expect(mockQueueRuntimeRequestResolution).not.toHaveBeenCalled();
+    });
+
+    it("claims, dispatches once with the contract payload, and marks delivered", async () => {
+      const res = await post(adminActor, once);
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockPermissionDecisions.claimNativePermissionDecision).toHaveBeenCalledWith(
+        expect.anything(),
+        {
+          companyId: "company-1",
+          agentId: "agent-1",
+          runId: "run-1",
+          requestId: "perm-1",
+          turnId: "turn-1",
+          contractSha256: sha,
+          decision: "once",
+          resolverUserId: "instance-admin",
+        },
+      );
+      expect(mockQueueRuntimeRequestResolution).toHaveBeenCalledTimes(1);
+      const call = mockQueueRuntimeRequestResolution.mock.calls[0]![0];
+      expect(call.resolution).toEqual({
+        action: "permission_decision",
+        decision: "once",
+        contractSha256: sha,
+      });
+      const { runnerPrpRequestResolvePayload } = await vi.importActual<
+        typeof import("../realtime/runner-prp-ws.js")
+      >("../realtime/runner-prp-ws.js");
+      expect(runnerPrpRequestResolvePayload(call.pendingRequest, call.resolution, call.actor)).toEqual({
+        requestId: "perm-1",
+        turnId: "turn-1",
+        response: {
+          schema: "paperclip.permission_decision.v1",
+          decision: "once",
+          contractSha256: sha,
+        },
+      });
+      expect(mockPermissionDecisions.settleNativePermissionDecision).toHaveBeenCalledWith(
+        expect.anything(),
+        { id: "claim-1", status: "delivered", error: null },
+      );
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "heartbeat.runtime_permission_decided",
+          details: expect.objectContaining({
+            requestId: "perm-1",
+            contractSha256: sha,
+            decision: "once",
+            resolverUserId: "instance-admin",
+            agentId: "agent-1",
+            status: "delivered",
+          }),
+        }),
+      );
+    });
+
+    it("answers 409 without dispatch when the request was already decided", async () => {
+      mockPermissionDecisions.claimNativePermissionDecision.mockResolvedValue(null);
+      const res = await post(adminActor, {
+        resolution: { action: "permission_decision", decision: "reject", contractSha256: sha },
+      });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/already decided/);
+      expect(mockQueueRuntimeRequestResolution).not.toHaveBeenCalled();
+    });
+
+    it("marks a throwing dispatch uncertain, answers 502 and never redispatches", async () => {
+      mockQueueRuntimeRequestResolution.mockImplementation(() => {
+        throw new Error("socket closed mid-write");
+      });
+      const res = await post(adminActor, once);
+      expect(res.status).toBe(502);
+      expect(mockQueueRuntimeRequestResolution).toHaveBeenCalledTimes(1);
+      expect(mockPermissionDecisions.settleNativePermissionDecision).toHaveBeenCalledWith(
+        expect.anything(),
+        { id: "claim-1", status: "dispatch_uncertain", error: "socket closed mid-write" },
+      );
+      // The claim is never released: a retry finds it and is refused.
+      mockPermissionDecisions.claimNativePermissionDecision.mockResolvedValue(null);
+      const retry = await post(adminActor, once);
+      expect(retry.status).toBe(409);
+      expect(mockQueueRuntimeRequestResolution).toHaveBeenCalledTimes(1);
+    });
+
+    it("refuses a malformed permission contract (unknown key) as stale", async () => {
+      const app = await createApp(
+        createRuntimeRequestDbStub(permissionEvent({ always_allow: true })),
+        adminActor,
+      );
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post("/api/heartbeat-runs/run-1/runtime-requests/perm-1/resolve")
+        .send(once));
+      expect(res.status).toBe(409);
+      expect(mockQueueRuntimeRequestResolution).not.toHaveBeenCalled();
+    });
   });
 });

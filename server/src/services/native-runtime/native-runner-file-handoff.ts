@@ -12,7 +12,8 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { manualOnlyHumanBindingSql } from "../manual-invocation-binding.js";
 
 import type { Db } from "@paperclipai/db";
 import {
@@ -842,7 +843,15 @@ export async function stageNativeRunnerWakeAttachments(input: {
         inArray(heartbeatRuns.status, ["queued", "running"]),
         eq(issues.id, input.binding.issueId),
         eq(issues.companyId, input.binding.companyId),
-        eq(issues.assigneeAgentId, input.binding.agentId),
+        or(
+          eq(issues.assigneeAgentId, input.binding.agentId),
+          manualOnlyHumanBindingSql({
+            runId: input.binding.runId,
+            agentId: input.binding.agentId,
+            issueId: input.binding.issueId,
+            issueAssigneeAgentId: issues.assigneeAgentId,
+          }),
+        ),
         eq(issues.executionRunId, input.binding.runId),
         eq(agents.id, input.binding.agentId),
         eq(agents.companyId, input.binding.companyId),
@@ -1097,7 +1106,15 @@ async function assertCurrentBinding(
         eq(heartbeatRuns.status, "running"),
         eq(issues.id, binding.issueId),
         eq(issues.companyId, binding.companyId),
-        eq(issues.assigneeAgentId, binding.agentId),
+        or(
+          eq(issues.assigneeAgentId, binding.agentId),
+          manualOnlyHumanBindingSql({
+            runId: binding.runId,
+            agentId: binding.agentId,
+            issueId: binding.issueId,
+            issueAssigneeAgentId: issues.assigneeAgentId,
+          }),
+        ),
         eq(issues.executionRunId, binding.runId),
         eq(agents.id, binding.agentId),
         eq(agents.companyId, binding.companyId),

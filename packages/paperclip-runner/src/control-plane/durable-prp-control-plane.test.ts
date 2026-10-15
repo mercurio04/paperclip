@@ -389,6 +389,8 @@ it("preserves an explicit OpenCode permission mode at the runner spawn boundary"
       PATH: "/bin",
       OPENROUTER_API_KEY: "provider-key",
       PAPERCLIP_OPENCODE_PERMISSION_MODE: "deny",
+      PAPERCLIP_OPENCODE_PERMISSION_PROFILE: "restricted_v1",
+      PAPERCLIP_OPENCODE_LLAMACPP_BASE_URL: "http://127.0.0.1:8080/v1",
       PAPERCLIP_OPENCODE_RUNTIME_DIR: "/runner/opencode",
       DATABASE_URL: "must-not-reach-runnerd",
       PAPERCLIP_API_KEY: "must-not-reach-runnerd",
@@ -418,6 +420,8 @@ it("preserves an explicit OpenCode permission mode at the runner spawn boundary"
     PATH: "/bin",
     OPENROUTER_API_KEY: "provider-key",
     PAPERCLIP_OPENCODE_PERMISSION_MODE: "deny",
+    PAPERCLIP_OPENCODE_PERMISSION_PROFILE: "restricted_v1",
+    PAPERCLIP_OPENCODE_LLAMACPP_BASE_URL: "http://127.0.0.1:8080/v1",
     PAPERCLIP_OPENCODE_RUNTIME_DIR: "/runner/opencode",
   });
   expect(launches[0]!.environment.DATABASE_URL).toBeUndefined();

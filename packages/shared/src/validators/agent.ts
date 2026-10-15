@@ -106,6 +106,11 @@ export const createAgentSchema = z.object({
   // instruction file instead of the generic default, and honors it only for
   // board-authored requests. Mirrors onboardingFirstTask on issue create.
   onboardingFirstAgent: z.boolean().optional(),
+  // Opt-in inert creation (board only). The server persists the agent paused,
+  // with timer/on-demand wakes off, no default grants, a hard assignment lock
+  // and the manual-only invocation gate, all in the create transaction. It is
+  // not an agent column and never changes defaults for other agents.
+  inert: z.boolean().optional(),
 });
 
 export type CreateAgent = z.infer<typeof createAgentSchema>;
@@ -128,7 +133,8 @@ export const builtInAgentResetSchema = z.object({
 
 export type BuiltInAgentReset = z.infer<typeof builtInAgentResetSchema>;
 
-export const createAgentHireSchema = createAgentSchema.extend({
+// Inert creation is only offered by the direct board create route.
+export const createAgentHireSchema = createAgentSchema.omit({ inert: true }).extend({
   sourceIssueId: z.string().guid().optional().nullable(),
   sourceIssueIds: z.array(z.string().guid()).optional(),
 });
@@ -136,7 +142,7 @@ export const createAgentHireSchema = createAgentSchema.extend({
 export type CreateAgentHire = z.infer<typeof createAgentHireSchema>;
 
 export const updateAgentSchema = objectWithoutDefaults(
-  createAgentSchema.omit({ permissions: true, onboardingFirstAgent: true }),
+  createAgentSchema.omit({ permissions: true, onboardingFirstAgent: true, inert: true }),
 )
   .partial()
   .extend({

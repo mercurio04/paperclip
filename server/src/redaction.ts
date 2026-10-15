@@ -100,6 +100,8 @@ export const PAPERCLIP_PUBLIC_SCHEMA_IDS = new Set([
   "paperclip.native-model-envelope.v2",
   "paperclip.native-session-scope.v2",
   "paperclip.native-session-supervisor.v1",
+  "paperclip.opencode_permission_contract.v1",
+  "paperclip.permission_decision.v1",
   "paperclip.plan.updated.v1",
   "paperclip.provider.native.v1",
   "paperclip.provider.notice.v1",
@@ -164,6 +166,7 @@ export const PAPERCLIP_PUBLIC_SCHEMA_IDS = new Set([
   "paperclip.runner.workflow-observation.v1",
   "paperclip.runtime-asset-manifest.v1",
   "paperclip.runtime-asset.v1",
+  "paperclip.runtime_request.permission.v1",
   "paperclip.runtime_request.v1",
   "paperclip.runtime_request.v2",
   "paperclip.safety.review.v1",
@@ -922,12 +925,87 @@ export function sanitizeRecord(
   return redacted;
 }
 
+const NATIVE_PERMISSION_REQUEST_SCHEMA = "paperclip.runtime_request.permission.v1";
+const NATIVE_PERMISSION_CONTRACT_SCHEMA = "paperclip.opencode_permission_contract.v1";
+const NATIVE_PERMISSION_CONTRACT_MAX_BYTES = 64 * 1024;
+
+/**
+ * Locate the frozen `payload.request.permission` contract of a PRP
+ * `runtime_request.created` event, either as the bare PRP event or wrapped in
+ * the persisted heartbeat run-event payload (`{ prpEvent }`). Returns null for
+ * anything that is not exactly a TAX-452 typed permission request.
+ */
+function nativePermissionContractOf(
+  payload: Record<string, unknown>,
+): { prpEventKey: "prpEvent" | null; contract: Record<string, unknown> } | null {
+  const wrapped = isPlainObject(payload.prpEvent) ? payload.prpEvent : null;
+  const event = wrapped ?? payload;
+  if (
+    event.schema !== "paperclip.prp.event.v1" ||
+    event.eventType !== "runtime_request.created" ||
+    !isPlainObject(event.payload)
+  ) return null;
+  const request = event.payload.request;
+  if (
+    !isPlainObject(request) ||
+    request.schema !== NATIVE_PERMISSION_REQUEST_SCHEMA ||
+    !isPlainObject(request.permission) ||
+    request.permission.schema !== NATIVE_PERMISSION_CONTRACT_SCHEMA
+  ) return null;
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(request.permission);
+  } catch {
+    return null;
+  }
+  if (Buffer.byteLength(serialized, "utf8") > NATIVE_PERMISSION_CONTRACT_MAX_BYTES) {
+    return null;
+  }
+  return {
+    prpEventKey: wrapped ? "prpEvent" : null,
+    contract: JSON.parse(serialized) as Record<string, unknown>,
+  };
+}
+
+/**
+ * The human approver must see the exact frozen permission contract (including
+ * bash `command` in `arguments`/`metadata`), and the server recomputes its
+ * `contractSha256` before accepting a decision. Key-based redaction, payload
+ * bounding and current-user path masking would all silently change it, so the
+ * subtree is restored verbatim after those passes. runnerd rejects contracts
+ * that carry credential-like values before the event is ever emitted, and the
+ * contract is capped at 64 KiB upstream (and here).
+ */
+export function preserveNativePermissionContract(
+  original: Record<string, unknown> | null | undefined,
+  processed: Record<string, unknown> | null | undefined,
+): Record<string, unknown> | null | undefined {
+  if (!original || !processed || !isPlainObject(original)) return processed;
+  const found = nativePermissionContractOf(original);
+  if (!found) return processed;
+  const event = found.prpEventKey ? processed[found.prpEventKey] : processed;
+  if (!isPlainObject(event) || !isPlainObject(event.payload)) return processed;
+  const request = event.payload.request;
+  if (!isPlainObject(request)) return processed;
+  const restoredRequest = { ...request, permission: found.contract };
+  const restoredEvent = {
+    ...event,
+    payload: { ...event.payload, request: restoredRequest },
+  };
+  return found.prpEventKey
+    ? { ...processed, [found.prpEventKey]: restoredEvent }
+    : restoredEvent;
+}
+
 export function redactEventPayload(
   payload: Record<string, unknown> | null,
 ): Record<string, unknown> | null {
   if (!payload) return null;
   if (!isPlainObject(payload)) return payload;
-  const sanitized = sanitizeRecord(payload);
+  const sanitized = preserveNativePermissionContract(
+    payload,
+    sanitizeRecord(payload),
+  ) as Record<string, unknown>;
   if (payload.schema !== NATIVE_RUN_SPAN_SCHEMA) return sanitized;
 
   // Native run span identities are controlled diagnostics emitted by

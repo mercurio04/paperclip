@@ -80,6 +80,12 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import {
+  agentInvocationIsManualOnly,
+  inertAgentPermissions,
+  inertAgentRuntimeConfig,
+  preserveInertLocks,
+} from "../services/agent-invocation-policy.js";
 import { PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
@@ -122,6 +128,7 @@ import {
 } from "../adapters/index.js";
 import {
   REDACTED_EVENT_VALUE,
+  preserveNativePermissionContract,
   redactAgentAdapterConfig,
   redactEventPayload,
 } from "../redaction.js";
@@ -139,9 +146,38 @@ import {
 import {
   assertNativeRuntimeRequestResolverAuthorized,
   NativeRuntimeRequestResolutionAuthorizationError,
+  parseNativePermissionDecisionResolution,
   readPendingNativeRuntimeRequest,
   type NativeRuntimeRequestResolver,
+  type PendingNativeRuntimeRequest,
 } from "../services/native-runtime/runtime-request-resolution-authority.js";
+import {
+  claimNativePermissionDecision,
+  settleNativePermissionDecision,
+} from "../services/native-runtime/native-permission-decisions.js";
+
+/** A permission dispatch failure that provably happened before any mutation. */
+class NativePermissionNotDispatchedError extends Error {
+  constructor(readonly code: "runtime_request_stale") {
+    super(code);
+    this.name = "NativePermissionNotDispatchedError";
+  }
+}
+
+const NATIVE_PERMISSION_DISPATCH_TIMEOUT_MS = 30_000;
+
+/** Bound an in-process dispatch; a timeout is an uncertain outcome, never retried. */
+function withPermissionDispatchTimeout<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error("permission_dispatch_timeout")),
+      NATIVE_PERMISSION_DISPATCH_TIMEOUT_MS,
+    );
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 import {
   NativeRuntimeRequestResolutionError,
   resolveNativeRuntimeRequest,
@@ -1745,6 +1781,65 @@ export function agentRoutes(
       resource: { type: "agent", companyId: agent.companyId, agentId: agent.id },
     });
     if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+  }
+
+  /**
+   * Human-invocation task binding for an opt-in manual-only agent (TAX-452 H6).
+   *
+   * Such an agent can never be assigned work, so an explicit board invocation
+   * may name the task to run in (`payload.issueId` / `payload.taskId`) without
+   * making the agent its assignee. Only an authenticated board user who can act
+   * on that task, in the agent's company, may bind it. Agent actors keep their
+   * existing self-wake path, which the manual-only gate skips anyway. The task
+   * assignment itself is never changed and `assertAssignableAgent` stays a hard
+   * 409 for every assignment path.
+   */
+  async function bindManualOnlyInvocationTask(
+    req: Request,
+    agent: { id: string; companyId: string; permissions?: unknown },
+    payload: Record<string, unknown> | null,
+  ): Promise<{ payload: Record<string, unknown> | null; issueId: string | null }> {
+    if (req.actor.type !== "board" || !agentInvocationIsManualOnly(agent.permissions)) {
+      return { payload, issueId: null };
+    }
+    const issueIdRaw = payload?.issueId;
+    const taskIdRaw = payload?.taskId;
+    if (issueIdRaw === undefined && taskIdRaw === undefined) return { payload, issueId: null };
+    const ids = [issueIdRaw, taskIdRaw].filter((value) => value !== undefined && value !== null);
+    if (ids.some((value) => typeof value !== "string" || value.trim().length === 0)) {
+      throw badRequest("Manual invocation task must be a task id.");
+    }
+    if (new Set(ids).size > 1) {
+      throw badRequest("Manual invocation names two different tasks.");
+    }
+    const issueId = (ids[0] as string | undefined) ?? null;
+    if (!issueId) return { payload, issueId: null };
+    const issue = await issueService(db).getById(issueId).catch(() => null);
+    // Cross-company and missing tasks are indistinguishable to the caller.
+    if (!issue || issue.companyId !== agent.companyId) throw notFound("Task not found");
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "issue:comment",
+      resource: {
+        type: "issue", companyId: issue.companyId, issueId: issue.id,
+        projectId: issue.projectId, parentIssueId: issue.parentId,
+        assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId, status: issue.status,
+      },
+    });
+    if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+    if (issue.conversationAgentId) {
+      throw conflict("A manual-only agent cannot be invoked in a chat conversation.");
+    }
+    if (["done", "cancelled"].includes(issue.status)) {
+      throw conflict("A manual-only agent cannot be invoked on a closed task.");
+    }
+    if (issue.assigneeAgentId) {
+      throw conflict("A manual-only agent cannot be invoked on a task another agent owns.");
+    }
+    return {
+      payload: { ...payload, issueId: issue.id, taskId: issue.id },
+      issueId: issue.id,
+    };
   }
 
   // The single owner-authorization helper for the three adapter login routes. It
@@ -4708,8 +4803,20 @@ export function agentRoutes(
       // The onboarding marker is not an agent column. The server consumes it to
       // seed the chief-of-staff persona; it never reaches the insert values.
       onboardingFirstAgent: createOnboardingFirstAgent,
+      // Opt-in inert creation (TAX-452) is not an agent column. It persists a
+      // paused, manual-only, assignment-locked agent without default grants.
+      inert: createInert,
       ...createInput
     } = req.body;
+    const inertCreate = createInert === true;
+    if (inertCreate) {
+      if (req.actor.type !== "board") {
+        throw forbidden("Only the board can create an inert agent");
+      }
+      if (createInput.role === "ceo") {
+        throw unprocessable("An inert agent cannot be the company CEO");
+      }
+    }
     createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
@@ -4773,8 +4880,20 @@ export function agentRoutes(
         id: agentId,
         ...createInput,
         adapterConfig: normalizedAdapterConfig,
-        runtimeConfig: normalizedRuntimeConfig,
-        status: "idle",
+        // Inert creation writes the paused status, disabled wakes and the
+        // persisted locks in the same insert/transaction as the agent row.
+        ...(inertCreate
+          ? {
+              runtimeConfig: inertAgentRuntimeConfig(normalizedRuntimeConfig),
+              permissions: inertAgentPermissions(createInput.permissions),
+              status: "paused",
+              pauseReason: "manual",
+              pausedAt: new Date(),
+            }
+          : {
+              runtimeConfig: normalizedRuntimeConfig,
+              status: "idle",
+            }),
         spentMonthlyCents: 0,
         lastHeartbeatAt: null,
       },
@@ -4816,6 +4935,7 @@ export function agentRoutes(
         name: agent.name,
         role: agent.role,
         desiredSkills: desiredSkillAssignment.desiredSkills,
+        ...(inertCreate ? { inert: true, invocationPolicy: "manual_only" } : {}),
       },
     });
     const telemetryClient = getTelemetryClient();
@@ -4823,12 +4943,15 @@ export function agentRoutes(
       trackAgentCreated(telemetryClient, { agentRole: agent.role, agentId: agent.id });
     }
 
-    await applyDefaultAgentTaskAssignGrant(
-      companyId,
-      agent.id,
-      req.actor.type === "board" ? (req.actor.userId ?? null) : null,
-    );
-    await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
+    // An inert agent receives no membership or principal grant at creation.
+    if (!inertCreate) {
+      await applyDefaultAgentTaskAssignGrant(
+        companyId,
+        agent.id,
+        req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+      );
+      await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
+    }
 
     if (agent.budgetMonthlyCents > 0) {
       await budgets.upsertPolicy(
@@ -4851,6 +4974,7 @@ export function agentRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
 
+    const existingManualOnly = agentInvocationIsManualOnly(existing.permissions);
     if (req.actor.type === "agent") {
       const actorAgent = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
       if (!actorAgent || actorAgent.companyId !== existing.companyId) {
@@ -4861,11 +4985,25 @@ export function agentRoutes(
         res.status(403).json({ error: "Only CEO can manage permissions" });
         return;
       }
+      if (existingManualOnly) {
+        res.status(403).json({ error: "Only the board can manage permissions of a manual-only agent" });
+        return;
+      }
     } else {
       await assertBoardCanManageAgentsForCompany(req, existing.companyId);
     }
 
-    const agent = await svc.updatePermissions(id, req.body);
+    // The inert manual-only locks (assignment block + invocation gate) survive
+    // any permissions rewrite; this route cannot drop them.
+    const agent = await svc.updatePermissions(
+      id,
+      existingManualOnly
+        ? preserveInertLocks(existing.permissions, {
+            ...(existing.permissions as Record<string, unknown> | null ?? {}),
+            ...req.body,
+          })
+        : req.body,
+    );
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
@@ -5818,6 +5956,12 @@ export function agentRoutes(
         ),
       );
     }
+    let manualInvocationIssueId: string | null = null;
+    if (!req.body.failedRunId) {
+      const bound = await bindManualOnlyInvocationTask(req, agent, wakePayload);
+      wakePayload = bound.payload;
+      manualInvocationIssueId = bound.issueId;
+    }
     const run = await heartbeat.wakeup(id, {
       failedRunId: req.body.failedRunId ?? null,
       ...(req.actor.type === "board" && !req.body.failedRunId ? { manualUserWake: true } : {}),
@@ -5864,7 +6008,12 @@ export function agentRoutes(
       action: "heartbeat.invoked",
       entityType: "heartbeat_run",
       entityId: run.id,
-      details: { agentId: id },
+      details: {
+        agentId: id,
+        ...(agentInvocationIsManualOnly(agent.permissions) && req.actor.type === "board"
+          ? { manualInvocation: { userId: req.actor.userId ?? null, issueId: manualInvocationIssueId } }
+          : {}),
+      },
     });
     if (req.body.debug?.providerTrace === "raw") {
       await logActivity(db, {
@@ -5972,6 +6121,9 @@ export function agentRoutes(
     if (typeof body.idempotencyKey === "string" && body.idempotencyKey.length > 0) {
       wakeOpts.idempotencyKey = body.idempotencyKey;
     }
+    const bound = await bindManualOnlyInvocationTask(req, agent, wakeOpts.payload ?? null);
+    const manualInvocationIssueId = bound.issueId;
+    if (bound.payload) wakeOpts.payload = bound.payload;
     const run = await heartbeat.wakeup(id, wakeOpts);
 
     if (!run) {
@@ -5989,7 +6141,12 @@ export function agentRoutes(
       action: "heartbeat.invoked",
       entityType: "heartbeat_run",
       entityId: run.id,
-      details: { agentId: id },
+      details: {
+        agentId: id,
+        ...(agentInvocationIsManualOnly(agent.permissions) && req.actor.type === "board"
+          ? { manualInvocation: { userId: req.actor.userId ?? null, issueId: manualInvocationIssueId } }
+          : {}),
+      },
     });
     if (providerTraceRequested) {
       await logActivity(db, {
@@ -6712,6 +6869,174 @@ export function agentRoutes(
     res.json(run);
   });
 
+  /**
+   * Typed OpenCode permission decision (TAX-452). The decision is claimed
+   * durably and atomically before dispatch; a claimed request is never
+   * dispatched twice, even when the first dispatch outcome is unknown.
+   */
+  async function resolveNativePermissionRequest(input: {
+    req: Request;
+    res: Response;
+    run: { id: string; companyId: string; agentId: string };
+    requestId: string;
+    pendingRequest: PendingNativeRuntimeRequest & {
+      permission: NonNullable<PendingNativeRuntimeRequest["permission"]>;
+    };
+    resolutionActor: NativeRuntimeRequestResolver;
+  }): Promise<void> {
+    const { req, res, run, requestId, pendingRequest, resolutionActor } = input;
+    if (req.actor.type !== "board" || !resolutionActor.userId.trim()) {
+      throw forbidden("A board user must decide runtime permissions.");
+    }
+    const resolution = parseNativePermissionDecisionResolution(req.body?.resolution);
+    if (!resolution) {
+      throw badRequest(
+        "Permission requests accept only {action:\"permission_decision\", decision:\"once\"|\"reject\", contractSha256}.",
+      );
+    }
+    if (resolution.contractSha256 !== pendingRequest.permission.contractSha256) {
+      throw conflict(
+        "The permission contract changed; reload the request before deciding.",
+      );
+    }
+    const samePending = (candidate: PendingNativeRuntimeRequest | null) =>
+      candidate !== null
+      && candidate.requestKind === pendingRequest.requestKind
+      && candidate.turnId === pendingRequest.turnId
+      && candidate.permission?.contractSha256 ===
+        pendingRequest.permission.contractSha256;
+    const currentPendingRequest = await readPendingNativeRuntimeRequest(db, {
+      companyId: run.companyId,
+      runId: run.id,
+      requestId,
+    });
+    if (!samePending(currentPendingRequest)) {
+      throw conflict("This runtime request is stale or is no longer pending.");
+    }
+    const claim = await claimNativePermissionDecision(db, {
+      companyId: run.companyId,
+      agentId: run.agentId,
+      runId: run.id,
+      requestId,
+      turnId: pendingRequest.turnId,
+      contractSha256: resolution.contractSha256,
+      decision: resolution.decision,
+      resolverUserId: resolutionActor.userId,
+    });
+    if (!claim) {
+      throw conflict("This permission request was already decided.");
+    }
+
+    // From here on the claim is final. `notDispatched` is set only for
+    // failures that provably happened before any provider/runner mutation.
+    let queued: { commandId: string } | null = null;
+    let failure: { status: "stale" | "dispatch_uncertain"; error: string } | null = null;
+    const authorizeBeforeDispatch = async () => {
+      const dispatchPending = await readPendingNativeRuntimeRequest(db, {
+        companyId: run.companyId,
+        runId: run.id,
+        requestId,
+      });
+      if (!samePending(dispatchPending)) {
+        throw new NativePermissionNotDispatchedError(
+          "runtime_request_stale",
+        );
+      }
+      assertNativeRuntimeRequestResolverAuthorized(
+        dispatchPending!,
+        resolutionActor,
+      );
+    };
+    const queueOnPrp = () => queueRunnerPrpRuntimeRequestResolution({
+      companyId: run.companyId,
+      runId: run.id,
+      pendingRequest: currentPendingRequest!,
+      actor: resolutionActor,
+      resolution,
+    });
+    try {
+      try {
+        queued = await withPermissionDispatchTimeout(resolveNativeRuntimeRequest({
+          runId: run.id,
+          requestId,
+          turnId: pendingRequest.turnId,
+          resolution,
+          authorizeBeforeDispatch,
+        }));
+      } catch (error) {
+        if (
+          error instanceof NativeRuntimeRequestResolutionError
+          && ["native_session_not_active", "runtime_request_resolution_unsupported"]
+            .includes(error.code)
+        ) {
+          await authorizeBeforeDispatch();
+          queued = queueOnPrp();
+        } else {
+          throw error;
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const provablyNotDispatched =
+        error instanceof NativePermissionNotDispatchedError
+        || error instanceof NativeRuntimeRequestResolutionAuthorizationError
+        || (
+          error instanceof NativeRuntimeRequestResolutionError
+          && error.code === "runtime_request_stale_turn"
+        )
+        || (
+          error instanceof RunnerPrpRuntimeRequestResolutionError
+          && error.code === "runner_prp_authority_not_active"
+        );
+      failure = {
+        status: provablyNotDispatched ? "stale" : "dispatch_uncertain",
+        error: message,
+      };
+    }
+    await settleNativePermissionDecision(db, {
+      id: claim.id,
+      status: failure ? failure.status : "delivered",
+      error: failure?.error ?? null,
+    });
+    await logActivity(db, {
+      companyId: run.companyId,
+      actorType: "user",
+      actorId: resolutionActor.userId,
+      action: "heartbeat.runtime_permission_decided",
+      entityType: "heartbeat_run",
+      entityId: run.id,
+      details: {
+        agentId: run.agentId,
+        runId: run.id,
+        requestId,
+        turnId: pendingRequest.turnId,
+        contractSha256: resolution.contractSha256,
+        decision: resolution.decision,
+        resolverUserId: resolutionActor.userId,
+        resolverPolicy: pendingRequest.resolverPolicy,
+        status: failure ? failure.status : "delivered",
+        ...(failure ? { error: failure.error.slice(0, 500) } : {}),
+      },
+    });
+    if (failure?.status === "stale") {
+      throw conflict(
+        "This runtime request is no longer pending; the decision was not delivered and will not be retried.",
+      );
+    }
+    if (failure) {
+      throw new HttpError(
+        502,
+        "The permission decision may or may not have reached the runner. It will not be retried; the runner fails closed if it did not arrive.",
+      );
+    }
+    res.status(202).json({
+      accepted: true,
+      commandId: queued!.commandId,
+      decision: resolution.decision,
+      status: "delivered",
+    });
+  }
+
   router.post(
     "/heartbeat-runs/:runId/runtime-requests/:requestId/resolve",
     async (req, res) => {
@@ -6763,6 +7088,20 @@ export function agentRoutes(
           );
         }
         throw error;
+      }
+      if (pendingRequest.permission) {
+        await resolveNativePermissionRequest({
+          req,
+          res,
+          run: existing,
+          requestId,
+          pendingRequest: {
+            ...pendingRequest,
+            permission: pendingRequest.permission,
+          },
+          resolutionActor,
+        });
+        return;
       }
       // Kind and turn are read only from the server-persisted PRP event. Body
       // values are deliberately ignored so a caller cannot downgrade an
@@ -7149,12 +7488,17 @@ export function agentRoutes(
     const limit = Number(req.query.limit ?? 200);
     const events = await heartbeat.listEvents(runId, Number.isFinite(afterSeq) ? afterSeq : 0, Number.isFinite(limit) ? limit : 200);
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-    const redactedEvents = events.map((event) =>
-      redactCurrentUserValue({
+    const redactedEvents = events.map((event) => {
+      const redacted = redactCurrentUserValue({
         ...event,
         payload: redactEventPayload(event.payload),
-      }, currentUserRedactionOptions),
-    );
+      }, currentUserRedactionOptions);
+      // Serve the frozen TAX-452 permission contract exactly as stored.
+      return {
+        ...redacted,
+        payload: preserveNativePermissionContract(event.payload, redacted.payload) ?? null,
+      };
+    });
     res.json(await runRedactions.redactForRun(run.companyId, run.id, redactedEvents));
   });
 

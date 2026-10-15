@@ -1406,6 +1406,7 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "heartbeat.disabled",
   "heartbeat.timer.no_actionable_work",
   "heartbeat.wakeOnDemand.disabled",
+  "agent.manual_only",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([

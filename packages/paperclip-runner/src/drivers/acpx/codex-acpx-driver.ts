@@ -1815,10 +1815,13 @@ function acpElicitationResponse(
     }
     return normalized.accept(resolution.response);
   }
-  if (resolution.action === "accept_for_session") {
+  if (
+    resolution.action === "accept_for_session" ||
+    resolution.action === "permission_decision"
+  ) {
     throw new HarnessRuntimeRequestResolutionError(
       "elicitation",
-      "ACPX form input does not support session acceptance",
+      `ACPX form input does not support ${resolution.action}`,
     );
   }
   return { action: resolution.action };

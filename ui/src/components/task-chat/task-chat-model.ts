@@ -25,7 +25,13 @@ import type {
   PaperclipQuestionSet,
 } from "@paperclipai/adapter-utils";
 
+import type {
+  NativePermissionContract,
+  NativePermissionDecision,
+} from "../transcript/native-run-events";
+
 export type { PaperclipQuestionResponse, PaperclipQuestionSet };
+export type { NativePermissionContract, NativePermissionDecision };
 
 export type TaskChatProviderActivityFamily =
   | "plan"
@@ -412,10 +418,20 @@ export interface TaskChatRuntimeRequestItem {
   questionSet?: PaperclipQuestionSet | null;
   resolvedAction?: string | null;
   response?: PaperclipQuestionResponse | null;
+  /** Frozen typed OpenCode permission contract (paperclip.runtime_request.permission.v1). */
+  permissionContract?: NativePermissionContract | null;
+  /** The request claimed the typed permission schema but its contract was malformed. */
+  permissionContractInvalid?: boolean;
+  permissionDecision?: NativePermissionDecision | null;
 }
 
 export type TaskChatRuntimeRequestDecision =
   | { action: "accept" | "accept_for_session" | "decline" | "cancel" }
+  | {
+      action: "permission_decision";
+      decision: NativePermissionDecision;
+      contractSha256: string;
+    }
   | { action: "submit"; values: Record<string, string> }
   | { action: "submit"; response: PaperclipQuestionResponse };
 
@@ -578,6 +594,8 @@ export function latestPendingRuntimeRequest(
 export function runtimeRequestReplacesComposerSkip(
   item: TaskChatRuntimeRequestItem,
 ): boolean {
+  // Typed permission contracts only accept once/reject; "Reject" is the skip.
+  if (item.permissionContract || item.permissionContractInvalid) return true;
   return item.choices.some((choice) => {
     const key = choice.key.trim().toLowerCase();
     const label = choice.label.trim().toLowerCase();

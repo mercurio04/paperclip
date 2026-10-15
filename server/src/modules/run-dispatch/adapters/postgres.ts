@@ -16,6 +16,7 @@ import {
 import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
 import { parseObject } from "../../../adapters/utils.js";
 import { evaluateAgentInvokabilityFromDb } from "../../../services/agent-invokability.js";
+import { agentInvocationIsManualOnly } from "../../../services/agent-invocation-policy.js";
 import { budgetService } from "../../../services/budgets.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../../../services/heartbeat-policy.js";
 import { collectDispositionRepairSourceState } from "../../../services/recovery/disposition-repair.js";
@@ -546,6 +547,43 @@ export function createPostgresRunDispatchAdapter(
             .then((rows) => Boolean(rows[0]))
         : false;
 
+    // TAX-452 H6: a manual-only agent is never an assignee. Its run owns the
+    // issue only when the invocation itself bound it: the run context names
+    // this issue and the persisted wake receipt is an authenticated user's
+    // manual wake. Any other run of that agent is still treated as reassigned.
+    const manualInvocation = parseObject(context.manualInvocation);
+    const isManualOnlyHumanInvocation =
+      issue !== null &&
+      readNonEmptyString(manualInvocation.issueId) === issue.id &&
+      issue.assigneeAgentId === null
+        ? await dbOrTx
+            .select({
+              permissions: agents.permissions,
+              requestPayload: agentWakeupRequests.payload,
+              requestedByActorType: agentWakeupRequests.requestedByActorType,
+              requestedByActorId: agentWakeupRequests.requestedByActorId,
+            })
+            .from(heartbeatRuns)
+            .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
+            .innerJoin(agentWakeupRequests, eq(agentWakeupRequests.id, heartbeatRuns.wakeupRequestId))
+            .where(and(
+              eq(heartbeatRuns.id, input.runId),
+              eq(heartbeatRuns.companyId, input.companyId),
+              eq(heartbeatRuns.agentId, input.agentId),
+              eq(agents.companyId, input.companyId),
+            ))
+            .limit(1)
+            .then(([row]) =>
+              Boolean(
+                row &&
+                  agentInvocationIsManualOnly(row.permissions) &&
+                  parseObject(row.requestPayload).manualUserWake === true &&
+                  row.requestedByActorType === "user" &&
+                  readNonEmptyString(row.requestedByActorId) !== null &&
+                  readNonEmptyString(manualInvocation.userId) === row.requestedByActorId,
+              ))
+        : false;
+
     const retryReasonKind = classifyRetryReasonKind(retryReason);
     // Dependency edges can change after scheduled promotion without changing
     // the displayed status. Read them again under the queued/final issue lock.
@@ -571,6 +609,7 @@ export function createPostgresRunDispatchAdapter(
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
       isAuthorizedSourceScopedRecovery,
+      isManualOnlyHumanInvocation,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
       wakeCommentIdPresent: Boolean(wakeCommentId),

@@ -5,6 +5,109 @@
   "oneOf": [
     {
       "type": "object",
+      "required": [
+        "schema",
+        "requestKind",
+        "requestId",
+        "type",
+        "status",
+        "prompt",
+        "turnId",
+        "origin",
+        "decisions",
+        "permission"
+      ],
+      "properties": {
+        "schema": { "const": "paperclip.runtime_request.permission.v1" },
+        "requestKind": { "const": "runtime" },
+        "requestId": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "type": { "const": "permission" },
+        "status": { "enum": ["pending", "resolved", "expired", "cancelled"] },
+        "prompt": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "turnId": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "itemId": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "origin": {
+          "type": "object",
+          "required": ["adapter", "provider", "method"],
+          "properties": {
+            "adapter": { "const": "opencode-server" },
+            "provider": { "const": "opencode" },
+            "method": { "const": "permission.asked" }
+          },
+          "additionalProperties": false
+        },
+        "decisions": { "const": ["once", "reject"] },
+        "permission": {
+          "type": "object",
+          "required": [
+            "schema",
+            "provider",
+            "providerVersion",
+            "providerSessionId",
+            "providerRequestId",
+            "permission",
+            "tool",
+            "patterns",
+            "always",
+            "metadata",
+            "arguments",
+            "cwd",
+            "targets",
+            "policy",
+            "contractSha256"
+          ],
+          "properties": {
+            "schema": { "const": "paperclip.opencode_permission_contract.v1" },
+            "provider": { "const": "opencode" },
+            "providerVersion": { "const": "1.18.29" },
+            "providerSessionId": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "providerRequestId": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "permission": { "type": "string", "minLength": 1, "maxLength": 160 },
+            "tool": {
+              "type": "object",
+              "required": ["name", "messageId", "callId"],
+              "properties": {
+                "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+                "messageId": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "callId": { "type": "string", "minLength": 1, "maxLength": 256 }
+              },
+              "additionalProperties": false
+            },
+            "patterns": { "type": "array", "items": { "type": "string" } },
+            "always": { "type": "array", "items": { "type": "string" } },
+            "metadata": { "type": "object" },
+            "arguments": { "type": "object" },
+            "cwd": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^/" },
+            "targets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["pattern", "resolvedPath"],
+                "properties": {
+                  "pattern": { "type": "string" },
+                  "resolvedPath": { "type": ["string", "null"] }
+                },
+                "additionalProperties": false
+              }
+            },
+            "policy": {
+              "type": "object",
+              "required": ["profile", "permissionDefault"],
+              "properties": {
+                "profile": { "const": "restricted_v1" },
+                "permissionDefault": { "const": "ask" }
+              },
+              "additionalProperties": false
+            },
+            "contractSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
       "required": ["schema", "requestKind", "requestId", "type", "status", "prompt", "input"],
       "properties": {
         "schema": { "const": "paperclip.runtime_request.v2" },

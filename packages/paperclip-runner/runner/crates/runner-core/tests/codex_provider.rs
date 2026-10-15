@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use paperclip_runner_core::codex_provider::{
-    CodexProvider, CodexProviderConfig, CodexProviderEvent,
+    CodexProvider, CodexProviderConfig, CodexProviderEvent, RuntimeRequestResolution,
 };
 use paperclip_runner_core::durable::{
     Command, CommandExecutor, DurableRunnerConfig, DurableRunnerError, PolledEvent,
@@ -6097,4 +6097,385 @@ fn lightweight_history_repeated_cursor_is_not_idle_evidence() {
     assert!(provider.active_provider_turn_id().is_some());
     provider.shutdown().unwrap();
     fs::remove_dir_all(directory).unwrap();
+}
+
+const OPENCODE_PERMISSION_FIXTURE: &str =
+    include_str!("../../../../protocol/fixtures/permissions/opencode-permission-request.json");
+
+fn opencode_permission_fixture() -> Value {
+    serde_json::from_str(OPENCODE_PERMISSION_FIXTURE).expect("permission fixture is JSON")
+}
+
+fn prepare_opencode_permission_executor(
+    directory: &Path,
+    switches: &[&str],
+) -> CodexCommandExecutor {
+    let config = provider_config(directory, switches);
+    let mut executor = CodexCommandExecutor::new(directory);
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .expect("prepare provider");
+    executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open provider session");
+    executor
+        .execute(&command(
+            "turn",
+            3,
+            "turn.start",
+            json!({"text": "Edit through the OpenCode proxy."}),
+        ))
+        .expect("start provider turn");
+    executor
+}
+
+fn permission_resolve(sequence: u64, request_id: &str, response: Value) -> Command {
+    command(
+        &format!("resolve-{sequence}"),
+        sequence,
+        "request.resolve",
+        json!({"requestId": request_id, "response": response}),
+    )
+}
+
+#[test]
+fn typed_opencode_permission_round_trips_through_the_durable_backend() {
+    let directory = temporary_directory("opencode-permission");
+    let mut executor =
+        prepare_opencode_permission_executor(&directory, &["--opencode-proxy-permission"]);
+    let fixture = opencode_permission_fixture();
+    let created = wait_for_executor_event(&mut executor, "runtime_request.created");
+    let request = &created.payload["request"];
+    let request_id = request["requestId"].as_str().unwrap().to_owned();
+    assert!(request_id.starts_with("runtime-request-"));
+    let mut expected = fixture["request"].clone();
+    expected["requestId"] = json!(request_id);
+    expected["turnId"] = request["turnId"].clone();
+    assert_eq!(request, &expected, "typed permission is emitted verbatim");
+    assert_eq!(request["type"], "permission");
+    assert_eq!(request["origin"]["method"], "permission.asked");
+    assert_eq!(request["decisions"], json!(["once", "reject"]));
+
+    let decision = |decision: &str| fixture["decisions"][decision].clone();
+    let mut wrong_sha = decision("once");
+    wrong_sha["contractSha256"] = json!("0".repeat(64));
+    let mut always = decision("once");
+    always["decision"] = json!("always");
+    let question = json!({
+        "schema": "paperclip.question_response.v1",
+        "answers": {"environment": {"selectedOptionIds": ["staging"]}}
+    });
+    for (sequence, invalid) in [(4, wrong_sha), (5, always), (6, question)] {
+        let error = executor
+            .execute(&permission_resolve(sequence, &request_id, invalid))
+            .expect_err("an invalid permission decision is a command error");
+        assert!(error.to_string().contains("runtime response failed"));
+    }
+    assert_eq!(
+        call_count(&directory, "opencode-permission-response:once"),
+        0,
+        "nothing reaches the provider for a rejected decision"
+    );
+
+    let resolved = executor
+        .execute(&permission_resolve(7, &request_id, decision("once")))
+        .expect("deliver the permission decision");
+    assert_eq!(resolved.events[0].0, "runtime_request.resolved");
+    assert_eq!(
+        resolved.events[0].2,
+        json!({
+            "provider": "codex",
+            "requestId": request_id,
+            "status": "delivered",
+            "type": "permission",
+            "decision": "once",
+        })
+    );
+    let duplicate = executor
+        .execute(&permission_resolve(8, &request_id, decision("reject")))
+        .expect_err("a permission is never answered twice");
+    assert!(duplicate.to_string().contains("no pending"));
+
+    wait_for_executor_event(&mut executor, "turn.completed");
+    assert_eq!(
+        call_count(&directory, "opencode-permission-response:once"),
+        1
+    );
+    assert_eq!(
+        call_count(&directory, "opencode-permission-response:reject"),
+        0
+    );
+    executor.shutdown().expect("stop provider process");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn invalid_opencode_permission_is_rejected_without_failing_the_session() {
+    let directory = temporary_directory("opencode-permission-invalid");
+    let mut executor =
+        prepare_opencode_permission_executor(&directory, &["--opencode-proxy-invalid-permission"]);
+    let mut diagnostic = None;
+    let mut created = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while created.is_none() && std::time::Instant::now() < deadline {
+        for event in poll_and_ack(&mut executor).expect("poll permission events") {
+            if event.event_type == "harness.diagnostic"
+                && event.payload["code"] == "permission_request_invalid"
+            {
+                assert!(created.is_none(), "the rejection precedes the valid retry");
+                diagnostic = Some(event);
+            } else if event.event_type == "runtime_request.created" {
+                created = Some(event);
+            } else {
+                assert!(
+                    !matches!(event.event_type.as_str(), "turn.failed" | "turn.completed"),
+                    "an invalid permission must not end the turn: {}",
+                    event.event_type
+                );
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let diagnostic = diagnostic.expect("the invalid permission is diagnosed");
+    assert_eq!(diagnostic.payload["paperclipExecuted"], false);
+    // The provider received a JSON-RPC error and re-asked with a valid contract.
+    let created = created.expect("the session survives and accepts a valid permission");
+    assert_eq!(created.payload["request"]["type"], "permission");
+    let request_id = created.payload["request"]["requestId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let reject = opencode_permission_fixture()["decisions"]["reject"].clone();
+    let resolved = executor
+        .execute(&permission_resolve(4, &request_id, reject))
+        .expect("the session still resolves permissions");
+    assert_eq!(resolved.events[0].2["decision"], "reject");
+    wait_for_executor_event(&mut executor, "turn.completed");
+    assert_eq!(
+        call_count(&directory, "opencode-permission-response:rejected"),
+        1
+    );
+    assert_eq!(
+        call_count(&directory, "opencode-permission-response:reject"),
+        1
+    );
+    executor.shutdown().expect("stop provider process");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn interrupting_a_turn_cancels_its_pending_opencode_permission() {
+    let directory = temporary_directory("opencode-permission-cancel");
+    let config = provider_config(&directory, &["--opencode-proxy-permission"]);
+    let mut provider = CodexProvider::start(&config, None).expect("start facade provider");
+    provider
+        .start_turn("Ask for a permission.", &config.cwd)
+        .expect("start provider turn");
+    let request_id = (0..64)
+        .find_map(|_| match provider.poll().expect("poll permission") {
+            Some(CodexProviderEvent::PermissionRequest {
+                request_id,
+                request,
+            }) => {
+                assert_eq!(request["requestId"], json!(request_id));
+                Some(request_id)
+            }
+            _ => None,
+        })
+        .expect("the typed permission reaches runnerd");
+    provider.interrupt_turn().expect("interrupt the turn");
+    assert_eq!(
+        call_count(&directory, "opencode-permission-response:cancel"),
+        1
+    );
+    let fixture = opencode_permission_fixture();
+    let error = provider
+        .resolve_runtime_request(&request_id, &fixture["decisions"]["once"])
+        .expect_err("a cancelled permission cannot be answered later");
+    assert!(error.to_string().contains("no pending"));
+    let _ = provider.shutdown();
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn delivered_opencode_permission_reports_its_native_outcome_once() {
+    let directory = temporary_directory("opencode-permission-native-outcome");
+    let config = provider_config(
+        &directory,
+        &[
+            "--opencode-proxy-permission",
+            "--opencode-proxy-permission-report-terminal",
+        ],
+    );
+    let mut provider = CodexProvider::start(&config, None).expect("start facade provider");
+    provider
+        .start_turn("Ask for a permission.", &config.cwd)
+        .expect("start provider turn");
+    let request_id = (0..64)
+        .find_map(|_| match provider.poll().expect("poll permission") {
+            Some(CodexProviderEvent::PermissionRequest { request_id, .. }) => Some(request_id),
+            _ => None,
+        })
+        .expect("the typed permission reaches runnerd");
+    let fixture = opencode_permission_fixture();
+    provider
+        .resolve_runtime_request(&request_id, &fixture["decisions"]["once"])
+        .expect("deliver the board decision");
+    let mut outcomes = Vec::new();
+    let mut ignored = 0;
+    for _ in 0..256 {
+        match provider.poll().expect("poll native outcome") {
+            Some(CodexProviderEvent::RuntimeRequestRejected { diagnostic })
+                if diagnostic["code"] == "permission_native_outcome" =>
+            {
+                outcomes.push(diagnostic)
+            }
+            Some(CodexProviderEvent::Notification { method, params })
+                if method == "warning"
+                    && params["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("was not delivered")) =>
+            {
+                ignored += 1
+            }
+            _ => {}
+        }
+        if outcomes.len() == 1 && ignored == 1 {
+            break;
+        }
+    }
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "exactly one outcome per delivered decision"
+    );
+    assert_eq!(outcomes[0]["requestId"], json!(request_id));
+    assert_eq!(outcomes[0]["nativeOutcome"], "rejected_terminal");
+    assert_eq!(outcomes[0]["paperclipExecuted"], false);
+    assert_eq!(
+        ignored, 1,
+        "a second report for the same request is ignored"
+    );
+    assert_eq!(
+        call_count(&directory, "opencode-permission-response:once"),
+        1
+    );
+    let _ = provider.shutdown();
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn proxy_expiry_retires_the_pending_opencode_permission_and_refuses_a_later_decision() {
+    let directory = temporary_directory("opencode-permission-expire");
+    let mut executor = prepare_opencode_permission_executor(
+        &directory,
+        &[
+            "--opencode-proxy-permission",
+            "--opencode-proxy-permission-expire",
+        ],
+    );
+    // created, the permission_expired diagnostic and expired may share a poll.
+    let mut seen = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline
+        && !seen
+            .iter()
+            .any(|event: &PolledEvent| event.event_type == "runtime_request.expired")
+    {
+        seen.extend(poll_and_ack(&mut executor).expect("poll permission events"));
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let find = |event_type: &str| {
+        seen.iter()
+            .find(|event| event.event_type == event_type)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing {event_type} in {:?}",
+                    seen.iter()
+                        .map(|e| (&e.event_type, &e.payload))
+                        .collect::<Vec<_>>()
+                )
+            })
+    };
+    let request_id = find("runtime_request.created").payload["request"]["requestId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let expired = find("runtime_request.expired");
+    assert!(seen
+        .iter()
+        .any(|event| event.event_type == "harness.diagnostic"
+            && event.payload["code"] == "permission_expired"));
+    assert_eq!(expired.payload["requestId"], json!(request_id));
+    assert_eq!(expired.payload["reason"], "permission_expired");
+    assert_eq!(expired.payload["type"], "permission");
+    let once = opencode_permission_fixture()["decisions"]["once"].clone();
+    let late = executor
+        .execute(&permission_resolve(4, &request_id, once))
+        .expect_err("an expired permission is never answered");
+    // The fake ends the turn once runnerd answers the expiry, so the late
+    // decision finds either no pending request or no active turn.
+    assert!(
+        late.to_string().contains("no pending")
+            || late.to_string().contains("outside an active turn"),
+        "{late}"
+    );
+    if !seen
+        .iter()
+        .any(|event| event.event_type == "turn.completed")
+    {
+        wait_for_executor_event(&mut executor, "turn.completed");
+    }
+    assert_eq!(
+        call_count(&directory, "opencode-permission-response:expired"),
+        1
+    );
+    for outcome in ["once", "reject", "cancel"] {
+        assert_eq!(
+            call_count(
+                &directory,
+                &format!("opencode-permission-response:{outcome}")
+            ),
+            0
+        );
+    }
+    executor.shutdown().expect("stop provider process");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn provider_level_permission_resolution_reports_the_decision() {
+    let directory = temporary_directory("opencode-permission-provider");
+    let config = provider_config(&directory, &["--opencode-proxy-permission"]);
+    let mut provider = CodexProvider::start(&config, None).expect("start facade provider");
+    provider
+        .start_turn("Ask for a permission.", &config.cwd)
+        .expect("start provider turn");
+    let request_id = (0..64)
+        .find_map(|_| match provider.poll().expect("poll permission") {
+            Some(CodexProviderEvent::PermissionRequest { request_id, .. }) => Some(request_id),
+            _ => None,
+        })
+        .expect("the typed permission reaches runnerd");
+    let fixture = opencode_permission_fixture();
+    assert_eq!(
+        provider
+            .resolve_runtime_request(&request_id, &fixture["decisions"]["reject"])
+            .expect("deliver reject"),
+        RuntimeRequestResolution::Permission {
+            decision: "reject".to_owned()
+        }
+    );
+    wait_for_notification(&mut provider, "turn/completed");
+    assert_eq!(
+        call_count(&directory, "opencode-permission-response:reject"),
+        1
+    );
+    let _ = provider.shutdown();
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }

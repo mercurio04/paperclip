@@ -273,6 +273,16 @@ describe("decideQueuedRunStaleness", () => {
     });
   });
 
+  it("keeps a human-bound manual-only invocation on an unassigned issue (TAX-452 H6)", () => {
+    const facts = { ...baseStalenessFacts(), issueAssigneeAgentId: null };
+    expect(decideQueuedRunStaleness({ ...facts, isManualOnlyHumanInvocation: true }, NOW)).toEqual({ stale: false });
+    // Without the verified human binding the same run is still stale.
+    expect(decideQueuedRunStaleness(facts, NOW)).toMatchObject({ stale: true, errorCode: "issue_assignee_changed" });
+    // The binding does not bypass terminal status.
+    expect(decideQueuedRunStaleness({ ...facts, isManualOnlyHumanInvocation: true, issueStatus: "done" }, NOW))
+      .toMatchObject({ stale: true, errorCode: "issue_terminal_status" });
+  });
+
   it.each([
     {
       name: "issue_not_found",

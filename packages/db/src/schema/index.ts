@@ -135,6 +135,7 @@ export { workAssessments } from "./work_assessments.js";
 export { statusDecisions } from "./status_decisions.js";
 export { statusDecisionEffects } from "./status_decision_effects.js";
 export { heartbeatRunWatchdogDecisions } from "./heartbeat_run_watchdog_decisions.js";
+export { nativePermissionDecisions } from "./native_permission_decisions.js";
 export { smokeRuns, smokeRunSteps } from "./smoke_lab.js";
 export { costEvents } from "./cost_events.js";
 export { financeEvents } from "./finance_events.js";

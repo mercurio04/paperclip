@@ -41,6 +41,7 @@ import type {
   AdapterRuntimeEvent,
 } from "../../adapters/index.js";
 import type { NativeFinalizationResult } from "@paperclipai/shared";
+import type { PaperclipRunnerOpenCodePermissionProfile } from "./provider-profile.js";
 import type {
   HarnessRuntimeRequestResolution,
   NativeExecutionInput,
@@ -128,7 +129,12 @@ import { registerRunnerPrpAuthority } from "../../realtime/runner-prp-ws.js";
 import { connectRunnerPrpIngress } from "../../realtime/runner-prp-outbound.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { reportRunFailure } from "../run-failure-report.js";
-import { persistActivity, publishActivity } from "../activity-log.js";
+import { logActivity, persistActivity, publishActivity } from "../activity-log.js";
+import { logger } from "../../middleware/logger.js";
+import {
+  applyNativePermissionSettle,
+  nativePermissionOutcomeFromEvent,
+} from "./native-permission-decisions.js";
 import { commitNativeStatusDecision } from "./status-decision-committer.js";
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 import { documentService } from "../documents.js";
@@ -6831,6 +6837,10 @@ export async function executePaperclipNativeSession(input: {
   db: Db;
   execution: NativeExecutionInput;
   runnerInstanceId: string;
+  /** Opt-in OpenCode permission profile (TAX-452); absent = unchanged. */
+  opencodePermissionProfile?: PaperclipRunnerOpenCodePermissionProfile;
+  /** Optional llama.cpp endpoint for the OpenCode provider. */
+  llamaCppBaseUrl?: string;
   /** Trusted task identity from the heartbeat orchestration. */
   conversationMode?: boolean;
   /** Configured total turn bound; zero/unset is unlimited. */
@@ -7364,6 +7374,28 @@ async function executePaperclipNativeSessionWithinScope(
   const governedWaitObservation = createGovernedWaitEventObservation(
     resolvePendingGovernedWait,
   );
+  // TAX-452: record what OpenCode natively received for a delivered typed
+  // permission claim (first write wins; conflicts audited). Idempotent, so the
+  // duplicate-event recovery path may repeat it. Never fails the event.
+  const recordNativePermissionOutcome = async (event: PrpEvent) => {
+    const outcome = nativePermissionOutcomeFromEvent(event);
+    if (!outcome) return;
+    try {
+      await applyNativePermissionSettle(
+        input.db,
+        {
+          companyId: input.execution.binding.companyId,
+          agentId: input.execution.binding.agentId,
+          runId: input.execution.binding.runId,
+          ...outcome,
+        },
+        (entry) => logActivity(input.db, entry),
+      );
+    } catch (error) {
+      logger.warn({ err: error, runId: input.execution.binding.runId, requestId: outcome.requestId },
+        "native permission outcome could not be recorded");
+    }
+  };
   const projectSessionGoalEvent = (event: PrpEvent) =>
     applyRunnerGoalPrpEvent(
       input.db,
@@ -7577,6 +7609,7 @@ async function executePaperclipNativeSessionWithinScope(
             })}\n`,
           );
         }
+        await recordNativePermissionOutcome(event);
         const questionFallback = await materializeRuntimeQuestionFallback({
           db: input.db,
           binding: input.execution.binding,
@@ -7622,6 +7655,7 @@ async function executePaperclipNativeSessionWithinScope(
         // publication, logging, trace, and metric effects remain committed-only.
         await projectSessionGoalEvent(event);
         providerUsageLimitObserved ||= nativeProviderUsageLimitFromEvent(event);
+        await recordNativePermissionOutcome(event);
         const questionFallback = await materializeRuntimeQuestionFallback({
           db: input.db,
           binding: input.execution.binding,
@@ -9864,6 +9898,8 @@ export async function createRunnerdBackend(input: {
   db: Db;
   execution: NativeExecutionInput;
   runnerInstanceId: string;
+  opencodePermissionProfile?: PaperclipRunnerOpenCodePermissionProfile;
+  llamaCppBaseUrl?: string;
   chatAttachmentReadScope?: NativeChatAttachmentReadScope;
   restartRecovery?: NativeRestartRecoveryClaim;
   durableEnvironmentLeaseId?: string;
@@ -11595,7 +11631,18 @@ async function createRunnerdBackendWithinSessionClaim(
           : {}),
         ...(input.execution.provider.kind === "opencode"
           ? {
-              opencodePermissionMode: input.execution.provider.permissionMode,
+              // restricted_v1 is only valid with "ask": the profile routes
+              // every tool permission through a human-decided contract.
+              opencodePermissionMode:
+                input.opencodePermissionProfile === "restricted_v1"
+                  ? "ask"
+                  : input.execution.provider.permissionMode,
+              ...(input.opencodePermissionProfile
+                ? { opencodePermissionProfile: input.opencodePermissionProfile }
+                : {}),
+              ...(input.llamaCppBaseUrl
+                ? { llamaCppBaseUrl: input.llamaCppBaseUrl }
+                : {}),
             }
           : {}),
         ...(input.execution.provider.kind === "claude_managed"

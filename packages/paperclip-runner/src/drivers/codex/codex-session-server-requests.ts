@@ -1,4 +1,10 @@
-import type { HarnessRuntimeRequest, PaperclipQuestionSet } from "../../contracts/harness-driver.js";
+import type {
+  HarnessRuntimeRequest,
+  PaperclipOpenCodePermissionContract,
+  PaperclipPermissionDecision,
+  PaperclipQuestionSet,
+} from "../../contracts/harness-driver.js";
+import type { PaperclipRuntimeRequestOrigin } from "../../contracts/question-set.js";
 import {
   CODEX_BLOCK_TOOL_NAME,
 } from "../../contracts/codex.js";
@@ -13,6 +19,7 @@ import {
   rejectedCodexToolCall as rejectedToolCall,
 } from "./codex-boundaries.js";
 import {
+  PAPERCLIP_PERMISSION_BRIDGE_METHOD,
   createCodexQuestionResponseContext,
   hasCodexQuestionForm,
   normalizeCodexQuestionSet,
@@ -282,22 +289,45 @@ async function handleServerRequestBody(
       }, { turnId: requestTurnId, itemId: String(request.id) });
       return safeRequestResponse(request.method);
     }
-    const runtimeRequest: HarnessRuntimeRequest = {
-      requestId,
-      requestKind,
-      method: request.method,
-      turnId: requestTurnId,
-      itemId: text(request.params.itemId, requestId),
-      status: "pending",
-      prompt: runtimeRequestPrompt(requestKind, request.params),
-      details: record(redactCodexValue(boundedCodexValue(request.params))),
-      ...(input !== null ? { input } : {}),
-      origin: {
-        adapter: "codex-app-server",
-        provider: "codex",
-        method: request.method,
-      },
-    };
+    const typedPermission = request.method === PAPERCLIP_PERMISSION_BRIDGE_METHOD;
+    // The transport already validated the frozen contract; it is carried
+    // verbatim (never redacted or bounded) because its hash must still match.
+    const runtimeRequest: HarnessRuntimeRequest = typedPermission
+      ? {
+          requestId,
+          requestKind,
+          method: request.method,
+          turnId: requestTurnId,
+          itemId: text(request.params.itemId, requestId),
+          status: "pending",
+          prompt: text(request.params.prompt).slice(0, 4_000),
+          details: {},
+          origin: structuredClone(
+            record(request.params.origin),
+          ) as unknown as PaperclipRuntimeRequestOrigin,
+          permission: structuredClone(
+            request.params.permission,
+          ) as PaperclipOpenCodePermissionContract,
+          decisions: structuredClone(
+            request.params.decisions,
+          ) as PaperclipPermissionDecision[],
+        }
+      : {
+          requestId,
+          requestKind,
+          method: request.method,
+          turnId: requestTurnId,
+          itemId: text(request.params.itemId, requestId),
+          status: "pending",
+          prompt: runtimeRequestPrompt(requestKind, request.params),
+          details: record(redactCodexValue(boundedCodexValue(request.params))),
+          ...(input !== null ? { input } : {}),
+          origin: {
+            adapter: "codex-app-server",
+            provider: "codex",
+            method: request.method,
+          },
+        };
     state.emit(
       "runtime_request.created",
       {
