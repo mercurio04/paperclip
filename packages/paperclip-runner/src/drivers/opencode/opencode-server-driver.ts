@@ -2,15 +2,17 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmod,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
+  readlink,
   realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
 import { createServer } from "node:net";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, parse as parsePath, resolve, sep } from "node:path";
 
 import {
   CODEX_SKILLLESS_BASE_INSTRUCTIONS,
@@ -303,6 +305,10 @@ export class OpenCodeServerDriver implements HarnessDriver {
     );
     await mkdir(root, { recursive: true, mode: 0o700 });
     await writeFile(join(root, "workspace"), `${cwd}\n`, { mode: 0o600 });
+    // restricted_v1: frozen once per session; permission targets and cwd must
+    // stay inside the workspace and never reach the private runtime root.
+    const workspaceRealpath = await realpath(cwd);
+    const privateRootRealpath = await realpath(root);
     const trace = await createProviderTraceFileSink({
       path: this.#options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH,
       provider: "opencode",
@@ -352,6 +358,8 @@ export class OpenCodeServerDriver implements HarnessDriver {
           normalizedSessionId: input.normalizedSessionId,
           providerSessionId,
           workingDirectory: cwd,
+          workspaceRealpath,
+          privateRootRealpath,
           runnerInstanceId:
             this.#options.runnerInstanceId ??
             `paperclip-opencode-${input.runId}`,
@@ -396,6 +404,8 @@ class OpenCodeHarnessSession implements HarnessSession {
   readonly #normalizedSessionId: string;
   readonly #providerSessionId: string;
   readonly #workingDirectory: string;
+  readonly #workspaceRealpath: string;
+  readonly #privateRootRealpath: string;
   readonly #runnerInstanceId: string;
   readonly #model: string;
   readonly #taskEnvelope: CodexTaskEnvelope;
@@ -443,6 +453,13 @@ class OpenCodeHarnessSession implements HarnessSession {
   >();
   /** restricted_v1: native permissions OpenCode itself settled as rejected. */
   readonly #providerRejectedPermissions = new Set<string>();
+  /**
+   * restricted_v1: permissions invalidated by a terminal turn, SSE loss, or
+   * session close. A decision for any of these may never dispatch `once`.
+   */
+  readonly #invalidatedPermissions = new Set<string>();
+  /** restricted_v1: frozen resolution of tool-argument paths (not hashed). */
+  readonly #frozenArgumentTargets = new Map<string, string>();
   #activeTraceFrameId: number | null = null;
   #activeTraceEmittedEventIds: string[] = [];
   #sourceSequence: number;
@@ -466,6 +483,8 @@ class OpenCodeHarnessSession implements HarnessSession {
     normalizedSessionId: string;
     providerSessionId: string;
     workingDirectory: string;
+    workspaceRealpath: string;
+    privateRootRealpath: string;
     runnerInstanceId: string;
     model: string;
     taskEnvelope: CodexTaskEnvelope;
@@ -481,6 +500,8 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#normalizedSessionId = input.normalizedSessionId;
     this.#providerSessionId = input.providerSessionId;
     this.#workingDirectory = input.workingDirectory;
+    this.#workspaceRealpath = input.workspaceRealpath;
+    this.#privateRootRealpath = input.privateRootRealpath;
     this.#runnerInstanceId = input.runnerInstanceId;
     this.#model = input.model;
     this.#taskEnvelope = input.taskEnvelope;
@@ -660,10 +681,13 @@ class OpenCodeHarnessSession implements HarnessSession {
     resolution: HarnessRuntimeRequestResolution;
   }): Promise<void> {
     const pending = this.#pendingRuntimeRequests.get(input.requestId);
-    if (!pending)
+    if (!pending) {
+      if (this.#invalidatedPermissions.has(input.requestId))
+        this.#emitDecisionAfterTerminal(input.requestId, input.turnId);
       throw new Error(
         `OpenCode request ${input.requestId} is no longer pending`,
       );
+    }
     if (
       pending.request.turnId !== input.turnId ||
       this.#activeTurnId !== input.turnId
@@ -896,6 +920,10 @@ class OpenCodeHarnessSession implements HarnessSession {
     if (this.#closed) return;
     this.#closed = true;
     this.#abort.abort();
+    for (const id of this.#typedPermissionsInFlight)
+      this.#invalidatedPermissions.add(id);
+    for (const [id, { request }] of this.#pendingRuntimeRequests)
+      if (request.permission !== undefined) this.#invalidatedPermissions.add(id);
     for (const { request } of this.#pendingRuntimeRequests.values()) {
       this.#emit(
         request.input === undefined
@@ -1221,8 +1249,10 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#typedPermissionsInFlight.add(requestId);
     try {
       let contract: PaperclipOpenCodePermissionContract;
+      let argumentTargets: string[];
       try {
-        contract = await this.#freezePermissionContract(properties);
+        ({ contract, argumentTargets } =
+          await this.#freezePermissionContract(properties));
       } catch (error) {
         this.#emit(
           "harness.diagnostic",
@@ -1248,10 +1278,42 @@ class OpenCodeHarnessSession implements HarnessSession {
         }
         return;
       }
+      const escaped = this.#escapesWorkspace(contract, argumentTargets);
+      if (escaped !== null) {
+        // TAX-470 H1: a target (after symlink resolution of the deepest
+        // existing ancestor) or the cwd leaves the workspace, or reaches the
+        // private runtime root. Never ask a human to approve that.
+        this.#emit(
+          "harness.diagnostic",
+          {
+            code: "permission_target_outside_workspace",
+            adapter: "opencode-server",
+            providerRequestId: requestId,
+            permission: contract.permission,
+            reason: escaped,
+          },
+          { turnId, itemId: requestId },
+        );
+        if (
+          !this.#closed &&
+          !this.#paperclipPermissionReplies.has(requestId) &&
+          !this.#providerRejectedPermissions.has(requestId)
+        ) {
+          const delivered = await this.#replyPermissionOnce(
+            requestId,
+            "reject",
+            turnId,
+          );
+          if (!delivered)
+            await this.#failTurnClosed(turnId, "permission_reply_uncertain");
+        }
+        return;
+      }
       if (
         this.#closed ||
         this.#activeTurnId !== turnId ||
-        !this.#typedPermissionsInFlight.has(requestId)
+        !this.#typedPermissionsInFlight.has(requestId) ||
+        this.#invalidatedPermissions.has(requestId)
       ) {
         // The turn ended or a reply raced the freeze; never surface a request
         // nobody can answer. A still-pending native request fails closed.
@@ -1284,6 +1346,7 @@ class OpenCodeHarnessSession implements HarnessSession {
         request,
         nativeQuestions: [],
       });
+      this.#frozenArgumentTargets.set(requestId, canonicalJson(argumentTargets));
       this.#emit(
         "runtime_request.created",
         {
@@ -1308,9 +1371,10 @@ class OpenCodeHarnessSession implements HarnessSession {
     }
   }
 
-  async #freezePermissionContract(
-    properties: Record<string, unknown>,
-  ): Promise<PaperclipOpenCodePermissionContract> {
+  async #freezePermissionContract(properties: Record<string, unknown>): Promise<{
+    contract: PaperclipOpenCodePermissionContract;
+    argumentTargets: string[];
+  }> {
     const providerRequestId = text(properties.id);
     const sessionId = text(properties.sessionID);
     const permission = text(properties.permission);
@@ -1362,7 +1426,89 @@ class OpenCodeHarnessSession implements HarnessSession {
       PERMISSION_CONTRACT_MAX_BYTES
     )
       throw new Error("permission contract exceeds 64 KiB");
-    return contract;
+    return {
+      contract,
+      argumentTargets: await resolveArgumentTargets(cwd, toolArguments),
+    };
+  }
+
+  /** Returns why a frozen permission escapes the workspace, or null. */
+  #escapesWorkspace(
+    contract: PaperclipOpenCodePermissionContract,
+    argumentTargets: readonly string[],
+  ): string | null {
+    const check = (path: string | null, label: string): string | null => {
+      if (path === null) return `${label} is unresolved`;
+      if (!isWithin(path, this.#workspaceRealpath))
+        return `${label} resolves outside the workspace`;
+      if (isWithin(path, this.#privateRootRealpath))
+        return `${label} resolves into the private runtime root`;
+      return null;
+    };
+    return (
+      check(contract.cwd, "cwd") ??
+      contract.targets
+        .map((target, index) => check(target.resolvedPath, `target ${index}`))
+        .find((reason) => reason !== null) ??
+      argumentTargets
+        .map((target, index) => check(target, `argument path ${index}`))
+        .find((reason) => reason !== null) ??
+      null
+    );
+  }
+
+  #emitDecisionAfterTerminal(requestId: string, turnId: string): void {
+    this.#emit(
+      "harness.diagnostic",
+      {
+        code: "permission_decision_after_terminal",
+        adapter: "opencode-server",
+        providerRequestId: requestId,
+      },
+      { turnId, itemId: requestId },
+    );
+  }
+
+  /**
+   * restricted_v1 (TAX-470 H2/H3): invalidate every typed permission that is
+   * pending or still being frozen. Each one is settled natively with exactly
+   * one `reject` (unless already settled) and can never be granted later.
+   */
+  #invalidateTypedPermissions(
+    reason: string,
+    diagnostic: string | null,
+  ): void {
+    if (this.#runtime.permissionProfile !== "restricted_v1") return;
+    const ids = new Set<string>(this.#typedPermissionsInFlight);
+    for (const [id, entry] of this.#pendingRuntimeRequests)
+      if (entry.request.permission !== undefined) ids.add(id);
+    for (const id of ids) {
+      this.#invalidatedPermissions.add(id);
+      const entry = this.#pendingRuntimeRequests.get(id);
+      const turnId = entry?.request.turnId ?? this.#activeTurnId ?? "";
+      if (diagnostic !== null)
+        this.#emit(
+          "harness.diagnostic",
+          {
+            code: diagnostic,
+            adapter: "opencode-server",
+            providerRequestId: id,
+          },
+          { turnId, itemId: id },
+        );
+      if (entry && this.#pendingRuntimeRequests.delete(id))
+        this.#emit(
+          "runtime_request.cancelled",
+          harnessRuntimeRequestOutcome(entry.request, { reason }),
+          { turnId: entry.request.turnId, itemId: entry.request.itemId },
+        );
+      if (
+        !this.#closed &&
+        !this.#paperclipPermissionReplies.has(id) &&
+        !this.#providerRejectedPermissions.has(id)
+      )
+        void this.#replyPermissionOnce(id, "reject", turnId);
+    }
   }
 
   async #fetchToolArguments(tool: {
@@ -1395,15 +1541,39 @@ class OpenCodeHarnessSession implements HarnessSession {
     resolution: HarnessRuntimeRequestResolution,
   ): Promise<void> {
     const contract = pending.request.permission!;
+    // TAX-470 H2: re-checked after every await and immediately before the
+    // native POST. A terminal turn, SSE loss, close, or any settlement of this
+    // request wins over the decision; a losing decision never sends `once`.
+    const stillCurrent = () =>
+      !this.#closed &&
+      this.#activeTurnId === turnId &&
+      !this.#terminalTurns.has(turnId) &&
+      this.#pendingRuntimeRequests.get(requestId) === pending &&
+      !this.#invalidatedPermissions.has(requestId) &&
+      !this.#paperclipPermissionReplies.has(requestId) &&
+      !this.#providerRejectedPermissions.has(requestId);
+    const loseRace = async (): Promise<void> => {
+      this.#emitDecisionAfterTerminal(requestId, turnId);
+      this.#invalidatedPermissions.add(requestId);
+      if (
+        !this.#closed &&
+        !this.#paperclipPermissionReplies.has(requestId) &&
+        !this.#providerRejectedPermissions.has(requestId)
+      )
+        await this.#replyPermissionOnce(requestId, "reject", turnId);
+    };
+    if (!stillCurrent()) return loseRace();
     let reply: PaperclipPermissionDecision = "reject";
     let diagnostic: string | null = null;
     if (resolution.action === "permission_decision") {
       if (resolution.contractSha256 !== contract.contractSha256) {
         diagnostic = "permission_contract_mismatch";
       } else if (resolution.decision === "once") {
-        const live = await this.#permissionStillMatches(contract).catch(
-          () => false,
-        );
+        const live = await this.#permissionStillMatches(
+          requestId,
+          contract,
+        ).catch(() => false);
+        if (!stillCurrent()) return loseRace();
         if (live) reply = "once";
         else diagnostic = "permission_contract_drift";
       }
@@ -1418,7 +1588,10 @@ class OpenCodeHarnessSession implements HarnessSession {
         },
         { turnId, itemId: requestId },
       );
+    // No await between this check and the POST being issued.
+    if (!stillCurrent()) return loseRace();
     const delivered = await this.#replyPermissionOnce(requestId, reply, turnId);
+    this.#frozenArgumentTargets.delete(requestId);
     if (!this.#pendingRuntimeRequests.delete(requestId)) return;
     if (!delivered) {
       this.#emit(
@@ -1443,6 +1616,7 @@ class OpenCodeHarnessSession implements HarnessSession {
   }
 
   async #permissionStillMatches(
+    requestId: string,
     contract: PaperclipOpenCodePermissionContract,
   ): Promise<boolean> {
     const value = await api(
@@ -1478,7 +1652,14 @@ class OpenCodeHarnessSession implements HarnessSession {
     const cwd = await realpath(this.#workingDirectory);
     if (cwd !== contract.cwd) return false;
     const targets = await resolvePermissionTargets(cwd, contract.patterns);
-    return canonicalJson(targets) === canonicalJson(contract.targets);
+    if (canonicalJson(targets) !== canonicalJson(contract.targets)) return false;
+    const argumentTargets = await resolveArgumentTargets(cwd, contract.arguments);
+    if (
+      canonicalJson(argumentTargets) !==
+      this.#frozenArgumentTargets.get(requestId)
+    )
+      return false;
+    return this.#escapesWorkspace(contract, argumentTargets) === null;
   }
 
   /**
@@ -1572,6 +1753,7 @@ class OpenCodeHarnessSession implements HarnessSession {
   /** Terminal fail-closed stop: the turn fails now, the provider is aborted. */
   async #failTurnClosed(turnId: string, code: string): Promise<void> {
     if (this.#activeTurnId === turnId) {
+      this.#invalidateTypedPermissions(code, null);
       for (const [id, entry] of this.#pendingRuntimeRequests) {
         this.#pendingRuntimeRequests.delete(id);
         this.#emit(
@@ -1676,6 +1858,28 @@ class OpenCodeHarnessSession implements HarnessSession {
         );
       } catch (error) {
         if (this.#closed || this.#abort.signal.aborted) return;
+        if (this.#runtime.permissionProfile === "restricted_v1") {
+          // TAX-470 H3: events (replies, aborts, new asks) may have been lost
+          // in the gap. Never keep an approval alive across it: invalidate
+          // every pending permission and fail the turn for reconciliation.
+          this.#invalidateTypedPermissions(
+            "permission_invalidated_sse_lost",
+            "permission_invalidated_sse_lost",
+          );
+          const turnId = this.#activeTurnId;
+          if (turnId !== null) {
+            this.#emit(
+              "harness.diagnostic",
+              {
+                code: "opencode_sse_lost",
+                adapter: "opencode-server",
+                message: redact(String(error), this.#runtime.sensitiveValues),
+              },
+              { turnId },
+            );
+            await this.#failTurnClosed(turnId, "opencode_sse_lost");
+          }
+        }
         attempts += 1;
         if (attempts > 3) {
           this.#emit("harness.diagnostic", {
@@ -1910,6 +2114,7 @@ class OpenCodeHarnessSession implements HarnessSession {
         status: "completed",
         semanticResult: this.#resultFingerprint,
       });
+      this.#invalidateTypedPermissions("turn_completed", null);
       this.#terminalTurns.set(turnId, fingerprint);
       this.#emitSettledFinalAgentMessage(turnId);
       const workspace = this.#workspaceChangesByTurn.get(turnId);
@@ -1939,6 +2144,8 @@ class OpenCodeHarnessSession implements HarnessSession {
         // card. Preserve the provider fact as a cancelled terminal event; the
         // native session loop independently commits the authoritative yielded
         // result when this abort followed a governed wait.
+        this.#invalidateTypedPermissions("turn_cancelled", null);
+        this.#terminalTurns.set(turnId, canonicalJson({ status: "cancelled" }));
         this.#activeTurnId = null;
         this.#emit(
           "turn.cancelled",
@@ -1948,7 +2155,6 @@ class OpenCodeHarnessSession implements HarnessSession {
           },
           { turnId },
         );
-        this.#terminalTurns.set(turnId, canonicalJson({ status: "cancelled" }));
         this.#events.close();
         return;
       }
@@ -1969,13 +2175,14 @@ class OpenCodeHarnessSession implements HarnessSession {
         },
         { turnId, itemId: `${turnId}:session-error` },
       );
+      this.#invalidateTypedPermissions("turn_failed", null);
+      this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
       this.#activeTurnId = null;
       this.#emit(
         "turn.failed",
         { status: "failed", error: bounded(properties.error ?? properties) },
         { turnId },
       );
-      this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
       this.#events.close();
     }
   }
@@ -3027,6 +3234,13 @@ const RESTRICTED_TERMINAL_PAPERCLIP_TOOLS = [
   PRP_BLOCK_TOOL_NAME,
 ] as const;
 
+const RESTRICTED_DENIED_NATIVE_TOOLS = [
+  "bash",
+  "webfetch",
+  "websearch",
+  "task",
+] as const;
+
 function restrictedPermissionRules(): Record<string, string> {
   // OpenCode evaluates the last matching rule, so the blanket ask and the
   // paperclip denies precede the explicit read-only allows. "*" is never allow.
@@ -3044,6 +3258,10 @@ function restrictedPermissionRules(): Record<string, string> {
   }
   rules.question = "allow";
   rules.external_directory = "deny";
+  // TAX-470 H4: no tool that can spawn a process, reach the network, or start
+  // a subagent. A shell could read /proc/<opencode pid>/environ or the private
+  // config regardless of workspace checks (same OS uid).
+  for (const tool of RESTRICTED_DENIED_NATIVE_TOOLS) rules[tool] = "deny";
   return rules;
 }
 
@@ -3156,21 +3374,71 @@ function stringArray(value: unknown): string[] | null {
   return [...(value as string[])];
 }
 
+/**
+ * TAX-470 H1: every target is frozen as the realpath of its deepest existing
+ * ancestor plus the remaining non-existent suffix (dangling symlinks are
+ * followed), so a changed ancestor symlink changes the frozen value even when
+ * the leaf does not exist yet. Never null.
+ */
 async function resolvePermissionTargets(
   cwd: string,
   patterns: readonly string[],
-): Promise<Array<{ pattern: string; resolvedPath: string | null }>> {
+): Promise<Array<{ pattern: string; resolvedPath: string }>> {
   return Promise.all(
-    patterns.map(async (pattern) => {
-      try {
-        return { pattern, resolvedPath: await realpath(resolve(cwd, pattern)) };
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code === "ENOENT" || code === "ENOTDIR")
-          return { pattern, resolvedPath: null };
-        throw error;
-      }
-    }),
+    patterns.map(async (pattern) => ({
+      pattern,
+      resolvedPath: await resolveTargetPath(resolve(cwd, pattern)),
+    })),
+  );
+}
+
+const ARGUMENT_PATH_KEYS = ["filePath", "filepath", "file_path", "path"];
+
+/** Paths a native tool actually acts on, resolved like OpenCode (vs cwd). */
+async function resolveArgumentTargets(
+  cwd: string,
+  toolArguments: Record<string, unknown> | null | undefined,
+): Promise<string[]> {
+  if (!toolArguments) return [];
+  const paths = ARGUMENT_PATH_KEYS.map((key) => toolArguments[key]).filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  );
+  return Promise.all(paths.map((path) => resolveTargetPath(resolve(cwd, path))));
+}
+
+async function resolveTargetPath(absolute: string, hops = 0): Promise<string> {
+  if (hops > 40) throw new Error("permission target has too many symlinks");
+  const parsed = parsePath(absolute);
+  const parts = absolute
+    .slice(parsed.root.length)
+    .split(sep)
+    .filter((part) => part.length > 0);
+  let current = parsed.root;
+  for (let index = 0; index < parts.length; index += 1) {
+    const next = join(current, parts[index]!);
+    let info;
+    try {
+      info = await lstat(next);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR")
+        return join(next, ...parts.slice(index + 1));
+      throw error;
+    }
+    if (info.isSymbolicLink()) {
+      current = await resolveTargetPath(
+        resolve(current, await readlink(next)),
+        hops + 1,
+      );
+    } else current = next;
+  }
+  return current;
+}
+
+function isWithin(path: string, root: string): boolean {
+  return (
+    path === root ||
+    path.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)
   );
 }
 

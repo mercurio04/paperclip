@@ -1,5 +1,7 @@
+import { execFileSync } from "node:child_process";
 import {
   chmod,
+  symlink,
   lstat,
   mkdir,
   mkdtemp,
@@ -1883,6 +1885,8 @@ describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
       replies: [] as Array<{ id: string; body: unknown }>,
       aborts: 0,
       messageFetches: 0,
+      childPid: 0,
+      beforePermissionRead: null as (() => Promise<void>) | null,
     };
     const fetcher: typeof globalThis.fetch = async (input, init) => {
       const url = new URL(String(input));
@@ -1908,8 +1912,10 @@ describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
       if (method === "POST" && url.pathname === "/session")
         return json({ id: sessionId });
       if (method === "GET" && url.pathname === "/question") return json([]);
-      if (method === "GET" && url.pathname === "/permission")
+      if (method === "GET" && url.pathname === "/permission") {
+        await state.beforePermissionRead?.();
         return json(state.live);
+      }
       if (
         method === "GET" &&
         url.pathname === `/session/${sessionId}/message/msg_1`
@@ -1953,6 +1959,9 @@ describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
       model,
       permissionProfile: "restricted_v1",
       llamaCppBaseUrl: baseUrl,
+      onSpawn: async ({ pid }) => {
+        state.childPid = pid;
+      },
       runtimeDirectory: root,
       command: fixture,
       fetch: fetcher,
@@ -1991,10 +2000,251 @@ describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
       emitNative,
       events,
       next,
+      dropSse: () => controller!.error(new Error("QA lost SSE")),
       configPath: join(root, normalizedSessionId, "config", "opencode", "opencode.json"),
       environmentPath: join(root, normalizedSessionId, "data", "fake-environment.json"),
     };
   }
+
+  // QA TAX-470 H4 (original OS-level probe). A raw process running as the same
+  // OS uid as OpenCode can always read /proc/<pid>/environ of the OpenCode
+  // server (OPENCODE_SERVER_PASSWORD is env-only in OpenCode 1.18.29) and any
+  // file that process can read. No in-process policy can prevent that; the only
+  // full mitigation is OS-user separation between the control plane and the
+  // tool-executing uid (handoff, out of scope for the driver). restricted_v1
+  // instead removes every tool that can spawn such a process (bash/task deny)
+  // and rejects any permission whose resolved target escapes the workspace —
+  // asserted by "QA restricted tool surface cannot reach the control
+  // credential" below. Kept skipped, not deleted, so the residual is visible.
+  it.skip("QA hides control credentials from same-uid shell processes (needs OS-user separation)", async () => {
+    const h = await harness();
+    const result = JSON.parse(
+      execFileSync(
+        process.execPath,
+        [
+          "-e",
+          `
+      const fs=require('fs');
+      const env=fs.readFileSync('/proc/'+process.argv[1]+'/environ');
+      const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
+      process.stdout.write(JSON.stringify({
+        controlPasswordReadable:env.includes(Buffer.from('OPENCODE_SERVER_PASSWORD=')),
+        bridgeCredentialReadable:typeof config.mcp.paperclip.headers.Authorization==='string'
+      }));`,
+          String(h.state.childPid),
+          h.configPath,
+        ],
+        { encoding: "utf8", env: { PATH: process.env.PATH } },
+      ),
+    );
+    await h.session.close({ reason: "QA complete" });
+    expect(result).toEqual({
+      controlPasswordReadable: false,
+      bridgeCredentialReadable: false,
+    });
+  });
+
+  it("QA blocks changed symlink ancestor for a nonexistent write target", async () => {
+    const h = await harness();
+    await mkdir(join(h.workspace, "before"));
+    await mkdir(join(h.workspace, "after"));
+    await symlink(join(h.workspace, "before"), join(h.workspace, "missing"));
+    h.state.toolInput = { filePath: "missing/file.txt", content: "x" };
+    const { turnId } = await h.session.startTurn({
+      message: { role: "user", text: "edit" },
+    });
+    const created = await h.next("runtime_request.created");
+    const contract = (created?.payload as any).request.permission;
+    await rm(join(h.workspace, "missing"));
+    await symlink(join(h.workspace, "after"), join(h.workspace, "missing"));
+    await h.session.resolveRuntimeRequest!({
+      requestId: permissionId,
+      turnId,
+      resolution: {
+        action: "permission_decision",
+        decision: "once",
+        contractSha256: contract.contractSha256,
+      },
+    });
+    const observed = structuredClone(h.state.replies);
+    await h.session.close({ reason: "QA complete" });
+    expect(observed).toEqual([{ id: permissionId, body: { reply: "reject" } }]);
+  });
+
+  it("QA prevents a once dispatch after terminal cancellation wins during live validation", async () => {
+    const h = await harness();
+    const { turnId } = await h.session.startTurn({
+      message: { role: "user", text: "edit" },
+    });
+    const created = await h.next("runtime_request.created");
+    const sha = (created?.payload as any).request.permission.contractSha256;
+    let release!: () => void;
+    let entered!: () => void;
+    const enteredPromise = new Promise<void>((r) => (entered = r));
+    const gate = new Promise<void>((r) => (release = r));
+    h.state.beforePermissionRead = async () => {
+      entered();
+      await gate;
+    };
+    const approval = h.session.resolveRuntimeRequest!({
+      requestId: permissionId,
+      turnId,
+      resolution: { action: "permission_decision", decision: "once", contractSha256: sha },
+    });
+    await enteredPromise;
+    h.emitNative({
+      type: "session.error",
+      properties: {
+        sessionID: sessionId,
+        error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+      },
+    });
+    await h.next("turn.cancelled");
+    release();
+    await approval;
+    const observed = structuredClone(h.state.replies);
+    await h.session.close({ reason: "QA complete" });
+    expect(observed.some((r) => (r.body as any).reply === "once")).toBe(false);
+  });
+
+  it("QA invalidates a pending approval after loss of SSE", async () => {
+    const h = await harness();
+    const { turnId } = await h.session.startTurn({
+      message: { role: "user", text: "edit" },
+    });
+    const created = await h.next("runtime_request.created");
+    const sha = (created?.payload as any).request.permission.contractSha256;
+    h.dropSse();
+    await new Promise((r) => setTimeout(r, 100));
+    await h.session
+      .resolveRuntimeRequest!({
+        requestId: permissionId,
+        turnId,
+        resolution: { action: "permission_decision", decision: "once", contractSha256: sha },
+      })
+      .catch(() => {});
+    const observed = structuredClone(h.state.replies);
+    await h.session.close({ reason: "QA complete" });
+    expect(observed.some((r) => (r.body as any).reply === "once")).toBe(false);
+  });
+
+  it.each([
+    { name: "/proc environ of the OpenCode server", target: "environ" },
+    { name: "private generated opencode.json", target: "config" },
+    { name: "dangling symlink outside the workspace", target: "dangling" },
+  ])(
+    "QA restricted tool surface cannot reach the control credential: $name",
+    async ({ target }) => {
+      const h = await harness();
+      const config = JSON.parse(await readFile(h.configPath, "utf8"));
+      // No process-spawning, network, or subagent tool exists to bypass the
+      // per-path checks (the raw same-uid OS probe above stays skipped).
+      for (const tool of ["bash", "webfetch", "websearch", "task"])
+        expect(config.permission[tool]).toBe("deny");
+      expect(config.permission["*"]).toBe("ask");
+      expect(config.permission.external_directory).toBe("deny");
+      expect(h.state.childPid).toBeGreaterThan(0);
+      const destination =
+        target === "environ"
+          ? `/proc/${h.state.childPid}/environ`
+          : target === "config"
+            ? h.configPath
+            : join(tmpdir(), `paperclip-qa-outside-${process.pid}`, "new.txt");
+      await symlink(destination, join(h.workspace, "link"));
+      h.asked.permission = target === "dangling" ? "edit" : "read";
+      h.asked.patterns = ["link"];
+      h.state.toolInput = { filePath: "link" };
+      h.state.live = [structuredClone(h.asked)];
+      await h.session.startTurn({ message: { role: "user", text: "read" } });
+      const diagnostic = await h.next("harness.diagnostic");
+      expect(diagnostic?.payload).toMatchObject({
+        code: "permission_target_outside_workspace",
+        providerRequestId: permissionId,
+      });
+      for (let attempt = 0; attempt < 50 && h.state.replies.length === 0; attempt += 1)
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+      expect(h.state.replies).toEqual([
+        { id: permissionId, body: { reply: "reject" } },
+      ]);
+      expect(
+        h.events.some((event) => event.eventType === "runtime_request.created"),
+      ).toBe(false);
+      expect(h.session.pendingRuntimeRequests?.()).toEqual([]);
+      // The suite cleanup chmods recursively and would follow this link.
+      await rm(join(h.workspace, "link"));
+      await h.session.close({ reason: "escape test complete" });
+    },
+  );
+
+  it("emits typed diagnostics when SSE loss invalidates a pending permission and fails the turn", async () => {
+    const h = await harness();
+    const { turnId } = await h.session.startTurn({
+      message: { role: "user", text: "edit" },
+    });
+    const created = await h.next("runtime_request.created");
+    const sha = (created?.payload as any).request.permission.contractSha256;
+    h.dropSse();
+    const failed = await h.next("turn.failed");
+    expect(failed?.payload).toMatchObject({ error: { code: "opencode_sse_lost" } });
+    expect(h.events).toContainEqual(
+      expect.objectContaining({
+        eventType: "harness.diagnostic",
+        payload: expect.objectContaining({
+          code: "permission_invalidated_sse_lost",
+          providerRequestId: permissionId,
+        }),
+      }),
+    );
+    expect(h.events).toContainEqual(
+      expect.objectContaining({
+        eventType: "runtime_request.cancelled",
+        payload: expect.objectContaining({ reason: "permission_invalidated_sse_lost" }),
+      }),
+    );
+    for (let attempt = 0; attempt < 50 && h.state.replies.length === 0; attempt += 1)
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+    expect(h.state.replies).toEqual([{ id: permissionId, body: { reply: "reject" } }]);
+    await expect(
+      h.session.resolveRuntimeRequest!({
+        requestId: permissionId,
+        turnId,
+        resolution: { action: "permission_decision", decision: "once", contractSha256: sha },
+      }),
+    ).rejects.toThrow(/no longer pending/);
+    const transcript = await h.session.transcript();
+    expect(transcript.events).toContainEqual(
+      expect.objectContaining({
+        payload: expect.objectContaining({ code: "permission_decision_after_terminal" }),
+      }),
+    );
+    expect(h.state.replies).toEqual([{ id: permissionId, body: { reply: "reject" } }]);
+    await h.session.close({ reason: "sse test complete" });
+  });
+
+  it("settles a pending permission with exactly one native reject on terminal cancellation", async () => {
+    const h = await harness();
+    await h.session.startTurn({ message: { role: "user", text: "edit" } });
+    await h.next("runtime_request.created");
+    h.emitNative({
+      type: "session.error",
+      properties: {
+        sessionID: sessionId,
+        error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+      },
+    });
+    await h.next("turn.cancelled");
+    expect(h.events).toContainEqual(
+      expect.objectContaining({
+        eventType: "runtime_request.cancelled",
+        payload: expect.objectContaining({ reason: "turn_cancelled" }),
+      }),
+    );
+    for (let attempt = 0; attempt < 50 && h.state.replies.length === 0; attempt += 1)
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+    expect(h.state.replies).toEqual([{ id: permissionId, body: { reply: "reject" } }]);
+    expect(h.session.pendingRuntimeRequests?.()).toEqual([]);
+    await h.session.close({ reason: "terminal test complete" });
+  });
 
   it("freezes a typed, hash-bound request with fetched arguments and replies once when live state matches", async () => {
     const h = await harness();
@@ -2046,7 +2296,11 @@ describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
       cwd: workspaceReal,
       targets: [
         { pattern: "notes.txt", resolvedPath: join(workspaceReal, "notes.txt") },
-        { pattern: "missing/file.txt", resolvedPath: null },
+        // TAX-470 H1: deepest existing ancestor realpath + missing suffix.
+        {
+          pattern: "missing/file.txt",
+          resolvedPath: join(workspaceReal, "missing", "file.txt"),
+        },
       ],
       policy: { profile: "restricted_v1", permissionDefault: "ask" },
     });
@@ -2286,6 +2540,8 @@ describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
     expect(Object.keys(config.provider)).toEqual(["llamacpp"]);
     expect(config.permission["*"]).toBe("ask");
     expect(config.permission.external_directory).toBe("deny");
+    for (const tool of ["bash", "webfetch", "websearch", "task"])
+      expect(config.permission[tool]).toBe("deny");
     expect(config.permission.question).toBe("allow");
     expect(config.permission["paperclip_*"]).toBe("deny");
     expect(config.permission["mcp__paperclip__*"]).toBe("deny");
