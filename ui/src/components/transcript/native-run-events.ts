@@ -152,13 +152,14 @@ export interface NativePermissionContract {
   providerSessionId: string | null;
   providerRequestId: string | null;
   permission: string;
-  tool: { messageId: string; callId: string } | null;
+  /** Frozen tool identity (TAX-452 H9/H10): never null in a valid contract. */
+  tool: { name: string; messageId: string; callId: string };
   patterns: string[];
   always: string[];
   cwd: string | null;
   targets: Array<{ pattern: string; resolvedPath: string | null }>;
-  /** Pretty-printed JSON of the tool arguments, or null when the contract has no tool. */
-  argumentsJson: string | null;
+  /** Pretty-printed JSON of the complete tool arguments (always an object). */
+  argumentsJson: string;
   /** Pretty-printed JSON of the provider metadata, or null when empty/absent. */
   metadataJson: string | null;
   policy: { profile: string; permissionDefault: string } | null;
@@ -217,14 +218,14 @@ export function normalizePermissionContract(
   const always = stringList(contract.always ?? []);
   if (!patterns || !always) return null;
 
-  let tool: NativePermissionContract["tool"] = null;
-  if (contract.tool !== null && contract.tool !== undefined) {
-    const rawTool = record(contract.tool);
-    const messageId = text(rawTool?.messageId);
-    const callId = text(rawTool?.callId);
-    if (!messageId || !callId) return null;
-    tool = { messageId, callId };
-  }
+  // TAX-452 H9/H10: a contract without the exact tool call (name included)
+  // and its complete arguments is malformed; fail closed.
+  const rawTool = record(contract.tool);
+  const toolName = text(rawTool?.name);
+  const messageId = text(rawTool?.messageId);
+  const callId = text(rawTool?.callId);
+  if (!toolName || !messageId || !callId) return null;
+  const tool: NativePermissionContract["tool"] = { name: toolName, messageId, callId };
 
   if (contract.targets !== undefined && !Array.isArray(contract.targets)) return null;
   const targets: NativePermissionContract["targets"] = [];
@@ -239,8 +240,9 @@ export function normalizePermissionContract(
     targets.push({ pattern, resolvedPath: typeof resolvedPath === "string" ? resolvedPath : null });
   }
 
-  const rawArguments = contract.arguments;
-  if (rawArguments !== null && rawArguments !== undefined && !record(rawArguments)) return null;
+  const rawArguments = record(contract.arguments);
+  const argumentsJson = rawArguments ? prettyJson(rawArguments) : null;
+  if (argumentsJson === null) return null;
   const metadata = record(contract.metadata);
   const rawPolicy = record(contract.policy);
   const policyProfile = text(rawPolicy?.profile);
@@ -264,7 +266,7 @@ export function normalizePermissionContract(
     always,
     cwd: text(contract.cwd),
     targets,
-    argumentsJson: record(rawArguments) ? prettyJson(rawArguments) : null,
+    argumentsJson,
     metadataJson: metadata && Object.keys(metadata).length > 0 ? prettyJson(metadata) : null,
     policy: policyProfile && permissionDefault
       ? { profile: policyProfile, permissionDefault }

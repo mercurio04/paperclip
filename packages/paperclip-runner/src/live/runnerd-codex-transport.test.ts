@@ -8910,15 +8910,17 @@ it.each(["claude", "codex"] as const)("keeps the explicitly assigned gateway in 
   expect(environment.DATABASE_URL).toBeUndefined();
 });
 
-function typedPermissionRequest(): Record<string, unknown> {
-  const unsigned = {
+function typedPermissionRequest(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const unsigned: Record<string, unknown> = {
     schema: "paperclip.opencode_permission_contract.v1",
     provider: "opencode",
     providerVersion: "1.18.29",
     providerSessionId: "ses_1",
     providerRequestId: "per_1",
     permission: "edit",
-    tool: { messageId: "msg_1", callId: "call_1" },
+    tool: { name: "write", messageId: "msg_1", callId: "call_1" },
     patterns: ["notes.txt"],
     always: ["*"],
     metadata: { filepath: "notes.txt" },
@@ -8926,6 +8928,7 @@ function typedPermissionRequest(): Record<string, unknown> {
     cwd: "/work",
     targets: [{ pattern: "notes.txt", resolvedPath: "/work/notes.txt" }],
     policy: { profile: "restricted_v1", permissionDefault: "ask" },
+    ...overrides,
   };
   const canonical = (value: unknown): string =>
     Array.isArray(value)
@@ -8975,6 +8978,27 @@ it.each([
   const request = typedPermissionRequest();
   mutate(request as Record<string, any>);
   expect(bridgedPermissionRequestParams(request, "thread-1", "turn-1")).toBeNull();
+});
+
+// TAX-452 H9/H10: correctly signed contracts that still cannot be approved.
+it.each([
+  ["a null tool and null arguments", { tool: null, arguments: null }],
+  ["null arguments", { arguments: null }],
+  ["array arguments", { arguments: [] }],
+  ["a tool without name", { tool: { messageId: "msg_1", callId: "call_1" } }],
+  ["a tool with an empty name", { tool: { name: "", messageId: "msg_1", callId: "call_1" } }],
+  ["a tool with an extra key", { tool: { name: "write", messageId: "m", callId: "c", x: 1 } }],
+  ["an unknown permission and tool", {
+    permission: "unrecognized_mutation",
+    tool: { name: "unrecognized_mutation", messageId: "m", callId: "c" },
+  }],
+  ["an edit permission from bash", { tool: { name: "bash", messageId: "m", callId: "c" } }],
+  ["a read permission from write", { permission: "read" }],
+  ["a list permission", { permission: "list", tool: { name: "list", messageId: "m", callId: "c" } }],
+])("rejects a signed typed permission contract with %s", (_name, overrides) => {
+  expect(
+    bridgedPermissionRequestParams(typedPermissionRequest(overrides), "thread-1", "turn-1"),
+  ).toBeNull();
 });
 
 it("maps permission resolutions onto the PRP permission decision response", () => {

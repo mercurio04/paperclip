@@ -116,6 +116,43 @@ export type PaperclipPermissionDecision =
   (typeof PAPERCLIP_PERMISSION_DECISIONS)[number];
 
 /**
+ * TAX-452 H9: the only (OpenCode permission, tool id) pairs restricted_v1 may
+ * surface for approval. Verified against the OpenCode 1.18.29 binary: the
+ * `edit`, `write` and `apply_patch` tools ask the `edit` permission; `read`,
+ * `glob` and `grep` ask their own name. 1.18.29 registers no `list` tool and
+ * no `multiedit`/`patch` tool, so they are absent (fail closed). Any other
+ * permission, tool, or mismatched pair is rejected natively and never shown.
+ * Mirrored by `RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS` in the Rust runnerd
+ * and the server authority; the shared permission fixture pins all three.
+ */
+export const RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS: Readonly<
+  Record<string, readonly string[]>
+> = Object.freeze({
+  edit: Object.freeze(["apply_patch", "edit", "write"]),
+  glob: Object.freeze(["glob"]),
+  grep: Object.freeze(["grep"]),
+  read: Object.freeze(["read"]),
+});
+
+export function isRestrictedV1ApprovablePermissionTool(
+  permission: unknown,
+  toolName: unknown,
+): boolean {
+  if (typeof permission !== "string" || typeof toolName !== "string")
+    return false;
+  if (
+    !Object.prototype.hasOwnProperty.call(
+      RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS,
+      permission,
+    )
+  )
+    return false;
+  return RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS[permission]!.includes(
+    toolName,
+  );
+}
+
+/**
  * Frozen OpenCode permission contract (TAX-452 §1). The hash covers the
  * canonical JSON of every field except `contractSha256` itself.
  */
@@ -126,11 +163,13 @@ export interface PaperclipOpenCodePermissionContract {
   providerSessionId: string;
   providerRequestId: string;
   permission: string;
-  tool: { messageId: string; callId: string } | null;
+  /** Frozen identity of the native tool call; `name` is the tool part's id. */
+  tool: { name: string; messageId: string; callId: string };
   patterns: string[];
   always: string[];
   metadata: Record<string, unknown>;
-  arguments: Record<string, unknown> | null;
+  /** Complete input of the tool part; always an object (TAX-452 H10). */
+  arguments: Record<string, unknown>;
   cwd: string;
   targets: Array<{ pattern: string; resolvedPath: string | null }>;
   policy: { profile: "restricted_v1"; permissionDefault: "ask" };

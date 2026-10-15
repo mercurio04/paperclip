@@ -64,23 +64,19 @@
             "providerRequestId": { "type": "string", "minLength": 1, "maxLength": 256 },
             "permission": { "type": "string", "minLength": 1, "maxLength": 160 },
             "tool": {
-              "oneOf": [
-                { "type": "null" },
-                {
-                  "type": "object",
-                  "required": ["messageId", "callId"],
-                  "properties": {
-                    "messageId": { "type": "string", "minLength": 1, "maxLength": 256 },
-                    "callId": { "type": "string", "minLength": 1, "maxLength": 256 }
-                  },
-                  "additionalProperties": false
-                }
-              ]
+              "type": "object",
+              "required": ["name", "messageId", "callId"],
+              "properties": {
+                "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+                "messageId": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "callId": { "type": "string", "minLength": 1, "maxLength": 256 }
+              },
+              "additionalProperties": false
             },
             "patterns": { "type": "array", "items": { "type": "string" } },
             "always": { "type": "array", "items": { "type": "string" } },
             "metadata": { "type": "object" },
-            "arguments": { "type": ["object", "null"] },
+            "arguments": { "type": "object" },
             "cwd": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^/" },
             "targets": {
               "type": "array",

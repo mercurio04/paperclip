@@ -46,6 +46,7 @@ import type {
 } from "../contracts/harness-driver.js";
 import {
   PAPERCLIP_OPENCODE_PERMISSION_CONTRACT_SCHEMA_V1,
+  isRestrictedV1ApprovablePermissionTool,
   PAPERCLIP_PERMISSION_DECISION_SCHEMA_V1,
   PAPERCLIP_RUNTIME_REQUEST_PERMISSION_SCHEMA_V1,
 } from "../contracts/harness-driver.js";
@@ -913,6 +914,29 @@ function canonicalPermissionJson(value: unknown): string {
   return JSON.stringify(value) ?? "undefined";
 }
 
+function isPlainPermissionObject(
+  value: unknown,
+): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** TAX-452 H9/H10: `tool` is exactly `{name, messageId, callId}`, never null. */
+function isFrozenPermissionTool(value: unknown): boolean {
+  if (!isPlainPermissionObject(value)) return false;
+  const keys = Object.keys(value).sort();
+  return (
+    keys.join(",") === "callId,messageId,name" &&
+    keys.every((key) => {
+      const entry = value[key];
+      return (
+        typeof entry === "string" &&
+        entry.length > 0 &&
+        entry.length <= (key === "name" ? 160 : 256)
+      );
+    })
+  );
+}
+
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
 }
@@ -954,7 +978,13 @@ export function bridgedPermissionRequestParams(
     typeof permission.contractSha256 !== "string" ||
     !/^[0-9a-f]{64}$/.test(permission.contractSha256) ||
     !isStringArray(permission.patterns) ||
-    !isStringArray(permission.always)
+    !isStringArray(permission.always) ||
+    !isFrozenPermissionTool(permission.tool) ||
+    !isPlainPermissionObject(permission.arguments) ||
+    !isRestrictedV1ApprovablePermissionTool(
+      permission.permission,
+      record(permission.tool).name,
+    )
   )
     return null;
   const { contractSha256, ...unsigned } = permission;

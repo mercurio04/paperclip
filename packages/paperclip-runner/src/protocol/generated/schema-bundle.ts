@@ -3040,31 +3040,30 @@ export const requestSchema = {
               "maxLength": 160
             },
             "tool": {
-              "oneOf": [
-                {
-                  "type": "null"
+              "type": "object",
+              "required": [
+                "name",
+                "messageId",
+                "callId"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 160
                 },
-                {
-                  "type": "object",
-                  "required": [
-                    "messageId",
-                    "callId"
-                  ],
-                  "properties": {
-                    "messageId": {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 256
-                    },
-                    "callId": {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 256
-                    }
-                  },
-                  "additionalProperties": false
+                "messageId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "callId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
                 }
-              ]
+              },
+              "additionalProperties": false
             },
             "patterns": {
               "type": "array",
@@ -3082,10 +3081,7 @@ export const requestSchema = {
               "type": "object"
             },
             "arguments": {
-              "type": [
-                "object",
-                "null"
-              ]
+              "type": "object"
             },
             "cwd": {
               "type": "string",

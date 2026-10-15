@@ -732,13 +732,12 @@ function RuntimePermissionContract({
         <code className="font-mono">{contract.permission}</code>
       </PermissionContractField>
       <PermissionContractField label="Tool">
-        {contract.tool ? (
-          <code className="font-mono text-xs">
-            {contract.tool.messageId} / {contract.tool.callId}
-          </code>
-        ) : (
-          <span className="text-muted-foreground">No associated tool</span>
-        )}
+        <code className="font-mono" data-testid="task-chat-runtime-permission-tool-name">
+          {contract.tool.name}
+        </code>{" "}
+        <code className="font-mono text-xs text-muted-foreground">
+          {contract.tool.messageId} / {contract.tool.callId}
+        </code>
       </PermissionContractField>
       <PermissionContractField label="Patterns">
         {contract.patterns.length > 0 ? (
@@ -784,16 +783,12 @@ function RuntimePermissionContract({
         )}
       </PermissionContractField>
       <PermissionContractField label="Arguments">
-        {contract.argumentsJson !== null ? (
-          <pre
-            className="max-h-64 overflow-auto whitespace-pre rounded-sm bg-muted/35 p-2 font-mono text-xs"
-            data-testid="task-chat-runtime-permission-arguments"
-          >
-            {contract.argumentsJson}
-          </pre>
-        ) : (
-          <span className="text-muted-foreground">No arguments</span>
-        )}
+        <pre
+          className="max-h-64 overflow-auto whitespace-pre rounded-sm bg-muted/35 p-2 font-mono text-xs"
+          data-testid="task-chat-runtime-permission-arguments"
+        >
+          {contract.argumentsJson}
+        </pre>
       </PermissionContractField>
       {contract.metadataJson !== null ? (
         <details>

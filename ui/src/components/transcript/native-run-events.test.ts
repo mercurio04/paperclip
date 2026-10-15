@@ -893,7 +893,7 @@ describe("nativeRunEventsToTranscript", () => {
           providerSessionId: "ses_1",
           providerRequestId: "per_1",
           permission: "edit",
-          tool: { messageId: "msg_1", callId: "call_1" },
+          tool: { name: "edit", messageId: "msg_1", callId: "call_1" },
           patterns: ["src/a.ts"],
           always: ["src/*"],
           metadata: { diff: "+x" },
@@ -929,7 +929,7 @@ describe("nativeRunEventsToTranscript", () => {
         providerSessionId: "ses_1",
         providerRequestId: "per_1",
         permission: "edit",
-        tool: { messageId: "msg_1", callId: "call_1" },
+        tool: { name: "edit", messageId: "msg_1", callId: "call_1" },
         patterns: ["src/a.ts"],
         always: ["src/*"],
         cwd: "/work/repo",
@@ -967,13 +967,12 @@ describe("nativeRunEventsToTranscript", () => {
       });
     });
 
-    it("accepts a tool-less contract with null arguments and unresolved targets", () => {
+    it("accepts unresolved targets but keeps the frozen tool identity", () => {
       const contract = normalizePermissionContract(
-        permissionRequest({}, { tool: null, arguments: null, targets: [{ pattern: "*", resolvedPath: null }] }),
+        permissionRequest({}, { targets: [{ pattern: "*", resolvedPath: null }] }),
       );
       expect(contract).toMatchObject({
-        tool: null,
-        argumentsJson: null,
+        tool: { name: "edit", messageId: "msg_1", callId: "call_1" },
         targets: [{ pattern: "*", resolvedPath: null }],
       });
     });
@@ -985,6 +984,10 @@ describe("nativeRunEventsToTranscript", () => {
       ["missing permission name", {}, { permission: 42 }],
       ["non-string patterns", {}, { patterns: [1] }],
       ["malformed tool", {}, { tool: { messageId: "m" } }],
+      // TAX-452 H9/H10: tool identity and arguments are mandatory.
+      ["tool-less contract", {}, { tool: null, arguments: null }],
+      ["null arguments", {}, { arguments: null }],
+      ["nameless tool", {}, { tool: { messageId: "msg_1", callId: "call_1" } }],
       ["malformed targets", {}, { targets: "x" }],
       ["array arguments", {}, { arguments: [1, 2] }],
       ["no supported decisions", { decisions: ["always"] }, {}],

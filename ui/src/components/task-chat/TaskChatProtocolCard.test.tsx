@@ -561,7 +561,7 @@ describe("TaskChatProtocolCard", () => {
           providerSessionId: "ses_1",
           providerRequestId: "per_1",
           permission: "edit",
-          tool: { messageId: "msg_1", callId: "call_1" },
+          tool: { name: "write", messageId: "msg_1", callId: "call_1" },
           patterns: ["src/a.ts"],
           always: ["src/*"],
           cwd: "/work/repo",
@@ -584,6 +584,10 @@ describe("TaskChatProtocolCard", () => {
       );
       expect(contract?.textContent).toContain("edit");
       expect(contract?.textContent).toContain("msg_1 / call_1");
+      expect(
+        container.querySelector('[data-testid="task-chat-runtime-permission-tool-name"]')
+          ?.textContent,
+      ).toBe("write");
       expect(contract?.textContent).toContain("src/a.ts");
       expect(contract?.textContent).toContain("/work/repo");
       expect(contract?.textContent).toContain("/work/repo/src/a.ts");

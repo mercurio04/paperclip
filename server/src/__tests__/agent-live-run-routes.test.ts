@@ -1849,7 +1849,7 @@ describe("agent live run routes", () => {
       providerSessionId: "ses_1",
       providerRequestId: "per_1",
       permission: "edit",
-      tool: { messageId: "msg_1", callId: "call_1" },
+      tool: { name: "edit", messageId: "msg_1", callId: "call_1" },
       patterns: ["src/a.ts"],
       always: ["*"],
       metadata: {},

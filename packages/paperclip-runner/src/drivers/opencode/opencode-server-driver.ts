@@ -49,7 +49,9 @@ import {
   PAPERCLIP_RUNTIME_REQUEST_SCHEMA_V2,
   harnessRuntimeInputExpiredOutcome,
   harnessRuntimeRequestOutcome,
+  isRestrictedV1ApprovablePermissionTool,
   parseHarnessRuntimeRequestResolution,
+  RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS,
   parsePaperclipQuestionSet,
 } from "../../contracts/harness-driver.js";
 import type {
@@ -1257,7 +1259,10 @@ class OpenCodeHarnessSession implements HarnessSession {
         this.#emit(
           "harness.diagnostic",
           {
-            code: "permission_contract_unrepresentable",
+            code:
+              error instanceof PermissionUnknownToolError
+                ? "permission_unknown_tool"
+                : "permission_contract_unrepresentable",
             adapter: "opencode-server",
             providerRequestId: requestId,
             reason: redact(
@@ -1382,23 +1387,41 @@ class OpenCodeHarnessSession implements HarnessSession {
     if (sessionId !== this.#providerSessionId)
       throw new Error("permission sessionID does not match the session");
     if (!permission) throw new Error("permission name is missing");
+    // TAX-452 H9: only the documented (permission, tool) pairs are approvable.
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS,
+        permission,
+      )
+    )
+      throw new PermissionUnknownToolError(
+        `permission ${JSON.stringify(permission.slice(0, 160))} is not approvable in restricted_v1`,
+      );
     const patterns = stringArray(properties.patterns);
     const always = stringArray(properties.always);
     if (patterns === null) throw new Error("permission patterns are invalid");
     if (always === null) throw new Error("permission always list is invalid");
     if (!isRecord(properties.metadata))
       throw new Error("permission metadata is missing");
-    let tool: PaperclipOpenCodePermissionContract["tool"] = null;
-    if (properties.tool !== undefined && properties.tool !== null) {
-      const nativeTool = record(properties.tool);
-      const messageId = text(nativeTool.messageID);
-      const callId = text(nativeTool.callID);
-      if (!messageId || !callId)
-        throw new Error("permission tool reference is incomplete");
-      tool = { messageId, callId };
-    }
-    const toolArguments =
-      tool === null ? null : await this.#fetchToolArguments(tool);
+    // TAX-452 H10: without the exact tool call and its complete arguments
+    // there is nothing a human could approve. Never freeze a partial contract.
+    if (!isRecord(properties.tool))
+      throw new Error("permission tool reference is missing");
+    const messageId = text(properties.tool.messageID);
+    const callId = text(properties.tool.callID);
+    if (!messageId || !callId)
+      throw new Error("permission tool reference is incomplete");
+    const toolPart = await this.#fetchToolPart({ messageId, callId });
+    if (!isRestrictedV1ApprovablePermissionTool(permission, toolPart.name))
+      throw new PermissionUnknownToolError(
+        `tool ${JSON.stringify(toolPart.name.slice(0, 160))} is not approvable for permission ${JSON.stringify(permission.slice(0, 160))}`,
+      );
+    const tool: PaperclipOpenCodePermissionContract["tool"] = {
+      name: toolPart.name,
+      messageId,
+      callId,
+    };
+    const toolArguments = toolPart.arguments;
     const cwd = await realpath(this.#workingDirectory);
     const targets = await resolvePermissionTargets(cwd, patterns);
     const unsigned = jsonClean({
@@ -1511,10 +1534,10 @@ class OpenCodeHarnessSession implements HarnessSession {
     }
   }
 
-  async #fetchToolArguments(tool: {
+  async #fetchToolPart(tool: {
     messageId: string;
     callId: string;
-  }): Promise<Record<string, unknown>> {
+  }): Promise<{ name: string; arguments: Record<string, unknown> }> {
     const message = record(
       await api(
         this.#fetch,
@@ -1528,9 +1551,12 @@ class OpenCodeHarnessSession implements HarnessSession {
     );
     if (matches.length !== 1)
       throw new Error("permission tool part is missing or ambiguous");
+    const name = text(matches[0]!.tool);
+    if (!name || name.length > 160)
+      throw new Error("permission tool part has no tool name");
     const input = record(matches[0]!.state).input;
     if (!isRecord(input)) throw new Error("permission tool input is missing");
-    return jsonClean(input) as Record<string, unknown>;
+    return { name, arguments: jsonClean(input) as Record<string, unknown> };
   }
 
   /** TAX-452 §4: resolve one typed permission with exactly one native reply. */
@@ -1635,20 +1661,30 @@ class OpenCodeHarnessSession implements HarnessSession {
         canonicalJson(contract.patterns)
     )
       return false;
-    if (contract.tool !== null) {
-      const liveTool = record(live.tool);
-      if (
-        text(liveTool.messageID) !== contract.tool.messageId ||
-        text(liveTool.callID) !== contract.tool.callId
+    // TAX-452 H9/H10: the frozen tool identity and complete arguments are
+    // mandatory; re-verify the live tool part (name included) before `once`.
+    if (
+      !isRecord(contract.tool) ||
+      !isRecord(contract.arguments) ||
+      !isRestrictedV1ApprovablePermissionTool(
+        contract.permission,
+        contract.tool.name,
       )
-        return false;
-      const args = await this.#fetchToolArguments(contract.tool);
-      if (
-        sha256Hex(canonicalJson(args)) !==
-        sha256Hex(canonicalJson(contract.arguments))
-      )
-        return false;
-    } else if (live.tool !== undefined && live.tool !== null) return false;
+    )
+      return false;
+    const liveTool = record(live.tool);
+    if (
+      text(liveTool.messageID) !== contract.tool.messageId ||
+      text(liveTool.callID) !== contract.tool.callId
+    )
+      return false;
+    const livePart = await this.#fetchToolPart(contract.tool);
+    if (livePart.name !== contract.tool.name) return false;
+    if (
+      sha256Hex(canonicalJson(livePart.arguments)) !==
+      sha256Hex(canonicalJson(contract.arguments))
+    )
+      return false;
     const cwd = await realpath(this.#workingDirectory);
     if (cwd !== contract.cwd) return false;
     const targets = await resolvePermissionTargets(cwd, contract.patterns);
@@ -3498,6 +3534,9 @@ function bounded(value: unknown): Record<string, unknown> {
 function record(value: unknown): Record<string, unknown> {
   return isRecord(value) ? value : {};
 }
+/** TAX-452 H9: the permission or its tool part is outside the allowlist. */
+class PermissionUnknownToolError extends Error {}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

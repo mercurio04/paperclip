@@ -67,6 +67,49 @@ const PERMISSION_CONTRACT_KEYS = new Set([
 ]);
 
 /**
+ * TAX-452 H9: the only (OpenCode permission, tool id) pairs a restricted_v1
+ * contract may carry; anything else is non-actionable (fail closed). Verified
+ * against OpenCode 1.18.29 (`edit`/`write`/`apply_patch` ask `edit`; `read`,
+ * `glob`, `grep` ask their own name; no `list` tool is registered). Mirrors
+ * `RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS` in the runner driver and the
+ * Rust runnerd; the shared permission fixture pins all three.
+ */
+export const RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS: Readonly<
+  Record<string, readonly string[]>
+> = Object.freeze({
+  edit: Object.freeze(["apply_patch", "edit", "write"]),
+  glob: Object.freeze(["glob"]),
+  grep: Object.freeze(["grep"]),
+  read: Object.freeze(["read"]),
+});
+const PERMISSION_TOOL_KEYS = ["callId", "messageId", "name"] as const;
+
+export function isRestrictedV1ApprovablePermissionTool(
+  permission: unknown,
+  toolName: unknown,
+): boolean {
+  return typeof permission === "string"
+    && typeof toolName === "string"
+    && Object.prototype.hasOwnProperty.call(RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS, permission)
+    && RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS[permission]!.includes(toolName);
+}
+
+/** TAX-452 H9/H10: `tool` is exactly `{name, messageId, callId}`, never null. */
+function isFrozenPermissionTool(value: unknown): value is Record<string, string> {
+  const tool = record(value);
+  if (!tool) return false;
+  const keys = Object.keys(tool).sort();
+  return keys.length === PERMISSION_TOOL_KEYS.length
+    && PERMISSION_TOOL_KEYS.every((key, index) => keys[index] === key)
+    && PERMISSION_TOOL_KEYS.every((key) => {
+      const entry = tool[key];
+      return typeof entry === "string"
+        && entry.length > 0
+        && entry.length <= (key === "name" ? 160 : 256);
+    });
+}
+
+/**
  * Typed permission decision: the `permission_decision` member of the runner
  * contract union in packages/paperclip-runner/src/contracts/harness-driver.ts.
  */
@@ -195,6 +238,11 @@ function canonicalPermissionRequest(
     || typeof contract.contractSha256 !== "string"
     || !CONTRACT_SHA256_PATTERN.test(contract.contractSha256)
     || typeof contract.permission !== "string"
+    // TAX-452 H10: the exact tool call and its complete arguments are required.
+    || !isFrozenPermissionTool(contract.tool)
+    || !record(contract.arguments)
+    // TAX-452 H9: defense in depth over the driver/runnerd allowlist.
+    || !isRestrictedV1ApprovablePermissionTool(contract.permission, record(contract.tool)?.name)
   ) return null;
   // A stored contract that no longer hashes to its own contractSha256 was
   // altered after the runner froze it (redaction, truncation, tampering): the

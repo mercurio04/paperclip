@@ -396,9 +396,9 @@ async function main() {
   const cwdA = reqA1.permission.cwd;
   receipt.ids.runA_request1 = reqA1.requestId;
   receipt.config.contractA1 = { ...reqA1.permission, metadata: Object.keys(reqA1.permission.metadata ?? {}), arguments: reqA1.permission.arguments };
-  record("contract.typed_permission", "permission.v1 for a workspace file write (edit), restricted_v1/ask, decisions once|reject",
-    { schema: reqA1.schema, permission: reqA1.permission.permission, policy: reqA1.permission.policy, decisions: reqA1.decisions, providerVersion: reqA1.permission.providerVersion },
-    reqA1.schema === "paperclip.runtime_request.permission.v1" && ["edit", "write"].includes(reqA1.permission.permission) && reqA1.permission.targets?.every((t) => typeof t.resolvedPath !== "string" || t.resolvedPath.startsWith(reqA1.permission.cwd)) && reqA1.permission.policy?.profile === "restricted_v1" && JSON.stringify(reqA1.decisions) === '["once","reject"]');
+  record("contract.typed_permission", "permission.v1 for a workspace file write (permission edit, frozen tool.name write, object arguments), restricted_v1/ask, decisions once|reject",
+    { schema: reqA1.schema, permission: reqA1.permission.permission, tool: reqA1.permission.tool, argumentsIsObject: typeof reqA1.permission.arguments === "object" && reqA1.permission.arguments !== null && !Array.isArray(reqA1.permission.arguments), policy: reqA1.permission.policy, decisions: reqA1.decisions, providerVersion: reqA1.permission.providerVersion },
+    reqA1.schema === "paperclip.runtime_request.permission.v1" && reqA1.permission.permission === "edit" && reqA1.permission.tool?.name === "write" && typeof reqA1.permission.tool?.messageId === "string" && typeof reqA1.permission.tool?.callId === "string" && typeof reqA1.permission.arguments === "object" && reqA1.permission.arguments !== null && !Array.isArray(reqA1.permission.arguments) && reqA1.permission.targets?.every((t) => typeof t.resolvedPath !== "string" || t.resolvedPath.startsWith(reqA1.permission.cwd)) && reqA1.permission.policy?.profile === "restricted_v1" && JSON.stringify(reqA1.decisions) === '["once","reject"]');
   record("counter.before_once", 0, counterValue(cwdA), counterValue(cwdA) === 0);
 
   const resolvePath = (runId, requestId) => `/heartbeat-runs/${runId}/runtime-requests/${encodeURIComponent(requestId)}/resolve`;

@@ -1931,7 +1931,7 @@ describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
                     id: "prt_1",
                     type: "tool",
                     callID: "call_1",
-                    tool: "edit",
+                    tool: (state as any).toolName ?? "edit",
                     state: { status: "running", input: state.toolInput },
                   },
                 ],
@@ -2005,6 +2005,173 @@ describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
       environmentPath: join(root, normalizedSessionId, "data", "fake-environment.json"),
     };
   }
+
+  // QA TAX-473 H9/H10 probe, verbatim from the re-QA report.
+  it.each(["unknown_tool", "missing_arguments"])("QA rejects incomplete or unknown permission: %s", async (kind) => {
+    const h = await harness();
+    if (kind === "unknown_tool") { h.asked.permission = "unrecognized_mutation"; (h.state as any).toolName = "unrecognized_mutation"; }
+    else delete (h.asked as any).tool;
+    h.state.live = [structuredClone(h.asked)];
+    const { turnId } = await h.session.startTurn({message:{role:"user",text:"edit"}});
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 100));
+    const pending = h.session.pendingRuntimeRequests?.()[0];
+    if (pending) {
+      await h.session.resolveRuntimeRequest!({requestId: permissionId, turnId,
+        resolution:{action:"permission_decision",decision:"once",contractSha256: pending.permission!.contractSha256}});
+    }
+    const observed = structuredClone(h.state.replies);
+    await h.session.close({reason:"QA complete"});
+    expect(observed.some(r => (r.body as any).reply === "once")).toBe(false);
+  });
+
+  // TAX-452 H9/H10: every unapprovable shape is rejected natively, with the
+  // right diagnostic, and never surfaces a typed request.
+  it.each([
+    {
+      name: "unknown permission and tool",
+      code: "permission_unknown_tool",
+      mutate: (h: Awaited<ReturnType<typeof harness>>) => {
+        h.asked.permission = "unrecognized_mutation";
+        (h.state as any).toolName = "unrecognized_mutation";
+      },
+    },
+    {
+      name: "edit permission asked by a non-edit tool",
+      code: "permission_unknown_tool",
+      mutate: (h: Awaited<ReturnType<typeof harness>>) => {
+        (h.state as any).toolName = "bash";
+      },
+    },
+    {
+      name: "read permission asked by the write tool",
+      code: "permission_unknown_tool",
+      mutate: (h: Awaited<ReturnType<typeof harness>>) => {
+        h.asked.permission = "read";
+        (h.state as any).toolName = "write";
+      },
+    },
+    {
+      name: "known tool under an unknown permission",
+      code: "permission_unknown_tool",
+      mutate: (h: Awaited<ReturnType<typeof harness>>) => {
+        h.asked.permission = "list";
+      },
+    },
+    {
+      name: "missing tool reference",
+      code: "permission_contract_unrepresentable",
+      mutate: (h: Awaited<ReturnType<typeof harness>>) => {
+        delete (h.asked as any).tool;
+      },
+    },
+    {
+      name: "null tool reference",
+      code: "permission_contract_unrepresentable",
+      mutate: (h: Awaited<ReturnType<typeof harness>>) => {
+        (h.asked as any).tool = null;
+      },
+    },
+    {
+      name: "tool reference without callID",
+      code: "permission_contract_unrepresentable",
+      mutate: (h: Awaited<ReturnType<typeof harness>>) => {
+        (h.asked as any).tool = { messageID: "msg_1" };
+      },
+    },
+    {
+      name: "non-object tool arguments",
+      code: "permission_contract_unrepresentable",
+      mutate: (h: Awaited<ReturnType<typeof harness>>) => {
+        (h.state as any).toolInput = null;
+      },
+    },
+    {
+      name: "tool part without a name",
+      code: "permission_contract_unrepresentable",
+      mutate: (h: Awaited<ReturnType<typeof harness>>) => {
+        (h.state as any).toolName = "";
+      },
+    },
+  ])("rejects natively with $code for $name", async ({ code, mutate }) => {
+    const h = await harness();
+    mutate(h);
+    h.state.live = [structuredClone(h.asked)];
+    await h.session.startTurn({ message: { role: "user", text: "edit" } });
+    const diagnostic = await h.next("harness.diagnostic");
+    expect(diagnostic?.payload).toMatchObject({
+      code,
+      providerRequestId: permissionId,
+    });
+    for (let attempt = 0; attempt < 50 && h.state.replies.length === 0; attempt += 1)
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+    expect(h.state.replies).toEqual([
+      { id: permissionId, body: { reply: "reject" } },
+    ]);
+    expect(
+      h.events.some((event) => event.eventType === "runtime_request.created"),
+    ).toBe(false);
+    expect(h.session.pendingRuntimeRequests?.()).toEqual([]);
+    await h.session.close({ reason: "done" });
+  });
+
+  it.each(["write", "apply_patch"])(
+    "keeps the %s tool approvable under the edit permission",
+    async (toolName) => {
+      const h = await harness();
+      (h.state as any).toolName = toolName;
+      const { turnId } = await h.session.startTurn({
+        message: { role: "user", text: "edit" },
+      });
+      const created = await h.next("runtime_request.created");
+      const contract = (created!.payload as any).request.permission;
+      expect(contract.tool).toEqual({
+        name: toolName,
+        messageId: "msg_1",
+        callId: "call_1",
+      });
+      await h.session.resolveRuntimeRequest!({
+        requestId: permissionId,
+        turnId,
+        resolution: {
+          action: "permission_decision",
+          decision: "once",
+          contractSha256: contract.contractSha256,
+        },
+      });
+      expect(h.state.replies).toEqual([
+        { id: permissionId, body: { reply: "once" } },
+      ]);
+      await h.session.close({ reason: "done" });
+    },
+  );
+
+  it("re-verifies the tool part name before once and rejects a swapped tool", async () => {
+    const h = await harness();
+    const { turnId } = await h.session.startTurn({
+      message: { role: "user", text: "edit" },
+    });
+    const created = await h.next("runtime_request.created");
+    const contract = (created!.payload as any).request.permission;
+    // Same call id and arguments, different tool identity.
+    (h.state as any).toolName = "write";
+    await h.session.resolveRuntimeRequest!({
+      requestId: permissionId,
+      turnId,
+      resolution: {
+        action: "permission_decision",
+        decision: "once",
+        contractSha256: contract.contractSha256,
+      },
+    });
+    expect(h.state.replies).toEqual([
+      { id: permissionId, body: { reply: "reject" } },
+    ]);
+    const diagnostic = await h.next("harness.diagnostic");
+    expect(diagnostic?.payload).toMatchObject({
+      code: "permission_contract_drift",
+    });
+    await h.session.close({ reason: "done" });
+  });
 
   // QA TAX-470 H4 (original OS-level probe). A raw process running as the same
   // OS uid as OpenCode can always read /proc/<pid>/environ of the OpenCode
@@ -2152,6 +2319,7 @@ describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
             : join(tmpdir(), `paperclip-qa-outside-${process.pid}`, "new.txt");
       await symlink(destination, join(h.workspace, "link"));
       h.asked.permission = target === "dangling" ? "edit" : "read";
+      (h.state as any).toolName = target === "dangling" ? "write" : "read";
       h.asked.patterns = ["link"];
       h.state.toolInput = { filePath: "link" };
       h.state.live = [structuredClone(h.asked)];
@@ -2289,7 +2457,7 @@ describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
       providerSessionId: sessionId,
       providerRequestId: permissionId,
       permission: "edit",
-      tool: { messageId: "msg_1", callId: "call_1" },
+      tool: { name: "edit", messageId: "msg_1", callId: "call_1" },
       arguments: { filePath: "notes.txt", content: "x" },
       metadata: h.asked.metadata,
       always: ["*"],

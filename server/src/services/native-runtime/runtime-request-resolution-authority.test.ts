@@ -7,6 +7,8 @@ import { redactEventPayload } from "../../redaction.js";
 import {
   assertNativeRuntimeRequestResolverAuthorized,
   computeNativePermissionContractSha256,
+  isRestrictedV1ApprovablePermissionTool,
+  RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS,
   parseNativePermissionDecisionResolution,
   NativeRuntimeRequestResolutionAuthorizationError,
   readPendingNativeRuntimeRequest,
@@ -117,12 +119,12 @@ describe("native runtime request resolution authority", () => {
       providerVersion: "1.18.29",
       providerSessionId: "ses_1",
       providerRequestId: "per_1",
-      permission: "bash",
-      tool: null,
-      patterns: ["ls"],
+      permission: "edit",
+      tool: { name: "write", messageId: "msg_1", callId: "call_1" },
+      patterns: ["a.ts"],
       always: [],
       metadata: {},
-      arguments: null,
+      arguments: { filePath: "/w/a.ts", content: "x" },
       cwd: "/w",
       targets: [],
       policy: { profile: "restricted_v1", permissionDefault: "ask" },
@@ -160,6 +162,27 @@ describe("native runtime request resolution authority", () => {
         .toBe(fixture.request.permission.contractSha256);
     });
 
+    it("pins the restricted_v1 (permission, tool) allowlist shared with the driver and runnerd", () => {
+      const fixture = JSON.parse(readFileSync(
+        new URL(
+          "../../../../packages/paperclip-runner/protocol/fixtures/permissions/opencode-permission-request.json",
+          import.meta.url,
+        ),
+        "utf8",
+      )) as {
+        restrictedApprovablePermissionTools: Record<string, string[]>;
+        request: { permission: { permission: string; tool: { name: string } } };
+      };
+      expect(Object.fromEntries(
+        Object.entries(RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS)
+          .map(([permission, tools]) => [permission, [...tools].sort()]),
+      )).toEqual(fixture.restrictedApprovablePermissionTools);
+      expect(isRestrictedV1ApprovablePermissionTool(
+        fixture.request.permission.permission,
+        fixture.request.permission.tool.name,
+      )).toBe(true);
+    });
+
     it("treats a stored contract that no longer matches its own sha as non-actionable", async () => {
       // Same signed sha, but a field changed after signing (e.g. redaction).
       const tampered = permissionEvent({}, {
@@ -177,7 +200,7 @@ describe("native runtime request resolution authority", () => {
 
     it("keeps the frozen contract verbatim through event redaction so the sha still verifies", async () => {
       const event = permissionEvent({}, {
-        tool: { messageId: "msg_1", callId: "call_1" },
+        tool: { name: "edit", messageId: "msg_1", callId: "call_1" },
         metadata: { command: "curl -H 'x-token: abc' https://example.test", deep: { a: { b: { c: 1 } } } },
         arguments: { command: "curl -H 'x-token: abc' https://example.test", token: "visible-to-approver" },
       });
@@ -212,7 +235,7 @@ describe("native runtime request resolution authority", () => {
         permission: {
           contractSha256: sha,
           decisions: ["once", "reject"],
-          contract: expect.objectContaining({ permission: "bash", cwd: "/w" }),
+          contract: expect.objectContaining({ permission: "edit", cwd: "/w" }),
         },
       });
     });
@@ -223,6 +246,24 @@ describe("native runtime request resolution authority", () => {
       ["always decision", { decisions: ["once", "always", "reject"] }, {}],
       ["bad sha", {}, { contractSha256: "nothex" }],
       ["wrong contract schema", {}, { schema: "paperclip.other.v1" }],
+      // TAX-452 H10: no tool call or no complete arguments.
+      ["null tool and arguments", {}, { tool: null, arguments: null }],
+      ["missing tool", {}, { tool: undefined }],
+      ["null arguments", {}, { arguments: null }],
+      ["array arguments", {}, { arguments: [] }],
+      ["tool without name", {}, { tool: { messageId: "msg_1", callId: "call_1" } }],
+      ["tool with empty name", {}, { tool: { name: "", messageId: "msg_1", callId: "call_1" } }],
+      ["tool with extra key", {}, { tool: { name: "edit", messageId: "m", callId: "c", extra: 1 } }],
+      // TAX-452 H9: (permission, tool) outside the restricted_v1 allowlist.
+      ["unknown permission and tool", {}, {
+        permission: "unrecognized_mutation",
+        tool: { name: "unrecognized_mutation", messageId: "msg_1", callId: "call_1" },
+      }],
+      ["edit permission from bash", {}, { tool: { name: "bash", messageId: "msg_1", callId: "call_1" } }],
+      ["read permission from write", {}, { permission: "read" }],
+      ["bash permission", {}, { permission: "bash", tool: { name: "bash", messageId: "m", callId: "c" } }],
+      ["list permission", {}, { permission: "list", tool: { name: "list", messageId: "m", callId: "c" } }],
+      ["prototype key permission", {}, { permission: "toString", tool: { name: "toString", messageId: "m", callId: "c" } }],
     ])("fails closed on %s", async (_label, request, permission) => {
       await expect(readPendingNativeRuntimeRequest(
         dbReturning(permissionEvent(request, permission)),

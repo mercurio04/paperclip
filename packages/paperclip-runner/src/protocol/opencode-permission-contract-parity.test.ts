@@ -2,6 +2,10 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
+import {
+  isRestrictedV1ApprovablePermissionTool,
+  RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS,
+} from "../contracts/harness-driver.js";
 import { permissionContractSha256 } from "../drivers/opencode/opencode-server-driver.js";
 
 /**
@@ -20,6 +24,7 @@ const fixture = JSON.parse(
   ),
 ) as {
   canonicalContractJson: string;
+  restrictedApprovablePermissionTools: Record<string, string[]>;
   request: { permission: Record<string, unknown> & { contractSha256: string } };
 };
 
@@ -54,5 +59,33 @@ describe("OpenCode permission contract hash parity (TS driver / Rust runnerd / s
         .update(fixture.canonicalContractJson, "utf8")
         .digest("hex"),
     ).toBe(contractSha256);
+  });
+
+  it("pins the restricted_v1 (permission, tool) allowlist shared with Rust and the server", () => {
+    const normalized = Object.fromEntries(
+      Object.entries(RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS).map(
+        ([permission, tools]) => [permission, [...tools].sort()],
+      ),
+    );
+    expect(normalized).toEqual(fixture.restrictedApprovablePermissionTools);
+    const frozen = fixture.request.permission as unknown as {
+      permission: string;
+      tool: { name: string; messageId: string; callId: string };
+      arguments: Record<string, unknown>;
+    };
+    expect(Object.keys(frozen.tool).sort()).toEqual([
+      "callId",
+      "messageId",
+      "name",
+    ]);
+    expect(
+      isRestrictedV1ApprovablePermissionTool(frozen.permission, frozen.tool.name),
+    ).toBe(true);
+    expect(isRestrictedV1ApprovablePermissionTool("edit", "bash")).toBe(false);
+    expect(isRestrictedV1ApprovablePermissionTool("bash", "bash")).toBe(false);
+    expect(isRestrictedV1ApprovablePermissionTool("list", "list")).toBe(false);
+    expect(isRestrictedV1ApprovablePermissionTool("toString", "toString")).toBe(
+      false,
+    );
   });
 });

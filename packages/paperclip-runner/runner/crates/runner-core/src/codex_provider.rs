@@ -59,6 +59,24 @@ const OPENCODE_PERMISSION_REQUEST_SCHEMA: &str = "paperclip.runtime_request.perm
 const OPENCODE_PERMISSION_CONTRACT_SCHEMA: &str = "paperclip.opencode_permission_contract.v1";
 const PERMISSION_DECISION_SCHEMA: &str = "paperclip.permission_decision.v1";
 const MAX_PERMISSION_CONTRACT_BYTES: usize = 64 * 1024;
+/// TAX-452 H9: the only (OpenCode permission, tool id) pairs a restricted_v1
+/// contract may carry. Verified against the OpenCode 1.18.29 binary: `edit`,
+/// `write` and `apply_patch` ask `edit`; `read`, `glob`, `grep` ask their own
+/// name; 1.18.29 registers no `list`/`multiedit`/`patch` tool. Mirrors
+/// `RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS` in the TS driver and the
+/// server; the shared permission fixture pins all three.
+const RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS: &[(&str, &[&str])] = &[
+    ("edit", &["apply_patch", "edit", "write"]),
+    ("glob", &["glob"]),
+    ("grep", &["grep"]),
+    ("read", &["read"]),
+];
+
+fn is_restricted_v1_approvable_permission_tool(permission: &str, tool_name: &str) -> bool {
+    RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS
+        .iter()
+        .any(|(name, tools)| *name == permission && tools.contains(&tool_name))
+}
 pub(crate) const MAX_SETTLED_PROVIDER_TURN_IDS: usize = 4_096;
 pub(crate) const MAX_DESCENDANT_THREAD_IDS: usize = 4_096;
 
@@ -4086,32 +4104,28 @@ fn validate_opencode_permission_request(
         .ok_or("permission providerSessionId is invalid")?;
     bounded_permission_text(permission.get("providerRequestId"), 256)
         .ok_or("permission providerRequestId is invalid")?;
-    bounded_permission_text(permission.get("permission"), 160)
+    let permission_name = bounded_permission_text(permission.get("permission"), 160)
         .ok_or("permission name is invalid")?;
+    // TAX-452 H10: the exact tool call and its complete input are mandatory;
+    // a contract without them is never approvable.
     let tool = permission
         .get("tool")
-        .ok_or("permission tool is required")?;
-    let arguments = permission
-        .get("arguments")
-        .ok_or("permission arguments are required")?;
-    match tool {
-        Value::Null => {
-            if !arguments.is_null() {
-                return Err("permission arguments must be null without a tool");
-            }
-        }
-        Value::Object(tool) => {
-            if !exact_keys(tool, &["messageId", "callId"], &[])
-                || bounded_permission_text(tool.get("messageId"), 256).is_none()
-                || bounded_permission_text(tool.get("callId"), 256).is_none()
-            {
-                return Err("permission tool is invalid");
-            }
-            if !arguments.is_object() {
-                return Err("permission arguments must be the tool input object");
-            }
-        }
-        _ => return Err("permission tool is invalid"),
+        .and_then(Value::as_object)
+        .ok_or("permission tool must be an object")?;
+    if !exact_keys(tool, &["name", "messageId", "callId"], &[])
+        || bounded_permission_text(tool.get("messageId"), 256).is_none()
+        || bounded_permission_text(tool.get("callId"), 256).is_none()
+    {
+        return Err("permission tool is invalid");
+    }
+    let tool_name =
+        bounded_permission_text(tool.get("name"), 160).ok_or("permission tool name is invalid")?;
+    if !permission.get("arguments").is_some_and(Value::is_object) {
+        return Err("permission arguments must be the tool input object");
+    }
+    // TAX-452 H9: defense in depth over the driver's allowlist.
+    if !is_restricted_v1_approvable_permission_tool(permission_name, tool_name) {
+        return Err("permission tool is not approvable in restricted_v1");
     }
     if !string_array(permission.get("patterns")) || !string_array(permission.get("always")) {
         return Err("permission patterns/always must be string arrays");
@@ -4895,8 +4909,12 @@ done
 
     #[test]
     fn forwards_the_typed_permission_profile_environment() {
-        assert!(OPENCODE_PROVIDER_ENVIRONMENT_KEYS.contains(&"PAPERCLIP_OPENCODE_PERMISSION_PROFILE"));
-        assert!(OPENCODE_PROVIDER_ENVIRONMENT_KEYS.contains(&"PAPERCLIP_OPENCODE_LLAMACPP_BASE_URL"));
+        assert!(
+            OPENCODE_PROVIDER_ENVIRONMENT_KEYS.contains(&"PAPERCLIP_OPENCODE_PERMISSION_PROFILE")
+        );
+        assert!(
+            OPENCODE_PROVIDER_ENVIRONMENT_KEYS.contains(&"PAPERCLIP_OPENCODE_LLAMACPP_BASE_URL")
+        );
     }
 
     #[test]
@@ -5170,6 +5188,42 @@ done
         let mut always = fixture["request"].clone();
         always["decisions"] = json!(["once", "always", "reject"]);
         assert!(!validator.is_valid(&always));
+        // TAX-452 H9/H10: tool {name, messageId, callId} and object arguments.
+        let mut null_tool = fixture["request"].clone();
+        null_tool["permission"]["tool"] = Value::Null;
+        null_tool["permission"]["arguments"] = Value::Null;
+        assert!(!validator.is_valid(&null_tool));
+        let mut nameless = fixture["request"].clone();
+        nameless["permission"]["tool"]
+            .as_object_mut()
+            .unwrap()
+            .remove("name");
+        assert!(!validator.is_valid(&nameless));
+        let mut null_arguments = fixture["request"].clone();
+        null_arguments["permission"]["arguments"] = Value::Null;
+        assert!(!validator.is_valid(&null_arguments));
+    }
+
+    #[test]
+    fn permission_tool_allowlist_matches_the_shared_fixture() {
+        let fixture = permission_fixture();
+        let expected = fixture["restrictedApprovablePermissionTools"]
+            .as_object()
+            .expect("fixture pins the restricted_v1 allowlist");
+        let actual: serde_json::Map<String, Value> = RESTRICTED_V1_APPROVABLE_PERMISSION_TOOLS
+            .iter()
+            .map(|(permission, tools)| {
+                let mut tools: Vec<&str> = tools.to_vec();
+                tools.sort_unstable();
+                ((*permission).to_owned(), json!(tools))
+            })
+            .collect();
+        assert_eq!(&actual, expected);
+        for tool in ["apply_patch", "edit", "write"] {
+            assert!(is_restricted_v1_approvable_permission_tool("edit", tool));
+        }
+        assert!(!is_restricted_v1_approvable_permission_tool("edit", "bash"));
+        assert!(!is_restricted_v1_approvable_permission_tool("bash", "bash"));
     }
 
     #[test]
@@ -5267,6 +5321,46 @@ done
         tool_without_arguments["request"]["permission"]["arguments"] = Value::Null;
         resign(&mut tool_without_arguments);
         cases.push(("tool input object", tool_without_arguments));
+
+        // TAX-452 H10: neither the tool nor the arguments may be null/absent.
+        let mut null_tool = base.clone();
+        null_tool["request"]["permission"]["tool"] = Value::Null;
+        null_tool["request"]["permission"]["arguments"] = Value::Null;
+        resign(&mut null_tool);
+        cases.push(("tool must be an object", null_tool));
+
+        let mut array_arguments = base.clone();
+        array_arguments["request"]["permission"]["arguments"] = json!([]);
+        resign(&mut array_arguments);
+        cases.push(("tool input object", array_arguments));
+
+        // TAX-452 H9: the frozen tool identity carries its name.
+        let mut nameless_tool = base.clone();
+        nameless_tool["request"]["permission"]["tool"]
+            .as_object_mut()
+            .unwrap()
+            .remove("name");
+        resign(&mut nameless_tool);
+        cases.push(("permission tool is invalid", nameless_tool));
+
+        let mut empty_tool_name = base.clone();
+        empty_tool_name["request"]["permission"]["tool"]["name"] = json!("");
+        resign(&mut empty_tool_name);
+        cases.push(("tool name is invalid", empty_tool_name));
+
+        for (permission, tool_name) in [
+            ("unrecognized_mutation", "unrecognized_mutation"),
+            ("edit", "bash"),
+            ("read", "edit"),
+            ("bash", "bash"),
+            ("list", "list"),
+        ] {
+            let mut unknown_pair = base.clone();
+            unknown_pair["request"]["permission"]["permission"] = json!(permission);
+            unknown_pair["request"]["permission"]["tool"]["name"] = json!(tool_name);
+            resign(&mut unknown_pair);
+            cases.push(("not approvable in restricted_v1", unknown_pair));
+        }
 
         let mut legacy_schema = base.clone();
         legacy_schema["request"]["schema"] = json!("paperclip.runtime_request.v2");
