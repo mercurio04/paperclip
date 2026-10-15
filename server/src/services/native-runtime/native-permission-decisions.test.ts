@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  activityLog,
   agents,
   companies,
   createDb,
@@ -21,7 +22,9 @@ import {
   reconcileCrashedNativePermissionClaims,
   reconcileTerminalNativePermissionOutcomes,
   settleNativePermissionDecision,
+  sweepTerminalNativePermissionOutcomes,
 } from "./native-permission-decisions.js";
+import { logActivity } from "../activity-log.js";
 
 describe("native permission outcome relayed by runnerd", () => {
   const diagnostic = (payload: Record<string, unknown>) => ({ eventType: "harness.diagnostic", payload });
@@ -237,5 +240,84 @@ describeEmbeddedPostgres("native permission decision claims (embedded Postgres)"
     await expect(reconcileTerminalNativePermissionOutcomes(db, {
       companyId, runId, reason: "native_outcome_unobserved_at_terminal",
     })).resolves.toEqual({ recovered: [], uncertain: [] });
+  });
+
+  it("boot sweep reconciles terminal runs whose fast-path timer died with the server (H13 crash)", async () => {
+    const newRun = async (status: string) => {
+      const id = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id, companyId, agentId, invocationSource: "on_demand", triggerDetail: "manual", status,
+        runtimeMode: "native", contextSnapshot: {},
+        ...(status === "running" ? {} : { finishedAt: new Date() }),
+      });
+      return id;
+    };
+    const deliver = async (run: string, requestId: string) => {
+      const claim = await claimNativePermissionDecision(db, { ...claimInput("once"), runId: run, requestId });
+      await settleNativePermissionDecision(db, { id: claim!.id, status: "delivered" });
+      return claim!;
+    };
+    // Board cancel || once: run cancelled, claim delivered, server killed before the 4s timer.
+    const cancelledRun = await newRun("cancelled");
+    const crashed = await deliver(cancelledRun, "perm-crash-lost");
+    // A persisted outcome whose consumer never ran (other terminal status).
+    const succeededRun = await newRun("succeeded");
+    const committed = await deliver(succeededRun, "perm-crash-committed");
+    await db.insert(heartbeatRunEvents).values({
+      companyId, runId: succeededRun, agentId, seq: 1, eventType: "harness.diagnostic", stream: "system", level: "info",
+      payload: { prpEvent: { eventType: "harness.diagnostic", payload: {
+        code: "permission_native_outcome", requestId: "perm-crash-committed", nativeOutcome: "once_applied",
+      } } },
+    });
+    const timedOutRun = await newRun("timed_out");
+    const timedOut = await deliver(timedOutRun, "perm-crash-timed-out");
+    // Live run: its consumer may still record the outcome; never touched.
+    const liveRun = await newRun("running");
+    const live = await deliver(liveRun, "perm-crash-live");
+    // Excluded (resuming) terminal run is left for its own recovery.
+    const resumingRun = await newRun("failed");
+    const resuming = await deliver(resumingRun, "perm-crash-resuming");
+
+    const audit = (entry: Parameters<typeof logActivity>[1]) => logActivity(db, entry);
+    const first = await sweepTerminalNativePermissionOutcomes(db,
+      { trigger: "startup_terminal_sweep", excludeRunIds: [resumingRun] }, audit);
+    expect(first).toEqual({ runs: 3, recovered: 1, uncertain: 2, failedRunIds: [] });
+
+    const rows = new Map((await db.select().from(nativePermissionDecisions)).map((row) => [row.id, row]));
+    expect(rows.get(crashed.id)).toMatchObject({
+      status: "dispatch_uncertain", nativeOutcome: null, error: "native_outcome_unobserved_at_terminal",
+    });
+    expect(rows.get(timedOut.id)).toMatchObject({ status: "dispatch_uncertain", nativeOutcome: null });
+    expect(rows.get(committed.id)).toMatchObject({ status: "delivered", nativeOutcome: "once_applied" });
+    expect(rows.get(live.id)).toMatchObject({ status: "delivered", nativeOutcome: null });
+    expect(rows.get(resuming.id)).toMatchObject({ status: "delivered", nativeOutcome: null });
+
+    const audits = await db.select().from(activityLog).where(eq(activityLog.entityType, "heartbeat_run"));
+    const forRun = (run: string) => audits.filter((row) => row.entityId === run)
+      .map((row) => ({ action: row.action, status: (row.details as Record<string, unknown>)?.status ?? null,
+        reason: (row.details as Record<string, unknown>)?.reason ?? null,
+        nativeOutcome: (row.details as Record<string, unknown>)?.nativeOutcome ?? null }));
+    expect(forRun(cancelledRun)).toEqual([{ action: "heartbeat.runtime_permission_reconciled",
+      status: "dispatch_uncertain", reason: "native_outcome_unobserved_at_terminal", nativeOutcome: null }]);
+    expect(forRun(succeededRun)).toEqual([{ action: "heartbeat.runtime_permission_native_outcome",
+      status: null, reason: null, nativeOutcome: "once_applied" }]);
+    expect(forRun(liveRun)).toEqual([]);
+
+    // Idempotent: a second boot (or the periodic tick) is a no-op without new audit rows.
+    await expect(sweepTerminalNativePermissionOutcomes(db,
+      { trigger: "startup_terminal_sweep", excludeRunIds: [resumingRun] }, audit))
+      .resolves.toEqual({ runs: 0, recovered: 0, uncertain: 0, failedRunIds: [] });
+    expect(await db.select().from(activityLog).where(eq(activityLog.entityType, "heartbeat_run")))
+      .toHaveLength(audits.length);
+
+    // Periodic use never pre-empts the live fast-path window.
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, liveRun));
+    await expect(sweepTerminalNativePermissionOutcomes(db,
+      { trigger: "periodic_terminal_sweep", settledBefore: new Date(Date.now() - 60_000) }, audit))
+      .resolves.toMatchObject({ runs: 0 });
+    await expect(sweepTerminalNativePermissionOutcomes(db,
+      { trigger: "periodic_terminal_sweep", settledBefore: new Date(Date.now() + 60_000) }, audit))
+      .resolves.toMatchObject({ runs: 2, uncertain: 2 });
   });
 });

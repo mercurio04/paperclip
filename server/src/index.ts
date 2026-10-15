@@ -1801,6 +1801,11 @@ async function startServerWithDatabaseTeardown(
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
               }
             })
+            .then(async () => {
+              // TAX-452 H13: durable terminal reconciliation of native
+              // permission claims whose fast-path timer was lost.
+              await heartbeat.reconcileTerminalNativePermissionClaims?.();
+            })
             .catch((err) => {
               logger.error({ err }, "periodic heartbeat recovery failed");
             }));

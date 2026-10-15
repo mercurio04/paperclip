@@ -1,8 +1,9 @@
 import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { terminateNativeDedicatedProcesses } from "./native-runtime/native-dedicated-process-reaper.js";
 import {
+  reconcileAndAuditTerminalNativePermissionOutcomes,
   reconcileCrashedNativePermissionClaims,
-  reconcileTerminalNativePermissionOutcomes,
+  sweepTerminalNativePermissionOutcomes,
 } from "./native-runtime/native-permission-decisions.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
@@ -12629,6 +12630,11 @@ export function heartbeatService(
     if (!isHeartbeatRunTerminalStatus(updated.status)) return;
     if (previousStatus === updated.status) return;
     clearHeartbeatRunRuntimeStatus(updated.id);
+    // H13: every genuine terminal transition of a native run (not only board
+    // cancel) arms the post-terminal outcome window; the boot/periodic sweep
+    // is the durable backstop if this process dies first.
+    if (updated.runtimeMode === "native")
+      scheduleTerminalNativePermissionOutcomeReconciliation(updated, `terminal_${updated.status}`);
     void emitAgentTaskRun(db, updated);
     void reportRunFailure(db, updated);
   }
@@ -13655,12 +13661,16 @@ export function heartbeatService(
    * from an already committed `permission_native_outcome`, otherwise moved to
    * `dispatch_uncertain` (never redelivered) and audited. Never throws.
    */
+  const pendingTerminalPermissionReconciliations = new Set<string>();
   function scheduleTerminalNativePermissionOutcomeReconciliation(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId">,
     trigger: string,
     delayMs = NATIVE_PERMISSION_OUTCOME_RECONCILE_MS,
   ) {
+    if (pendingTerminalPermissionReconciliations.has(run.id)) return;
+    pendingTerminalPermissionReconciliations.add(run.id);
     const timer = setTimeout(() => {
+      pendingTerminalPermissionReconciliations.delete(run.id);
       void reconcileTerminalNativePermissionOutcomesNow(run, trigger).catch((error) => {
         logger.warn({ err: error, runId: run.id }, "native permission outcome reconciliation failed");
       });
@@ -13672,49 +13682,42 @@ export function heartbeatService(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId">,
     trigger: string,
   ) {
-    const reason = "native_outcome_unobserved_at_terminal";
-    const { recovered, uncertain } = await reconcileTerminalNativePermissionOutcomes(db, {
-      companyId: run.companyId,
-      runId: run.id,
-      reason,
-    });
-    for (const row of recovered) {
-      await logActivity(db, {
-        companyId: run.companyId,
-        actorType: "system",
-        actorId: "paperclip-runner",
-        action: "heartbeat.runtime_permission_native_outcome",
-        entityType: "heartbeat_run",
-        entityId: run.id,
-        agentId: run.agentId,
-        runId: run.id,
-        details: { agentId: run.agentId, runId: run.id, requestId: row.requestId, nativeOutcome: row.nativeOutcome,
-          source: "terminal_reconciliation", trigger },
-      });
-    }
-    for (const row of uncertain) {
-      await logActivity(db, {
-        companyId: run.companyId,
-        actorType: "system",
-        actorId: "native_terminal_reconciliation",
-        action: "heartbeat.runtime_permission_reconciled",
-        entityType: "heartbeat_run",
-        entityId: run.id,
-        agentId: run.agentId,
-        runId: run.id,
-        details: {
-          runId: run.id,
-          requestId: row.requestId,
-          turnId: row.turnId,
-          decision: row.decision,
-          contractSha256: row.contractSha256,
-          resolverUserId: row.resolverUserId,
-          previousStatus: "delivered",
-          status: "dispatch_uncertain",
-          reason,
-          trigger,
+    return reconcileAndAuditTerminalNativePermissionOutcomes(db, run, trigger, (entry) => logActivity(db, entry));
+  }
+
+  /**
+   * Durable side of H13: the fast-path timer above is process memory, so a
+   * crash inside its window (or any other lost timer) would leave a terminal
+   * run's `delivered` claim without native outcome forever. This sweep is
+   * DB-derived: boot runs it with no age filter (the previous process, the
+   * only possible outcome consumer, is gone) and the periodic scheduler tick
+   * runs it with `settledBefore = now - window` so it never pre-empts a live
+   * fast path. Never redelivers, never throws.
+   */
+  async function reconcileTerminalNativePermissionClaims(options: {
+    trigger?: string;
+    settledBefore?: Date | null;
+    excludeRunIds?: readonly string[];
+  } = {}) {
+    try {
+      const result = await sweepTerminalNativePermissionOutcomes(
+        db,
+        {
+          trigger: options.trigger ?? "periodic_terminal_sweep",
+          settledBefore:
+            options.settledBefore === undefined
+              ? new Date(Date.now() - NATIVE_PERMISSION_OUTCOME_RECONCILE_MS)
+              : (options.settledBefore ?? undefined),
+          excludeRunIds: options.excludeRunIds,
         },
-      });
+        (entry) => logActivity(db, entry),
+      );
+      if (result.recovered > 0 || result.uncertain > 0 || result.failedRunIds.length > 0)
+        logger.warn({ ...result, trigger: options.trigger }, "native permission terminal sweep reconciled claims");
+      return result;
+    } catch (error) {
+      logger.warn({ err: error }, "native permission terminal sweep failed");
+      return { runs: 0, recovered: 0, uncertain: 0, failedRunIds: [] as string[] };
     }
   }
 
@@ -15045,6 +15048,18 @@ export function heartbeatService(
       }
     }
     await reconcileNativeRestartLeftovers(dispositions);
+    // H13 crash variant: claims left `delivered` without native outcome by a
+    // process that died inside its post-terminal window. Runs being resumed
+    // now (or scheduled to resume) are excluded; the sweep only reconciles,
+    // never redelivers.
+    const terminalPermissionSweep = await reconcileTerminalNativePermissionClaims({
+      trigger: "startup_terminal_sweep",
+      settledBefore: null,
+      excludeRunIds: [
+        ...claims.map((claim) => claim.runId),
+        ...scheduledNativeRetries.map((entry) => entry.runId),
+      ],
+    });
     for (const claim of claims) {
       const execution = executeRun(claim.runId, {
         nativeLeaseOwner: claim.leaseOwner,
@@ -15066,6 +15081,7 @@ export function heartbeatService(
       claims,
       dispositions,
       scheduledRetryRunIds: scheduledNativeRetries.map((entry) => entry.runId),
+      terminalPermissionSweep,
       awaitingEvidenceRunIds: dispositions
         .filter((entry) => entry.kind === "awaiting_evidence")
         .map((entry) => entry.runId),
@@ -29323,6 +29339,7 @@ export function heartbeatService(
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     recoverNativeRunsAfterRestart,
+    reconcileTerminalNativePermissionClaims,
     reapOrphanedRuns,
     sweepPendingCleanupLeases,
     // Override-aware scheduling-suppression check (honors the worktree

@@ -994,6 +994,54 @@ async function main() {
     parkCounter(cwd, "internalLoss");
   }
 
+  // ---- 10. QA TAX-478 H13 (crash variant): board cancel || once, then the
+  // server is SIGKILLed inside the in-process post-terminal reconciliation
+  // window (4s timer). The delivered/null claim must still become
+  // dispatch_uncertain, audited, after the restart (durable boot sweep) and
+  // the once must never be replayed. Runs last on the default runnerd so it
+  // cannot disturb earlier cases.
+  {
+    const { run, req } = await startRunAndWaitPermission("QA terminal cancel then crash");
+    const cwd = req.permission.cwd;
+    const [cancel, decision] = await Promise.all([
+      api("POST", `/heartbeat-runs/${run.id}/cancel`, {}),
+      api("POST", resolvePath(run.id, req.requestId), once(req)),
+    ]);
+    const preCrash = await claimsFor(run.id);
+    const runBefore = await runStatus(run.id);
+    const counterBefore = counterValue(cwd);
+    const killedAt = new Date().toISOString();
+    const killed = await killServerHard();
+    killed.pgStopped = await stopOrphanPostgres();
+    const fixtureMark = receipt.fixture.requests.length;
+    await startServerProcess();
+    try { await pgSql?.end({ timeout: 2 }); } catch {}
+    pgSql = createRequire(join(ROOT, "packages/db/package.json"))("postgres")(`postgres://paperclip:paperclip@127.0.0.1:${PG_PORT}/paperclip`, { max: 2, onnotice: () => {} });
+    await sleep(6500);
+    // The boot sweep runs inside startup recovery; allow it a bounded margin.
+    let after = await claimsFor(run.id);
+    for (let w = 0; w < 40 && after.some((c) => c.status === "delivered" && c.native_outcome == null); w += 1) {
+      await sleep(500);
+      after = await claimsFor(run.id);
+    }
+    const audit = await pgSql`select action, details->>'status' as status, details->>'reason' as reason, details->>'trigger' as trigger from activity_log where entity_id = ${run.id} and action like 'heartbeat.runtime_permission%' order by created_at`;
+    const late = await api("POST", resolvePath(run.id, req.requestId), once(req));
+    const counter = counterValue(cwd);
+    const observed = { runId: run.id, requestId: req.requestId, cancel: cancel.status, decision: decision.status, runBefore, preCrash, killedAt,
+      runAfter: await runStatus(run.id), after, late: late.status, counterBefore, counter, audit,
+      survivorsAfterKill: killed.survivors.length,
+      replayedToolCalls: receipt.fixture.requests.slice(fixtureMark).filter((q) => q.action && q.action !== "text").length };
+    receipt.adversarial.terminalCrash = observed;
+    record("qa.terminal_crash.uncertainty_durable", "cancelled run + delivered/null claim survives crash as dispatch_uncertain and audited, never replayed",
+      observed,
+      preCrash.length === 1 && preCrash[0].status === "delivered" && preCrash[0].native_outcome === null &&
+        after.length === 1 && (after[0].status === "dispatch_uncertain" || (after[0].status === "delivered" && after[0].native_outcome !== null)) &&
+        (after[0].status !== "dispatch_uncertain" || audit.some((x) => x.action === "heartbeat.runtime_permission_reconciled" && x.status === "dispatch_uncertain")) &&
+        late.status === 409 && counter === counterBefore && observed.replayedToolCalls === 0,
+      { defectIfFailed: "the post-terminal reconciliation lives only in process memory: a crash inside its window leaves delivered/null forever without audit" });
+    parkCounter(cwd, "terminalCrash");
+  }
+
   await authenticatedPhase({ foreignSha: sha });
 }
 

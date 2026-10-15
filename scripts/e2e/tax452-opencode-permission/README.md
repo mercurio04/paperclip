@@ -113,8 +113,10 @@ Runs are strictly serial; the fixture switches scenario between runs.
   nativeOutcome}` after the delivery, runnerd relays it as the diagnostic
   `permission_native_outcome`, the server records it first-write-wins and
   audits `heartbeat.runtime_permission_native_outcome`). A claim whose outcome
-  was not observed before the run went terminal is reconciled ~4s after the
-  board cancel: recovered from a committed `permission_native_outcome`, else
+  was not observed before the run went terminal is reconciled ~4s after any
+  terminal transition of the native run (in-process fast path), and durably
+  by a DB-derived sweep at server boot and on the periodic scheduler tick:
+  recovered from a committed `permission_native_outcome`, else
   moved to `dispatch_uncertain` (audited `heartbeat.runtime_permission_reconciled`,
   previousStatus `delivered`); the once-audit check uses that latest status.
   `TAX452_REQUIRE_NATIVE_OUTCOME=0` allows a null outcome (debug only).
@@ -148,6 +150,18 @@ Runs are strictly serial; the fixture switches scenario between runs.
   server is restarted on the default binary. Expected: one claim, never
   `delivered`, `dispatch_uncertain`; retries 409; counter <= 1 and unchanged;
   no new provider tool call.
+
+## QA TAX-478 H13 crash variant (`qa.terminal_crash.uncertainty_durable`)
+
+Runs last, on the default runnerd. Board cancel || `once` on a pending
+permission (both 200/202), the claim is `delivered` with null
+`native_outcome` and the run `cancelled`; the server process group is
+SIGKILLed inside the 4s post-terminal window, so the in-process timer never
+fires. After restarting the same instance the boot sweep must have moved the
+claim to `dispatch_uncertain` (`native_outcome_unobserved_at_terminal`,
+audited `heartbeat.runtime_permission_reconciled`, trigger
+`startup_terminal_sweep`) or recovered a committed outcome; late `once` 409,
+counter unchanged, no new provider tool call (never replayed).
 
 Cases recorded with `defectIfFailed` describe a known product defect when
 they fail; they are not waived. `ns-inner.sh` keeps bash as PID 1 of the

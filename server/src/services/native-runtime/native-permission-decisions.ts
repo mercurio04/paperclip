@@ -1,7 +1,7 @@
-import { and, eq, isNull, lt, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, lt, notInArray, sql } from "drizzle-orm";
 
 import type { Db } from "@paperclipai/db";
-import { heartbeatRunEvents, nativePermissionDecisions } from "@paperclipai/db";
+import { heartbeatRunEvents, heartbeatRuns, nativePermissionDecisions } from "@paperclipai/db";
 
 import type { NativePermissionDecision } from "./runtime-request-resolution-authority.js";
 
@@ -333,4 +333,143 @@ export async function reconcileTerminalNativePermissionOutcomes(
       resolverUserId: nativePermissionDecisions.resolverUserId,
     });
   return { recovered, uncertain };
+}
+
+/** Every heartbeat run status after which no event consumer remains. */
+export const NATIVE_PERMISSION_TERMINAL_RUN_STATUSES = [
+  "succeeded",
+  "interrupted",
+  "failed",
+  "cancelled",
+  "timed_out",
+] as const;
+
+export const NATIVE_OUTCOME_UNOBSERVED_AT_TERMINAL = "native_outcome_unobserved_at_terminal";
+
+export interface NativePermissionReconciliationAudit {
+  companyId: string;
+  actorType: "system";
+  actorId: string;
+  action: string;
+  entityType: "heartbeat_run";
+  entityId: string;
+  agentId: string;
+  runId: string;
+  details: Record<string, unknown>;
+}
+
+/**
+ * Terminal reconciliation of one run plus its audit rows: one
+ * `heartbeat.runtime_permission_native_outcome` per recovered outcome and one
+ * `heartbeat.runtime_permission_reconciled` (delivered -> dispatch_uncertain)
+ * per unobservable outcome. Idempotent: only rows this call moved are audited,
+ * so a concurrent or repeated call never duplicates an audit row.
+ */
+export async function reconcileAndAuditTerminalNativePermissionOutcomes(
+  db: Db,
+  run: { readonly id: string; readonly companyId: string; readonly agentId: string },
+  trigger: string,
+  audit: (entry: NativePermissionReconciliationAudit) => Promise<unknown>,
+): Promise<{ recovered: number; uncertain: number }> {
+  const reason = NATIVE_OUTCOME_UNOBSERVED_AT_TERMINAL;
+  const { recovered, uncertain } = await reconcileTerminalNativePermissionOutcomes(db, {
+    companyId: run.companyId,
+    runId: run.id,
+    reason,
+  });
+  for (const row of recovered) {
+    await audit({
+      companyId: run.companyId,
+      actorType: "system",
+      actorId: "paperclip-runner",
+      action: "heartbeat.runtime_permission_native_outcome",
+      entityType: "heartbeat_run",
+      entityId: run.id,
+      agentId: run.agentId,
+      runId: run.id,
+      details: { agentId: run.agentId, runId: run.id, requestId: row.requestId, nativeOutcome: row.nativeOutcome,
+        source: "terminal_reconciliation", trigger },
+    });
+  }
+  for (const row of uncertain) {
+    await audit({
+      companyId: run.companyId,
+      actorType: "system",
+      actorId: "native_terminal_reconciliation",
+      action: "heartbeat.runtime_permission_reconciled",
+      entityType: "heartbeat_run",
+      entityId: run.id,
+      agentId: run.agentId,
+      runId: run.id,
+      details: {
+        runId: run.id,
+        requestId: row.requestId,
+        turnId: row.turnId,
+        decision: row.decision,
+        contractSha256: row.contractSha256,
+        resolverUserId: row.resolverUserId,
+        previousStatus: "delivered",
+        status: "dispatch_uncertain",
+        reason,
+        trigger,
+      },
+    });
+  }
+  return { recovered: recovered.length, uncertain: uncertain.length };
+}
+
+/**
+ * Durable terminal reconciliation sweep (TAX-452 H13, crash variant). The
+ * in-process post-terminal timer dies with the server, so a crash inside its
+ * window used to leave a `delivered` claim with a null `native_outcome`
+ * forever. This sweep finds every such claim whose heartbeat run is terminal
+ * (any terminal status) and reconciles it exactly like the timer would:
+ * recover a committed `permission_native_outcome`, else `dispatch_uncertain`,
+ * each audited. It never redelivers and never touches non-terminal runs.
+ * `settledBefore` (periodic use) skips runs/claims that changed inside the
+ * live fast-path window; boot use omits it because the previous process —
+ * the only possible outcome consumer — is gone. Idempotent; per-run failures
+ * are reported, never thrown.
+ */
+export async function sweepTerminalNativePermissionOutcomes(
+  db: Db,
+  input: {
+    readonly trigger: string;
+    readonly settledBefore?: Date;
+    readonly excludeRunIds?: readonly string[];
+  },
+  audit: (entry: NativePermissionReconciliationAudit) => Promise<unknown>,
+): Promise<{ runs: number; recovered: number; uncertain: number; failedRunIds: string[] }> {
+  const conditions = [
+    eq(nativePermissionDecisions.status, "delivered"),
+    isNull(nativePermissionDecisions.nativeOutcome),
+    inArray(heartbeatRuns.status, [...NATIVE_PERMISSION_TERMINAL_RUN_STATUSES]),
+  ];
+  if (input.excludeRunIds && input.excludeRunIds.length > 0)
+    conditions.push(notInArray(heartbeatRuns.id, [...input.excludeRunIds]));
+  if (input.settledBefore) {
+    conditions.push(lt(nativePermissionDecisions.updatedAt, input.settledBefore));
+    conditions.push(sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.updatedAt}) < ${input.settledBefore.toISOString()}::timestamptz`);
+  }
+  const runs = await db
+    .selectDistinct({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId })
+    .from(nativePermissionDecisions)
+    .innerJoin(heartbeatRuns, and(
+      eq(heartbeatRuns.id, nativePermissionDecisions.runId),
+      eq(heartbeatRuns.companyId, nativePermissionDecisions.companyId),
+    ))
+    .where(and(...conditions));
+  let recovered = 0;
+  let uncertain = 0;
+  const failedRunIds: string[] = [];
+  for (const run of runs) {
+    try {
+      const result = await reconcileAndAuditTerminalNativePermissionOutcomes(db, run, input.trigger, audit);
+      recovered += result.recovered;
+      uncertain += result.uncertain;
+    } catch {
+      failedRunIds.push(run.id);
+    }
+  }
+  return { runs: runs.length, recovered, uncertain, failedRunIds };
 }
