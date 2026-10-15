@@ -90,7 +90,7 @@
     {
       "path": "schemas/request.schema.json",
       "id": "https://paperclip.dev/schemas/prp/v1/request.schema.json",
-      "sha256": "c8d00e10150c90963f19641c075f50da7f67617dd817f41b356287ad85c53f2b"
+      "sha256": "c25fd744b6eddd11757d81542b6c6a4caa55f8aa7ef0467662e9d0100fe16e8b"
     },
     {
       "path": "schemas/result.schema.json",
@@ -203,6 +203,12 @@
     {
       "path": "fixtures/local-runner/scripts/permission-input.json",
       "sha256": "9b64b78ed75006b9190c80fd88c5ab555ef458f7ad023e8ebfdac8de373e1f9c",
+      "expectation": "accept",
+      "compatibilityCase": "canonical"
+    },
+    {
+      "path": "fixtures/permissions/opencode-permission-request.json",
+      "sha256": "c3200a5369d419c82b9298591d797f6f700723fcd912912801e22678d9a05dde",
       "expectation": "accept",
       "compatibilityCase": "canonical"
     },

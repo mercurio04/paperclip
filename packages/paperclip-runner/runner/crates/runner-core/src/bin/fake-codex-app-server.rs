@@ -491,6 +491,28 @@ fn send_opencode_proxy_runtime_question(state: &FakeState) -> io::Result<()> {
     }))
 }
 
+const OPENCODE_PERMISSION_FIXTURE: &str =
+    include_str!("../../../../../protocol/fixtures/permissions/opencode-permission-request.json");
+
+fn opencode_permission_fixture() -> Value {
+    serde_json::from_str(OPENCODE_PERMISSION_FIXTURE).expect("permission fixture is JSON")
+}
+
+fn send_opencode_proxy_permission(state: &FakeState, id: &str, invalid: bool) -> io::Result<()> {
+    let turn_id = state.active_turn_id.as_deref().unwrap_or("provider-turn-1");
+    let mut request = opencode_permission_fixture()["request"].clone();
+    // turnId is outside the contract digest, so the fixture's sha stays valid.
+    request["turnId"] = json!(turn_id);
+    if invalid {
+        request["decisions"] = json!(["once", "always", "reject"]);
+    }
+    send(json!({
+        "id": id,
+        "method": "paperclip/runtimeRequest",
+        "params": {"request": request}
+    }))
+}
+
 fn send_runtime_elicitation(state: &FakeState) -> io::Result<()> {
     let turn_id = state.active_turn_id.as_deref().unwrap_or("provider-turn-1");
     send(json!({
@@ -615,6 +637,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let emit_opencode_proxy_runtime_question = args
         .iter()
         .any(|value| value == "--opencode-proxy-runtime-question");
+    let emit_opencode_proxy_permission = args
+        .iter()
+        .any(|value| value == "--opencode-proxy-permission");
+    let emit_opencode_proxy_invalid_permission = args
+        .iter()
+        .any(|value| value == "--opencode-proxy-invalid-permission");
     let emit_runtime_elicitation = args.iter().any(|value| value == "--runtime-elicitation");
     let emit_structured_activity = args.iter().any(|value| value == "--structured-activity");
     let emit_split_event_burst = args.iter().any(|value| value == "--split-event-burst");
@@ -860,6 +888,51 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             && message.get("id") == Some(&json!("runtime-elicitation-1"))
         {
             finish_turn(&state_path, &mut state, "completed")?;
+            continue;
+        }
+        if message.get("method").is_none()
+            && message.get("id") == Some(&json!("opencode-permission-invalid-1"))
+        {
+            if message.get("error").is_none() || message.get("result").is_some() {
+                return Err("invalid OpenCode permission was not rejected".into());
+            }
+            log_call(call_log.as_deref(), "opencode-permission-response:rejected")?;
+            // The session survives: a valid permission still round-trips.
+            send_opencode_proxy_permission(&state, "opencode-permission-request-1", false)?;
+            continue;
+        }
+        if message.get("method").is_none()
+            && message.get("id") == Some(&json!("opencode-permission-request-1"))
+        {
+            let expected_sha = opencode_permission_fixture()
+                .pointer("/request/permission/contractSha256")
+                .cloned();
+            let resolution = message
+                .pointer("/result/resolution")
+                .and_then(Value::as_object)
+                .ok_or("OpenCode permission response omitted its resolution")?;
+            let outcome = match resolution.get("action").and_then(Value::as_str) {
+                Some("cancel") if resolution.len() == 1 => "cancel".to_owned(),
+                Some("permission_decision")
+                    if resolution.len() == 3
+                        && resolution.get("contractSha256") == expected_sha.as_ref() =>
+                {
+                    resolution
+                        .get("decision")
+                        .and_then(Value::as_str)
+                        .filter(|decision| matches!(*decision, "once" | "reject"))
+                        .ok_or("OpenCode permission decision is invalid")?
+                        .to_owned()
+                }
+                _ => return Err("OpenCode permission response changed shape".into()),
+            };
+            log_call(
+                call_log.as_deref(),
+                &format!("opencode-permission-response:{outcome}"),
+            )?;
+            if outcome != "cancel" {
+                finish_turn(&state_path, &mut state, "completed")?;
+            }
             continue;
         }
         if message.get("method").is_none()
@@ -1592,6 +1665,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     send_runtime_question(&state)?;
                 } else if emit_opencode_proxy_runtime_question {
                     send_opencode_proxy_runtime_question(&state)?;
+                } else if emit_opencode_proxy_invalid_permission {
+                    send_opencode_proxy_permission(&state, "opencode-permission-invalid-1", true)?;
+                } else if emit_opencode_proxy_permission {
+                    send_opencode_proxy_permission(&state, "opencode-permission-request-1", false)?;
                 } else if emit_runtime_elicitation {
                     send_runtime_elicitation(&state)?;
                 } else if emit_structured_activity {

@@ -526,7 +526,7 @@ impl DurableState {
         }
         validate_semantic_tool_input_digest(event_type.as_str(), &payload)?;
 
-        let sanitized_payload = sanitize_value(&payload);
+        let sanitized_payload = sanitize_event_payload(event_type.as_str(), &payload);
         if durable_semantics_changed_by_sanitization(&payload, &sanitized_payload) {
             return Err(DurableRunnerError::invalid(
                 "durable identity or validation semantics contain credential-shaped material",
@@ -1576,6 +1576,56 @@ fn durable_semantics_changed_by_sanitization(original: &Value, sanitized: &Value
         }
         _ => false,
     }
+}
+
+/// Like `sanitize_value`, but never truncates long strings. Used only for the
+/// typed OpenCode permission contract, which must persist verbatim or not at
+/// all (its digest binds the decision).
+fn sanitize_value_untruncated(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    let sanitized = if protocol_authorization_boundary(key, value) {
+                        value.clone()
+                    } else if sensitive_key(key, value) {
+                        Value::String("[REDACTED]".to_owned())
+                    } else {
+                        sanitize_value_untruncated(value)
+                    };
+                    (key.clone(), sanitized)
+                })
+                .collect(),
+        ),
+        Value::Array(values) => {
+            Value::Array(values.iter().map(sanitize_value_untruncated).collect())
+        }
+        Value::String(value) => Value::String(redact_sensitive_text_values(value)),
+        value => value.clone(),
+    }
+}
+
+/// True when the durable outbox would persist this permission contract
+/// byte-for-byte. Intake rejects contracts that redaction would rewrite.
+pub(crate) fn permission_contract_is_durably_representable(permission: &Value) -> bool {
+    sanitize_value_untruncated(permission) == *permission
+}
+
+fn sanitize_event_payload(event_type: &str, payload: &Value) -> Value {
+    let mut sanitized = sanitize_value(payload);
+    if event_type == "runtime_request.created"
+        && payload.pointer("/request/schema").and_then(Value::as_str)
+            == Some("paperclip.runtime_request.permission.v1")
+    {
+        if let (Some(permission), Some(slot)) = (
+            payload.pointer("/request/permission"),
+            sanitized.pointer_mut("/request/permission"),
+        ) {
+            *slot = sanitize_value_untruncated(permission);
+        }
+    }
+    sanitized
 }
 
 pub(crate) fn sanitize_value(value: &Value) -> Value {
@@ -3144,6 +3194,44 @@ mod tests {
             Some(&json!("api_key=[REDACTED]"))
         );
         assert_eq!(payload["diagnostic"], json!("token=[REDACTED]"));
+    }
+
+    #[test]
+    fn typed_permission_contracts_persist_untruncated_but_other_text_is_bounded() {
+        let config = config(PathBuf::from("unused"));
+        let mut state = DurableState::new(&config);
+        let diff = "+".repeat(10_000);
+        let permission = json!({
+            "schema": "paperclip.opencode_permission_contract.v1",
+            "metadata": {"diff": diff},
+        });
+        assert!(permission_contract_is_durably_representable(&permission));
+        assert!(!permission_contract_is_durably_representable(
+            &json!({"metadata": {"command": "export password=hunter2hunter2"}})
+        ));
+        state
+            .enqueue_event(
+                &config,
+                "runtime_request.created",
+                EventPriority::P0,
+                json!({
+                    "request": {
+                        "schema": "paperclip.runtime_request.permission.v1",
+                        "prompt": "x".repeat(5_000),
+                        "permission": permission,
+                    }
+                }),
+            )
+            .unwrap();
+        let payload = state.outbox[0]
+            .envelope
+            .pointer("/payload/payload")
+            .unwrap();
+        assert_eq!(payload.pointer("/request/permission"), Some(&permission));
+        assert!(payload["request"]["prompt"]
+            .as_str()
+            .unwrap()
+            .ends_with("…[truncated]"));
     }
 
     #[test]
