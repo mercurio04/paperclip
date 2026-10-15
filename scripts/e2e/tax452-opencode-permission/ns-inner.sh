@@ -18,6 +18,9 @@ if [ "$KEEP_OUT" = 1 ]; then mkdir -p "$OUT"; mount --bind /mnt "$OUT"; fi
 mount -t proc proc /proc
 # Embedded Postgres refuses uid 0: drop to an unprivileged uid in a nested
 # user namespace that keeps the same net/mount namespaces.
-exec unshare --user --map-user=1000 --map-group=1000 \
+# Not exec'd: this bash stays PID 1 of the namespace and reaps orphans. With
+# node as PID 1, a SIGKILLed server's postmaster stayed a zombie that
+# `kill(pid, 0)` still reports alive, so a restarted server refused to start.
+unshare --user --map-user=1000 --map-group=1000 \
   env -i PATH="$NODE_BIN:/usr/bin:/bin" LANG=C.UTF-8 \
   node "$HERE/driver.mjs" "$ROOT" "$OUT"

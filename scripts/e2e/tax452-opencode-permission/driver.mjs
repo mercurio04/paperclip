@@ -55,15 +55,37 @@ function record(name, expected, observed, pass, extra = {}) {
 // call #2; otherwise a final text. Requests without tools (titles) -> text.
 // Both writes target a relative path inside the run workspace.
 const WRITE_TOOL = "write";
+// Scenario switched by the driver between runs (runs are strictly serial).
+// "write2": the original two-write flow. "deny": exactly one tool call
+// (`call`) on the first main-agent request, then a final text; the tool
+// result OpenCode feeds back is kept as the observed tool-part outcome.
+let scenario = { kind: "write2" };
+const exposedToolNames = new Set();
+function messageText(m) {
+  return typeof m?.content === "string" ? m.content : JSON.stringify(m?.content ?? "");
+}
 function fixtureDecision(body) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const tools = Array.isArray(body.tools) ? body.tools.map((t) => t?.function?.name) : [];
+  for (const t of tools) exposedToolNames.add(t);
   const toolResults = messages.filter((m) => m.role === "tool");
   const last = toolResults.at(-1);
   const lastText = typeof last?.content === "string" ? last.content : JSON.stringify(last?.content ?? "");
   const rejected = /reject|denied|not allowed|permission/i.test(lastText);
   let action;
-  if (!tools.includes(WRITE_TOOL)) action = { kind: "text", text: "E2E fixture" };
+  if (scenario.kind === "deny") {
+    if (tools.length === 0) action = { kind: "text", text: "E2E fixture" };
+    else if (toolResults.length === 0) {
+      const sys = messages.filter((m) => m.role === "system").map(messageText).join("\n");
+      scenario.cwd ??= /Working directory: ([^\n]+)/.exec(sys)?.[1]?.trim() ?? null;
+      scenario.toolsExposed = tools;
+      scenario.prepare?.(scenario.cwd);
+      action = { kind: "tool", id: `call_deny_${scenario.label}`, name: scenario.call.name, args: scenario.call.args };
+    } else {
+      scenario.toolResult ??= lastText.slice(0, 600);
+      action = { kind: "text", text: "E2E fixture done." };
+    }
+  } else if (!tools.includes(WRITE_TOOL)) action = { kind: "text", text: "E2E fixture" };
   else if (toolResults.length === 0) action = { kind: "tool", id: "call_e2e_1" };
   else if (toolResults.length === 1 && !rejected) action = { kind: "tool", id: "call_e2e_2" };
   else action = { kind: "text", text: "E2E fixture done." };
@@ -74,7 +96,8 @@ function fixtureDecision(body) {
     toolCount: tools.length,
     toolResults: toolResults.length,
     lastToolResultRejected: toolResults.length ? rejected : null,
-    action: action.kind === "tool" ? `${WRITE_TOOL}:${action.id}` : "text",
+    scenario: scenario.kind === "deny" ? `deny:${scenario.label}` : scenario.kind,
+    action: action.kind === "tool" ? `${action.name ?? WRITE_TOOL}:${action.id}` : "text",
   });
   return action;
 }
@@ -106,7 +129,7 @@ const fixture = http.createServer((req, res) => {
     const action = fixtureDecision(body);
     const usage = { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 };
     const call = action.kind === "tool"
-      ? { index: 0, id: action.id, type: "function", function: { name: WRITE_TOOL, arguments: JSON.stringify({ filePath: `${COUNTER_PREFIX}${action.id}.txt`, content: "tick\n" }) } }
+      ? { index: 0, id: action.id, type: "function", function: { name: action.name ?? WRITE_TOOL, arguments: JSON.stringify(action.args ?? { filePath: `${COUNTER_PREFIX}${action.id}.txt`, content: "tick\n" }) } }
       : null;
     if (body.stream) {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
@@ -159,6 +182,35 @@ function egressProbe() {
 
 let server = null;
 let pgSql = null;
+let startServerProcess = null;
+// Process table of this PID namespace (only E2E processes are visible).
+function processTable() {
+  return execFileSync("ps", ["-eo", "pid,pgid,stat,args", "--no-headers"]).toString().split("\n").map((l) => l.trim()).filter(Boolean)
+    .map((l) => { const [pid, pgid, stat, ...args] = l.split(/\s+/); return { pid: Number(pid), pgid: Number(pgid), stat, args: args.join(" ").slice(0, 160) }; })
+    .filter((p) => !p.stat.startsWith("Z"));
+}
+// runnerd fd-execs the pinned OpenCode binary: `/proc/self/fd/N serve --hostname 127.0.0.1 --port P`.
+const isOpencode = (p) => /^\/proc\/self\/fd\/\d+ serve --hostname /.test(p.args) || /opencode-linux-x64\/bin\/opencode serve/.test(p.args);
+const isRunnerd = (p) => /paperclip-runnerd/.test(p.args);
+// SIGKILL the whole server process group (tsx + node + every child that did
+// not setsid away). Returns the survivors, which are the interesting part.
+async function stopOrphanPostgres() {
+  const pm = processTable().find((p) => /postgres/.test(p.args) && /-D /.test(p.args));
+  if (!pm) return { postmaster: null };
+  try { process.kill(pm.pid, "SIGINT"); } catch {}
+  const end = Date.now() + 30_000;
+  while (Date.now() < end && processTable().some((p) => p.pid === pm.pid)) await sleep(300);
+  return { postmaster: pm.pid, stopped: !processTable().some((p) => p.pid === pm.pid) };
+}
+async function killServerHard() {
+  const pgid = server.pid;
+  try { process.kill(-pgid, "SIGKILL"); } catch {}
+  const end = Date.now() + 15_000;
+  while (server.exitCode === null && server.signalCode === null && Date.now() < end) await sleep(200);
+  await sleep(1500);
+  const survivors = processTable().filter((p) => p.pgid !== process.pid && p.pid !== process.pid && !/^ps /.test(p.args) && !/driver\.mjs/.test(p.args));
+  return { killedPgid: pgid, exit: { code: server.exitCode, signal: server.signalCode }, survivors };
+}
 
 async function waitFor(fn, label, timeoutMs = 180_000, everyMs = 1000) {
   const end = Date.now() + timeoutMs;
@@ -276,14 +328,17 @@ async function main() {
     OPENCODE_DISABLE_SHARE: "1",
   };
   receipt.config.serverEnv = Object.fromEntries(Object.entries(serverEnv).map(([k, v]) => [k, v.startsWith(OUT) ? v.replace(OUT, "$OUT") : v]));
-  server = spawn(join(ROOT, "server/node_modules/.bin/tsx"), ["src/index.ts"], {
-    cwd: join(ROOT, "server"),
-    env: serverEnv,
-    stdio: ["ignore", fs.openSync(join(OUT, "server.log"), "a"), fs.openSync(join(OUT, "server.log"), "a")],
-    detached: true,
-  });
-  await waitFor(async () => (await api("GET", "/health").catch(() => ({ status: 0 }))).status === 200, "health", 300_000, 2000);
-  log("server healthy");
+  startServerProcess = async (overrides = {}) => {
+    server = spawn(join(ROOT, "server/node_modules/.bin/tsx"), ["src/index.ts"], {
+      cwd: join(ROOT, "server"),
+      env: { ...serverEnv, ...overrides },
+      stdio: ["ignore", fs.openSync(join(OUT, "server.log"), "a"), fs.openSync(join(OUT, "server.log"), "a")],
+      detached: true,
+    });
+    await waitFor(async () => (await api("GET", "/health").catch(() => ({ status: 0 }))).status === 200, "health", 300_000, 2000);
+    log("server healthy", server.pid);
+  };
+  await startServerProcess();
   const require = createRequire(join(ROOT, "packages/db/package.json"));
   const postgres = require("postgres");
   pgSql = postgres(`postgres://paperclip:paperclip@127.0.0.1:${PG_PORT}/paperclip`, { max: 2, onnotice: () => {} });
@@ -493,6 +548,333 @@ async function main() {
       statusA === "succeeded" && statusB === "succeeded" && assignAfter.status === 409 && assignCreateAfter.status === 409 &&
       aEnd.permissions?.invocationPolicy?.mode === "manual_only" && aEnd.permissions?.authorizationPolicy?.protectedAgent?.blockAssignment === true &&
       runAgents.length === 1 && runAgents[0].agent_id === agent.id);
+
+  // ================================================== adversarial (TAX-474)
+  const once = (r) => ({ resolution: { action: "permission_decision", decision: "once", contractSha256: r.permission.contractSha256 } });
+  const parkCounter = (cwd, tag) => {
+    const dir = join(OUT, `counter-${tag}`);
+    fs.mkdirSync(dir, { recursive: true });
+    for (const f of counterFiles(cwd)) fs.renameSync(join(cwd, f), join(dir, f));
+  };
+  const claimsFor = (runId) => pgSql`select request_id, decision, status, error from native_permission_decisions where run_id = ${runId} order by created_at`;
+  // runtime_request.resolved carries no decision: a `once` can only leave the
+  // server through a claim, so the audit row + claim are the dispatch record.
+  const onceDecisions = async (runId) => pgSql`select details->>'requestId' as request_id, details->>'status' as status from activity_log where entity_id = ${runId} and action = 'heartbeat.runtime_permission_decided' and details->>'decision' = 'once'`;
+  const eventDigest = (ev) => ev.filter((e) => !/performance|^log|output|delta/.test(e.eventType ?? e.type ?? "")).map((e) => {
+    const t = e.eventType ?? e.type; const p = eventPayload(e);
+    return /diagnostic|fail|error|runtime_request|terminal|cancel|notice|item\./.test(t) ? `${t}:${JSON.stringify(p).slice(0, 300)}` : t;
+  });
+  async function startRunAndWaitPermission(title) {
+    const { issue: iss, run } = await invokeAndGetRun(title);
+    const req = await waitFor(async () => {
+      const st = await runStatus(run.id);
+      if (st && !["queued", "running"].includes(st)) throw new Error(`${title}: run ended ${st} before a permission request: ${JSON.stringify(await runFailure(run.id))}`);
+      return pendingPermissions(await runEvents(run.id))[0];
+    }, `${title} permission`, 240_000, 1000);
+    return { issue: iss, run, req };
+  }
+  const opencodeProcs = () => processTable().filter(isOpencode).map((p) => p.pid);
+  receipt.adversarial = {};
+
+  // ---- 4. HTTP reply lost after delivery: the client sends `once`, the
+  // server claims + dispatches, the client drops the socket without ever
+  // reading the response, then retries.
+  {
+    const { run, req } = await startRunAndWaitPermission("E2E adv: lost HTTP reply");
+    const cwd = req.permission.cwd;
+    const before = counterValue(cwd);
+    const payload = JSON.stringify(once(req));
+    const sock = net.connect(SERVER_PORT, "127.0.0.1");
+    sock.pause(); // never read: the response is lost from the client's view
+    await new Promise((r) => sock.once("connect", r));
+    sock.write(`POST /api${resolvePath(run.id, req.requestId)} HTTP/1.1\r\nHost: 127.0.0.1:${SERVER_PORT}\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(payload)}\r\nConnection: close\r\n\r\n${payload}`);
+    const settled = await waitFor(async () => (await claimsFor(run.id)).find((c) => c.status !== "claimed") ?? null, "lost-reply claim settled", 30_000, 200);
+    sock.destroy();
+    const retry = await api("POST", resolvePath(run.id, req.requestId), once(req));
+    await waitFor(async () => counterValue(cwd) >= 1 || null, "lost-reply counter 1", 60_000, 500);
+    const req2 = await waitFor(async () => pendingPermissions(await runEvents(run.id)).find((r) => r.requestId !== req.requestId), "lost-reply second ask", 120_000, 1000);
+    const rej2 = await api("POST", resolvePath(run.id, req2.requestId), { resolution: { action: "permission_decision", decision: "reject", contractSha256: req2.permission.contractSha256 } });
+    const st = await waitTerminal(run.id);
+    await sleep(1000);
+    const claims = await claimsFor(run.id);
+    const ev = await runEvents(run.id);
+    const firstOnce = (await onceDecisions(run.id)).filter((e) => e.request_id === req.requestId);
+    receipt.adversarial.lostReply = { runId: run.id, requestId: req.requestId, settled, retry: { status: retry.status, body: retry.text.slice(0, 200) }, rej2: rej2.status, status: st, claims, onceEvents: firstOnce };
+    record("adv.lost_reply.retry_409_no_redelivery", "client drops the 202 after claim+dispatch; retry -> 409; exactly one delivered claim and one once resolution for the request; counter 0->1 (not 2); second ask rejected",
+      { retry: retry.status, counterBefore: before, counter: counterValue(cwd), claims: claims.map((c) => `${c.decision}:${c.status}`), onceResolutions: firstOnce.length, runStatus: st },
+      retry.status === 409 && before === 0 && counterValue(cwd) === 1 && claims.filter((c) => c.request_id === req.requestId).length === 1 &&
+        claims.find((c) => c.request_id === req.requestId)?.status === "delivered" && firstOnce.length === 1 && firstOnce[0].status === "delivered" && rej2.status === 202);
+    parkCounter(cwd, "lostReply");
+  }
+
+  // ---- 3. Board cancel while a permission is pending, then a late `once`.
+  {
+    const { run, req } = await startRunAndWaitPermission("E2E adv: cancel then late once");
+    const cwd = req.permission.cwd;
+    const ocBefore = opencodeProcs();
+    receipt.adversarial.cancelRunnerd = processTable().filter(isRunnerd).map((p) => p.pid);
+    receipt.adversarial.processesWhilePending = processTable().filter((p) => !/^ps /.test(p.args));
+    const cancel = await api("POST", `/heartbeat-runs/${run.id}/cancel`, {});
+    const late = await api("POST", resolvePath(run.id, req.requestId), once(req));
+    const st = await waitTerminal(run.id, 60_000);
+    const ocAfter = await waitFor(async () => (opencodeProcs().length === 0 ? [] : null), "opencode stopped after cancel", 30_000, 500).catch(() => opencodeProcs());
+    const late2 = await api("POST", resolvePath(run.id, req.requestId), once(req));
+    await sleep(1500);
+    const claims = await claimsFor(run.id);
+    const ev = await runEvents(run.id);
+    receipt.adversarial.cancel = { runId: run.id, cancel: cancel.status, late: late.status, late2: late2.status, status: st, opencodeBefore: ocBefore, opencodeAfter: ocAfter, claims, digest: eventDigest(ev).slice(-12) };
+    record("adv.cancel_then_once_409", "board cancel -> run cancelled; late once 409 (immediately and after terminal); 0 claims, 0 once; counter 0; OpenCode process stopped",
+      { cancel: cancel.status, late: late.status, late2: late2.status, runStatus: st, claims: claims.length, once: (await onceDecisions(run.id)).length, counter: counterValue(cwd), opencodeBefore: ocBefore.length, opencodeAfter: ocAfter.length },
+      cancel.status === 200 && late.status === 409 && late2.status === 409 && st === "cancelled" && claims.length === 0 && (await onceDecisions(run.id)).length === 0 && counterValue(cwd) === 0);
+    const ownOc = ocBefore.filter((pid) => ocAfter.includes(pid));
+    record("adv.cancel.opencode_stopped", "after board cancel of a run blocked on a permission, the run's runnerd/OpenCode exit within 30s",
+      { opencodeWhilePending: ocBefore, opencodeAfter30s: ocAfter, stillAlive: ownOc }, ocBefore.length > 0 && ownOc.length === 0, { defectIfFailed: "runnerd keeps the cancelled run's OpenCode (pending native permission) alive" });
+  }
+
+  // ---- 1. Deny surfaces: one run per surface, the fixture emits exactly
+  // that tool call. No permission request may be published and nothing may
+  // change.
+  {
+    const toolNames = [...exposedToolNames];
+    receipt.adversarial.exposedToolNames = toolNames;
+    const mcpCreate = ["paperclip_create_task", "mcp__paperclip__create_task", "paperclip_paperclip_create_task"].find((n) => toolNames.includes(n)) ?? "paperclip_create_task";
+    const outsideDir = "/tmp/e2e-outside-dir";
+    fs.mkdirSync(outsideDir, { recursive: true });
+    const surfaces = [
+      { label: "bash", call: { name: "bash", args: { command: "echo x >> e2e-deny-bash.txt", description: "e2e deny probe" } } },
+      { label: "webfetch", call: { name: "webfetch", args: { url: `http://127.0.0.1:${FIXTURE_PORT}/e2e-webfetch-probe`, format: "text" } } },
+      { label: "task", call: { name: "task", args: { description: "e2e deny", prompt: "Create the file e2e-deny-task.txt", subagent_type: "general" } } },
+      { label: "mcp_create_task", call: { name: mcpCreate, args: { title: "E2E deny MCP probe", description: "must never exist" } } },
+      { label: "unknown_tool", call: { name: "e2e_unknown_tool", args: { path: "e2e-deny-unknown.txt" } } },
+      { label: "write_abs_outside", call: { name: "write", args: { filePath: "/tmp/e2e-outside-abs.txt", content: "escape\n" } } },
+      { label: "write_symlink_escape", call: { name: "write", args: { filePath: "e2e-escape-link/escaped.txt", content: "escape\n" } },
+        prepare: (cwd) => { if (cwd && !fs.existsSync(join(cwd, "e2e-escape-link"))) fs.symlinkSync(outsideDir, join(cwd, "e2e-escape-link")); scenario.symlink = cwd ? fs.readlinkSync(join(cwd, "e2e-escape-link")) : null; } },
+    ];
+    const effects = (cwd) => ({
+      bashMarker: fs.existsSync(join(cwd, "e2e-deny-bash.txt")),
+      taskMarker: fs.existsSync(join(cwd, "e2e-deny-task.txt")),
+      unknownMarker: fs.existsSync(join(cwd, "e2e-deny-unknown.txt")),
+      absOutside: fs.existsSync("/tmp/e2e-outside-abs.txt"),
+      symlinkOutside: fs.readdirSync(outsideDir),
+      counter: counterValue(cwd),
+      webfetchHits: receipt.fixture.requests.filter((r) => r.unexpected && r.unexpected.includes("e2e-webfetch-probe")).length,
+    });
+    const results = [];
+    for (const surface of surfaces) {
+      scenario = { kind: "deny", label: surface.label, call: surface.call, prepare: surface.prepare };
+      const issuesBefore = (await pgSql`select count(*)::int as n from issues where company_id = ${company.id}`)[0].n;
+      const claimsBefore = (await pgSql`select count(*)::int as n from native_permission_decisions`)[0].n;
+      const { run } = await invokeAndGetRun(`E2E adv deny: ${surface.label}`);
+      const st = await waitTerminal(run.id, 120_000);
+      await sleep(1000);
+      const cwd = scenario.cwd ?? cwdA;
+      const ev = await runEvents(run.id);
+      const created = ev.filter((e) => (e.eventType ?? e.type) === "runtime_request.created");
+      // Driver diagnostics reach the run as harness.diagnostic or, for
+      // turn-scoped warnings, as provider.notice.recorded{summary: code}.
+      const diags = [
+        ...summarizeEvents(ev).filter((e) => e.type === "harness.diagnostic").map((e) => e.code),
+        ...ev.filter((e) => (e.eventType ?? e.type) === "provider.notice.recorded").map((e) => `notice:${eventPayload(e).summary}`),
+      ].filter((c) => c !== "provider_startup_ownership");
+      const issuesAfter = (await pgSql`select count(*)::int as n from issues where company_id = ${company.id}`)[0].n;
+      const probeIssues = (await pgSql`select count(*)::int as n from issues where title = 'E2E deny MCP probe'`)[0].n;
+      const claimsAfter = (await pgSql`select count(*)::int as n from native_permission_decisions`)[0].n;
+      const fx = effects(cwd);
+      const r = {
+        surface: surface.label, tool: surface.call.name, runId: run.id, runStatus: st, cwd,
+        toolExposedToModel: (scenario.toolsExposed ?? []).includes(surface.call.name),
+        toolCallEmitted: receipt.fixture.requests.some((q) => q.scenario === `deny:${surface.label}` && q.action !== "text"),
+        permissionRequestsCreated: created.length, diagnostics: diags,
+        toolResult: scenario.toolResult ?? null,
+        newIssues: issuesAfter - issuesBefore - 1, probeIssues, newClaims: claimsAfter - claimsBefore, effects: fx,
+        symlink: scenario.symlink,
+        fixtureCalls: receipt.fixture.requests.filter((q) => q.scenario === `deny:${surface.label}`).map((q) => q.action),
+        digest: eventDigest(ev),
+      };
+      results.push(r);
+      const zeroEffect = !fx.bashMarker && !fx.taskMarker && !fx.unknownMarker && !fx.absOutside && fx.symlinkOutside.length === 0 && fx.counter === 0 && fx.webfetchHits === 0;
+      record(`adv.deny.${surface.label}`, "tool call reaches OpenCode; no permission request published; no claim; no file/network/Paperclip effect; run terminal",
+        { runStatus: st, exposed: r.toolExposedToModel, emitted: r.toolCallEmitted, requests: created.length, claims: r.newClaims, newIssues: r.newIssues, diagnostics: diags, toolResult: (r.toolResult ?? "").slice(0, 160), effects: fx },
+        r.toolCallEmitted && created.length === 0 && r.newClaims === 0 && r.newIssues === 0 && probeIssues === 0 && zeroEffect && !["queued", "running"].includes(st) &&
+          (surface.label !== "write_symlink_escape" || (r.symlink === outsideDir && diags.includes("notice:permission_target_outside_workspace"))));
+    }
+    scenario = { kind: "write2" };
+    receipt.adversarial.deny = results;
+    try { fs.unlinkSync(join(results.at(-1).cwd, "e2e-escape-link")); } catch {}
+  }
+
+  // ---- 2. Restart without replay. (a) a request pending with no decision;
+  // (b) a decision durably claimed (row `claimed`) and the server killed
+  // before any dispatch. The claimed row is written with the server's own
+  // claim shape right before SIGKILL; no production seam exists between the
+  // claim INSERT and the dispatch.
+  for (const variant of ["pending", "claimed"]) {
+    const preOc = opencodeProcs();
+    const preRd = processTable().filter(isRunnerd).map((p) => p.pid);
+    const { run, req } = await startRunAndWaitPermission(`E2E adv: restart (${variant})`);
+    const cwd = req.permission.cwd;
+    const before = { counter: counterValue(cwd), opencode: opencodeProcs(), runnerd: processTable().filter(isRunnerd).map((p) => p.pid) };
+    if (variant === "claimed") {
+      await pgSql`insert into native_permission_decisions (company_id, agent_id, run_id, request_id, turn_id, contract_sha256, decision, resolver_user_id, status)
+        values (${company.id}, ${agent.id}, ${run.id}, ${req.requestId}, ${req.turnId}, ${req.permission.contractSha256}, 'once', 'local-admin', 'claimed')`;
+    }
+    const killed = await killServerHard();
+    // The embedded postmaster is in the server group and dies with it (its
+    // workers exit on postmaster death); if one survived anyway, fast-stop it
+    // so the restart is a clean crash of the whole service. runnerd and
+    // OpenCode (own session) are deliberately left as they are.
+    killed.pgProbe = await pgSql`select current_setting('data_directory', true) as dd, current_user as u, (select rolsuper from pg_roles where rolname = current_user) as su`.then((r) => r[0]).catch((e) => ({ error: e.message }));
+    killed.pgStopped = await stopOrphanPostgres();
+    const fixtureMark = receipt.fixture.requests.length;
+    await startServerProcess();
+    const afterBoot = { runStatus: await runStatus(run.id), opencode: opencodeProcs(), runnerd: processTable().filter(isRunnerd).map((p) => p.pid) };
+    const probe1 = await api("POST", resolvePath(run.id, req.requestId), once(req));
+    const st = await waitTerminal(run.id, 180_000).catch((e) => `not terminal: ${e.message}`);
+    const probe2 = await api("POST", resolvePath(run.id, req.requestId), once(req));
+    await sleep(3000);
+    const ev = await runEvents(run.id);
+    const claims = await claimsFor(run.id);
+    const ocLeft = opencodeProcs();
+    const replayed = receipt.fixture.requests.slice(fixtureMark).filter((q) => q.action && q.action !== "text");
+    const row = (await pgSql`select status, error_code, error from heartbeat_runs where id = ${run.id}`)[0];
+    const onceRows = await onceDecisions(run.id);
+    receipt.adversarial[`restart_${variant}`] = { runId: run.id, requestId: req.requestId, before, killed, afterBoot, probe1: { status: probe1.status, body: probe1.text.slice(0, 200) }, probe2: probe2.status, terminal: st, row, claims, opencodeLeft: ocLeft, fixtureAfterRestart: receipt.fixture.requests.slice(fixtureMark), digest: eventDigest(ev).slice(-14) };
+    // A probe that slips in before reconciliation may insert a claim, but it
+    // must settle as `stale` (provably not dispatched); a pre-crash claim must
+    // stay blocked (claimed/dispatch_uncertain). Never `delivered`.
+    const expectedClaims = variant === "pending"
+      ? claims.every((c) => c.status === "stale")
+      : claims.length === 1 && claims[0].decision === "once" && ["claimed", "dispatch_uncertain"].includes(claims[0].status);
+    record(`adv.restart_${variant}.no_replay`, `server SIGKILL with the permission ${variant === "pending" ? "pending (no decision)" : "claimed (row claimed, not dispatched)"}; after restart: once -> 409 (twice), 0 once resolutions, counter 0, no new mutating tool call from the provider, run terminal/reconciled, no OpenCode left${variant === "claimed" ? ", claim never delivered" : ", no claim"}`,
+      { probe1: probe1.status, probe2: probe2.status, runStatus: st, errorCode: row?.error_code, once: onceRows.filter((o) => o.status === "delivered").length, counter: counterValue(cwd), replayedToolCalls: replayed.length, claims: claims.map((c) => `${c.decision}:${c.status}`), opencodeLeft: ocLeft.length, survivorsAfterKill: killed.survivors.map((p) => p.args.slice(0, 60)) },
+      probe1.status === 409 && probe2.status === 409 && onceRows.filter((o) => o.status === "delivered").length === 0 && counterValue(cwd) === 0 && replayed.length === 0 && expectedClaims &&
+        typeof st === "string" && !st.startsWith("not terminal"));
+    const runOc = before.opencode.filter((pid) => !preOc.includes(pid));
+    const runRunnerd = before.runnerd.filter((pid) => !preRd.includes(pid));
+    const leftover = await waitFor(async () => { const alive = processTable().map((p) => p.pid); const l = [...runOc, ...runRunnerd].filter((pid) => alive.includes(pid)); return l.length === 0 ? [] : null; }, "orphans reaped", 30_000, 1000).catch(() => { const alive = processTable().map((p) => p.pid); return [...runOc, ...runRunnerd].filter((pid) => alive.includes(pid)); });
+    record(`adv.restart_${variant}.orphan_processes_stopped`, "after restart + reconciliation, the killed server's runnerd/OpenCode for this run exit within 30s",
+      { opencodeBeforeKill: runOc, runnerdBeforeKill: runRunnerd, stillAlive: leftover }, leftover.length === 0, { defectIfFailed: "runnerd/OpenCode of a crashed server's run survive and are not reaped after native_restart_recovery_blocked" });
+  }
+
+  await authenticatedPhase({ foreignSha: sha });
+}
+
+// ------------------------------------------- 5. authenticated/private phase
+// A second disposable instance (own instance id and embedded Postgres) in
+// authenticated/private mode. Users are created through the real better-auth
+// API; the first one claims the instance (DEPLOYMENT-MODES.md §8, browser
+// claim endpoint, driven with the session cookie + trusted Origin). Company
+// memberships of the non-admin users are seeded in SQL: inviting needs a
+// mail/invite acceptance flow that is out of scope here.
+const ORIGIN = `http://127.0.0.1:${SERVER_PORT}`;
+async function sapi(method, path, body, cookie) {
+  const res = await fetch(`${API}${path}`, {
+    method,
+    headers: { "content-type": "application/json", origin: ORIGIN, referer: `${ORIGIN}/`, ...(cookie ? { cookie } : {}) },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+  const cookies = (res.headers.getSetCookie?.() ?? []).map((c) => c.split(";")[0]).filter((c) => !/=$/.test(c));
+  return { status: res.status, json, text: text.slice(0, 500), cookie: cookies.join("; ") || null };
+}
+async function smust(method, path, body, cookie) {
+  const r = await sapi(method, path, body, cookie);
+  if (r.status >= 400) throw new Error(`[auth] ${method} ${path} -> ${r.status} ${r.text}`);
+  return r;
+}
+async function authenticatedPhase({ foreignSha }) {
+  const A = (receipt.authenticated = { instanceId: `${INSTANCE}-auth` });
+  A.killPhase1 = await killServerHard();
+  A.killPhase1.pgStopped = await stopOrphanPostgres();
+  try { await pgSql?.end({ timeout: 2 }); } catch {}
+  await startServerProcess({
+    PAPERCLIP_INSTANCE_ID: A.instanceId,
+    PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+    PAPERCLIP_DEPLOYMENT_EXPOSURE: "private",
+    PAPERCLIP_PUBLIC_URL: ORIGIN,
+    PAPERCLIP_AUTH_RATE_LIMIT_ENABLED: "false",
+    BETTER_AUTH_SECRET: createHash("sha256").update(`e2e-${Date.now()}-${Math.random()}`).digest("hex"),
+  });
+  const require = createRequire(join(ROOT, "packages/db/package.json"));
+  pgSql = require("postgres")(`postgres://paperclip:paperclip@127.0.0.1:${PG_PORT}/paperclip`, { max: 2, onnotice: () => {} });
+  const password = createHash("sha256").update(`pw-${Math.random()}`).digest("hex").slice(0, 24);
+  const signUp = async (who) => {
+    const r = await smust("POST", "/auth/sign-up/email", { email: `${who}@e2e.invalid`, password, name: `E2E ${who}` });
+    return { userId: r.json?.user?.id, cookie: r.cookie };
+  };
+  const health = (await sapi("GET", "/health")).json;
+  A.healthBefore = { deploymentMode: health?.deploymentMode, deploymentExposure: health?.deploymentExposure, bootstrapStatus: health?.bootstrapStatus };
+  const admin = await signUp("admin");
+  const claim = await sapi("POST", "/bootstrap/claim", {}, admin.cookie);
+  const anon = await sapi("POST", "/companies", { name: "anon" });
+  A.bootstrap = { claim: claim.status, anonCreateCompany: anon.status };
+  record("auth.bootstrap_admin_claim", "authenticated/private instance; first signed-up user claims via POST /bootstrap/claim (200); anonymous mutation 401/403",
+    { health: A.healthBefore, claim: claim.status, anon: anon.status }, claim.status === 200 && [401, 403].includes(anon.status));
+  const C = admin.cookie;
+  await smust("PATCH", "/instance/settings/experimental", { enableNativeRunner: true }, C);
+  const company = (await smust("POST", "/companies", { name: "E2E auth company 1" }, C)).json;
+  const company2 = (await smust("POST", "/companies", { name: "E2E auth company 2" }, C)).json;
+  const agentRes = await smust("POST", `/companies/${company.id}/agents`, {
+    name: "Bombero E2E auth", role: "engineer", adapterType: "paperclip_runner", inert: true,
+    adapterConfig: { provider: "opencode", model: `llamacpp/${MODEL_ID}`, opencodePermissionProfile: "restricted_v1", llamaCppBaseUrl: `http://127.0.0.1:${FIXTURE_PORT}/v1` },
+  }, C);
+  const agent = agentRes.json;
+  await smust("POST", `/agents/${agent.id}/resume`, {}, C);
+  const iss = (await smust("POST", `/companies/${company.id}/issues`, { title: "E2E auth permission", status: "todo" }, C)).json;
+  const wake = await smust("POST", `/agents/${agent.id}/wakeup`, { source: "on_demand", reason: "e2e_human_invocation", payload: { issueId: iss.id } }, C);
+  const runId = wake.json.id;
+  A.ids = { companyId: company.id, company2Id: company2.id, agentId: agent.id, runId, adminUserId: admin.userId };
+  const req = await waitFor(async () => {
+    const st = (await sapi("GET", `/heartbeat-runs/${runId}`, undefined, C)).json?.status;
+    if (st && !["queued", "running"].includes(st)) throw new Error(`auth run ended ${st} before a permission request`);
+    const evs = (await sapi("GET", `/heartbeat-runs/${runId}/events?afterSeq=0&limit=1000`, undefined, C)).json;
+    return pendingPermissions(Array.isArray(evs) ? evs : [])[0];
+  }, "auth run permission", 240_000, 1000);
+  const cwd = req.permission.cwd;
+  const path = `/heartbeat-runs/${runId}/runtime-requests/${encodeURIComponent(req.requestId)}/resolve`;
+  const onceBody = (sha) => ({ resolution: { action: "permission_decision", decision: "once", contractSha256: sha } });
+
+  // Users: a non-admin member of the same company and a non-admin member of
+  // another company (memberships seeded, users created via the auth API).
+  const member = await signUp("member");
+  const outsider = await signUp("outsider");
+  await pgSql`insert into company_memberships (company_id, principal_type, principal_id, status, membership_role) values (${company.id}, 'user', ${member.userId}, 'active', 'member')`;
+  await pgSql`insert into company_memberships (company_id, principal_type, principal_id, status, membership_role) values (${company2.id}, 'user', ${outsider.userId}, 'active', 'member')`;
+  // Stale admin session: a second admin session, then the first one signs out.
+  const adminStale = admin.cookie;
+  const relog = await smust("POST", "/auth/sign-in/email", { email: "admin@e2e.invalid", password }, undefined);
+  const signOut = await sapi("POST", "/auth/sign-out", {}, adminStale);
+  const C2 = relog.cookie;
+
+  const probes = {
+    memberSameCompany: await sapi("POST", path, onceBody(req.permission.contractSha256), member.cookie),
+    outsiderOtherCompany: await sapi("POST", path, onceBody(req.permission.contractSha256), outsider.cookie),
+    adminSignedOutSession: await sapi("POST", path, onceBody(req.permission.contractSha256), adminStale),
+    adminOtherRunSha: await sapi("POST", path, onceBody(foreignSha), C2),
+    adminNoOrigin: await (async () => { const r = await fetch(`${API}${path}`, { method: "POST", headers: { "content-type": "application/json", cookie: C2 }, body: JSON.stringify(onceBody(req.permission.contractSha256)) }); return { status: r.status, text: (await r.text()).slice(0, 200) }; })(),
+  };
+  // Other-run crossing: the request id of this run posted under another run
+  // of the same instance does not exist there.
+  await sleep(1500);
+  const claimsAfterProbes = await pgSql`select decision, status from native_permission_decisions where run_id = ${runId}`;
+  A.probes = Object.fromEntries(Object.entries(probes).map(([k, v]) => [k, { status: v.status, body: v.text.slice(0, 200) }]));
+  A.signOut = signOut.status;
+  record("auth.member_non_admin_403", "non-admin member of the run's company -> 403, no claim", { status: probes.memberSameCompany.status, body: probes.memberSameCompany.text.slice(0, 160) }, probes.memberSameCompany.status === 403);
+  record("auth.other_company_user_403_404", "user of another company -> 403/404, no claim", { status: probes.outsiderOtherCompany.status, body: probes.outsiderOtherCompany.text.slice(0, 160) }, [403, 404].includes(probes.outsiderOtherCompany.status));
+  record("auth.admin_signed_out_session_401", "admin cookie of a signed-out session -> 401/403, no claim", { signOut: signOut.status, status: probes.adminSignedOutSession.status }, signOut.status === 200 && [401, 403].includes(probes.adminSignedOutSession.status));
+  record("auth.admin_other_run_sha_409", "instance admin (fresh session) with another run's contract sha -> 409", { status: probes.adminOtherRunSha.status }, probes.adminOtherRunSha.status === 409);
+  record("auth.admin_without_trusted_origin_403", "instance admin session without Origin/Referer -> 403 (board mutation guard)", { status: probes.adminNoOrigin.status, body: probes.adminNoOrigin.text }, probes.adminNoOrigin.status === 403);
+  record("auth.zero_dispatch_after_probes", "0 claims, counter 0, request still pending", { claims: claimsAfterProbes.length, counter: counterValue(cwd) }, claimsAfterProbes.length === 0 && counterValue(cwd) === 0);
+  // The legitimate admin finally rejects: exactly one claim, delivered.
+  const rej = await sapi("POST", path, { resolution: { action: "permission_decision", decision: "reject", contractSha256: req.permission.contractSha256 } }, C2);
+  const st = await waitFor(async () => { const s2 = (await sapi("GET", `/heartbeat-runs/${runId}`, undefined, C2)).json?.status; return s2 && !["queued", "running"].includes(s2) ? s2 : null; }, "auth run terminal", 120_000);
+  const claimsEnd = await pgSql`select decision, status, resolver_user_id from native_permission_decisions where run_id = ${runId}`;
+  A.end = { reject: rej.status, runStatus: st, claims: claimsEnd };
+  record("auth.admin_reject_single_claim", "instance admin reject -> 202; exactly one claim (reject, delivered, resolver = admin user); counter 0",
+    { reject: rej.status, runStatus: st, claims: claimsEnd.map((c) => `${c.decision}:${c.status}:${c.resolver_user_id === admin.userId ? "admin" : c.resolver_user_id}`), counter: counterValue(cwd) },
+    rej.status === 202 && claimsEnd.length === 1 && claimsEnd[0].decision === "reject" && claimsEnd[0].status === "delivered" && claimsEnd[0].resolver_user_id === admin.userId && counterValue(cwd) === 0);
 }
 
 let failure = null;
