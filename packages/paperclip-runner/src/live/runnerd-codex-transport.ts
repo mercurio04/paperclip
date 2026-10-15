@@ -3372,6 +3372,9 @@ const OPEN_CODE_RUNNER_ENVIRONMENT_KEYS = new Set([
   "PATHEXT",
   "WINDIR",
   "RUST_BACKTRACE",
+  // Bounded TTL of a pending typed permission (restricted_v1); the proxy
+  // validates it and falls back to the driver default when unset.
+  "PAPERCLIP_OPENCODE_PERMISSION_TTL_MS",
   "OPENROUTER_API_KEY",
   "PAPERCLIP_NATIVE_MCP_NAME",
   "PAPERCLIP_NATIVE_MCP_URL",
@@ -6167,8 +6170,26 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         const requestId = record(
           record(event.envelope.payload).payload,
         ).requestId;
-        if (typeof requestId === "string")
+        if (typeof requestId === "string") {
+          const bridged = this.#bridgedRuntimeInputs.get(requestId);
           this.#bridgedRuntimeInputs.delete(requestId);
+          // TAX-452: runnerd settled a typed permission without a delivered
+          // decision (TTL expiry, provider cascade reject, terminal turn). The
+          // native permission is already rejected; settle the bridged server
+          // request so the controller publishes it as no longer pending and
+          // refuses any later decision instead of dispatching it.
+          if (
+            bridged?.permissionContractSha256 !== undefined &&
+            event.eventType !== "runtime_request.resolved"
+          )
+            this.#queue.push({
+              method: "serverRequest/resolved",
+              params: {
+                ...(this.#threadId ? { threadId: this.#threadId } : {}),
+                requestId,
+              },
+            });
+        }
         continue;
       }
       const sessionUpdatePayload = record(eventPayload);

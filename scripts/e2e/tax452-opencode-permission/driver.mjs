@@ -24,6 +24,11 @@ const HOME = join(OUT, "home");
 const PCHOME = join(OUT, "pchome");
 const INSTANCE = "e2e-tax452";
 const RUNNERD = join(ROOT, "packages/paperclip-runner/runner/target/release/paperclip-runnerd");
+// Separate build with the non-default `e2e-fault-injection` Cargo feature; the
+// default RUNNERD above must not contain the seam.
+const RUNNERD_FAULT = join(ROOT, "packages/paperclip-runner/runner/target/e2e-fault/paperclip-runnerd");
+const FAULT_DIR = "/tmp/paperclip-e2e-fault"; // private tmpfs of the namespace
+const PERMISSION_TTL_MS = 8000;
 
 const receipt = {
   schema: "tax452.e2e.receipt.v1",
@@ -60,6 +65,7 @@ const WRITE_TOOL = "write";
 // (`call`) on the first main-agent request, then a final text; the tool
 // result OpenCode feeds back is kept as the observed tool-part outcome.
 let scenario = { kind: "write2" };
+let fixturePhase = null;
 const exposedToolNames = new Set();
 function messageText(m) {
   return typeof m?.content === "string" ? m.content : JSON.stringify(m?.content ?? "");
@@ -85,6 +91,12 @@ function fixtureDecision(body) {
       scenario.toolResult ??= lastText.slice(0, 600);
       action = { kind: "text", text: "E2E fixture done." };
     }
+  } else if (scenario.kind === "parallel2") {
+    // Two writes in ONE model response: OpenCode asks both permissions while
+    // the first is still pending (stale/cascade crossing case).
+    if (!tools.includes(WRITE_TOOL)) action = { kind: "text", text: "E2E fixture" };
+    else if (toolResults.length === 0) action = { kind: "tool", id: "call_par_1", extra: [{ id: "call_par_2" }] };
+    else action = { kind: "text", text: "E2E fixture done." };
   } else if (!tools.includes(WRITE_TOOL)) action = { kind: "text", text: "E2E fixture" };
   else if (toolResults.length === 0) action = { kind: "tool", id: "call_e2e_1" };
   else if (toolResults.length === 1 && !rejected) action = { kind: "tool", id: "call_e2e_2" };
@@ -97,6 +109,7 @@ function fixtureDecision(body) {
     toolResults: toolResults.length,
     lastToolResultRejected: toolResults.length ? rejected : null,
     scenario: scenario.kind === "deny" ? `deny:${scenario.label}` : scenario.kind,
+    phase: fixturePhase,
     action: action.kind === "tool" ? `${action.name ?? WRITE_TOOL}:${action.id}` : "text",
   });
   return action;
@@ -128,14 +141,14 @@ const fixture = http.createServer((req, res) => {
     try { body = JSON.parse(raw); } catch {}
     const action = fixtureDecision(body);
     const usage = { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 };
-    const call = action.kind === "tool"
-      ? { index: 0, id: action.id, type: "function", function: { name: action.name ?? WRITE_TOOL, arguments: JSON.stringify(action.args ?? { filePath: `${COUNTER_PREFIX}${action.id}.txt`, content: "tick\n" }) } }
-      : null;
+    const toolCall = (a, index) => ({ index, id: a.id, type: "function", function: { name: a.name ?? WRITE_TOOL, arguments: JSON.stringify(a.args ?? { filePath: `${COUNTER_PREFIX}${a.id}.txt`, content: "tick\n" }) } });
+    const calls = action.kind === "tool" ? [action, ...(action.extra ?? [])].map(toolCall) : [];
+    const call = calls[0] ?? null;
     if (body.stream) {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
       res.write(chunk({ role: "assistant" }));
       if (call) {
-        res.write(chunk({ tool_calls: [call] }));
+        res.write(chunk({ tool_calls: calls }));
         res.write(chunk({}, "tool_calls", usage));
       } else {
         res.write(chunk({ content: action.text }));
@@ -147,7 +160,7 @@ const fixture = http.createServer((req, res) => {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
       id: "chatcmpl-e2e", object: "chat.completion", created: Math.floor(Date.now() / 1000), model: MODEL_ID,
-      choices: [{ index: 0, finish_reason: call ? "tool_calls" : "stop", message: call ? { role: "assistant", content: null, tool_calls: [{ id: call.id, type: "function", function: call.function }] } : { role: "assistant", content: action.text } }],
+      choices: [{ index: 0, finish_reason: call ? "tool_calls" : "stop", message: call ? { role: "assistant", content: null, tool_calls: calls.map((c) => ({ id: c.id, type: "function", function: c.function })) } : { role: "assistant", content: action.text } }],
       usage,
     }));
   });
@@ -301,6 +314,7 @@ async function main() {
     opencode: execFileSync(ocBin, ["--version"], { env: { PATH: process.env.PATH, HOME } }).toString().trim(),
     opencodeBinarySha256: sha256File(ocBin),
     runnerdSha256: sha256File(RUNNERD),
+    runnerdFaultSha256: fs.existsSync(RUNNERD_FAULT) ? sha256File(RUNNERD_FAULT) : null,
     paperclipServerVersion: JSON.parse(fs.readFileSync(join(ROOT, "server/package.json"), "utf8")).version,
   };
 
@@ -556,7 +570,20 @@ async function main() {
     fs.mkdirSync(dir, { recursive: true });
     for (const f of counterFiles(cwd)) fs.renameSync(join(cwd, f), join(dir, f));
   };
-  const claimsFor = (runId) => pgSql`select request_id, decision, status, error from native_permission_decisions where run_id = ${runId} order by created_at`;
+  const claimsFor = (runId) => pgSql`select request_id, decision, status, error, native_outcome from native_permission_decisions where run_id = ${runId} order by created_at`;
+  // native_outcome = what OpenCode actually received (driver settle signal).
+  // Consistency with the counter (the OpenCode-side effect of a native `once`):
+  // once => once_applied; reject/no reply => rejected_* | unknown | null.
+  // Every delivered claim must carry a non-null outcome: the proxy reports it
+  // post-delivery and runnerd relays it (`permission_native_outcome`).
+  // TAX452_REQUIRE_NATIVE_OUTCOME=0 relaxes that to "null allowed" (debug).
+  const requireNativeOutcome = process.env.TAX452_REQUIRE_NATIVE_OUTCOME !== "0";
+  const nativeOutcomeConsistent = (claim, onceObserved) => {
+    const o = claim.native_outcome ?? null;
+    if (o !== null && !["once_applied", "rejected_terminal", "rejected_drift", "rejected_expired", "unknown"].includes(o)) return false;
+    if (requireNativeOutcome && claim.status === "delivered" && o === null) return false;
+    return onceObserved ? (o === null || o === "once_applied") && (!requireNativeOutcome || o === "once_applied") : o !== "once_applied";
+  };
   // runtime_request.resolved carries no decision: a `once` can only leave the
   // server through a claim, so the audit row + claim are the dispatch record.
   const onceDecisions = async (runId) => pgSql`select details->>'requestId' as request_id, details->>'status' as status from activity_log where entity_id = ${runId} and action = 'heartbeat.runtime_permission_decided' and details->>'decision' = 'once'`;
@@ -703,6 +730,108 @@ async function main() {
     try { fs.unlinkSync(join(results.at(-1).cwd, "e2e-escape-link")); } catch {}
   }
 
+  // ---- 6. Simultaneous board cancel || `once` (TAX-476 pending heredado).
+  // Both requests leave together; whichever wins, the run must end terminal,
+  // no native `once` may happen after the terminal, a later decision is 409,
+  // and the counter/claims must agree with the winner.
+  {
+    const iterations = [];
+    for (let i = 1; i <= 3; i += 1) {
+      const { run, req } = await startRunAndWaitPermission(`E2E adv: cancel||once #${i}`);
+      const cwd = req.permission.cwd;
+      const [cancel, dec] = await Promise.all([
+        api("POST", `/heartbeat-runs/${run.id}/cancel`, {}),
+        api("POST", resolvePath(run.id, req.requestId), once(req)),
+      ]);
+      const st = await waitTerminal(run.id, 90_000).catch((e) => `not terminal: ${e.message}`);
+      const counterAtTerminal = counterValue(cwd);
+      await sleep(3000);
+      const late = await api("POST", resolvePath(run.id, req.requestId), once(req));
+      const counterAfter = counterValue(cwd);
+      // The native outcome arrives asynchronously after the delivery.
+      let claims = await claimsFor(run.id);
+      for (let w = 0; w < 20 && claims.some((c) => c.status === "delivered" && c.native_outcome == null); w += 1) {
+        await sleep(500);
+        claims = await claimsFor(run.id);
+      }
+      const onceRows = await onceDecisions(run.id);
+      const ev = await runEvents(run.id);
+      const delivered = claims.filter((c) => c.status === "delivered");
+      const winner = dec.status === 202 ? (counterAfter === 1 ? "once_executed" : "once_claimed_lost_to_terminal") : "cancel";
+      const it = { i, runId: run.id, cancel: cancel.status, decision: dec.status, decisionBody: dec.text.slice(0, 160), runStatus: st, late: late.status,
+        counterAtTerminal, counterAfter, claims: claims.map((c) => `${c.decision}:${c.status}:${c.native_outcome ?? "null"}`), onceRows: onceRows.map((o) => o.status), winner,
+        digest: eventDigest(ev).filter((d) => /runtime_request|permission|cancel|terminal/.test(d)).slice(-10) };
+      it.pass = cancel.status === 200 && [202, 409].includes(dec.status) && typeof st === "string" && !st.startsWith("not terminal") &&
+        late.status === 409 && counterAfter <= 1 && counterAfter === counterAtTerminal &&
+        claims.length <= 1 && delivered.length <= 1 &&
+        (dec.status === 409 ? claims.filter((c) => c.status === "delivered").length === 0 && counterAfter === 0 : claims.length === 1 && claims[0].decision === "once") &&
+        (counterAfter === 1 ? dec.status === 202 && delivered.length === 1 : true) &&
+        // A delivered once claim must mean the once won before the terminal,
+        // unless the driver recorded that OpenCode got a native reject.
+        (delivered.some((c) => c.decision === "once")
+          ? counterAfter === 1 || delivered.every((c) => /^rejected_/.test(c.native_outcome ?? ""))
+          : true) &&
+        // (a) never a native once after terminal; (b) every claim's
+        // native_outcome agrees with what OpenCode received.
+        counterAfter === counterAtTerminal &&
+        claims.every((c) => nativeOutcomeConsistent(c, counterAfter === 1)) &&
+        onceRows.filter((o) => o.status === "delivered").length === delivered.filter((c) => c.decision === "once").length;
+      iterations.push(it);
+      parkCounter(cwd, `cancelOnce${i}`);
+    }
+    receipt.adversarial.cancelOnceRace = iterations;
+    record("adv.cancel_once_race.single_terminal_winner", "3x Promise.all(board cancel, once): run terminal; decision 202|409; late once 409; counter <=1 and unchanged after terminal (no native once after terminal); claims <=1, once 409 => 0 delivered claims and counter 0; counter 1 => decision 202 + one delivered claim; once audit rows match delivered claims; native_outcome consistent with OpenCode (counter 1 => once_applied|null, else never once_applied; delivered once with counter 0 only if native_outcome rejected_*)",
+      iterations.map((x) => ({ i: x.i, cancel: x.cancel, decision: x.decision, runStatus: x.runStatus, late: x.late, counter: `${x.counterAtTerminal}->${x.counterAfter}`, claims: x.claims, winner: x.winner, pass: x.pass })),
+      iterations.length === 3 && iterations.every((x) => x.pass),
+      { defectIfFailed: "a once that lost to the terminal cancel inside the driver (native reject) is still recorded as a delivered claim: delivered means 'handed to runnerd', not 'executed'" });
+  }
+
+  // ---- 7. Stale request of the same run (TAX-476 pending heredado): the
+  // model asks two writes in one response, so two permissions are pending in
+  // the same turn. Rejecting the first makes OpenCode cascade-reject the
+  // second natively; a later `once` for that settled request must be 409 with
+  // zero dispatch, both while the run continues and after the turn ended.
+  {
+    scenario = { kind: "parallel2" };
+    const { run } = await invokeAndGetRun("E2E adv: stale cascaded permission");
+    const reqs = await waitFor(async () => {
+      const st = await runStatus(run.id);
+      if (st && !["queued", "running"].includes(st)) throw new Error(`stale case: run ended ${st} before two permissions: ${JSON.stringify(await runFailure(run.id))}`);
+      const p = pendingPermissions(await runEvents(run.id));
+      return p.length >= 2 ? p : null;
+    }, "two concurrent permissions", 240_000, 1000).catch(async (e) => ({ error: e.message, pending: pendingPermissions(await runEvents(run.id)).map((r) => r.requestId) }));
+    if (!Array.isArray(reqs)) {
+      receipt.adversarial.stale = { runId: run.id, notReproduced: reqs };
+      record("adv.stale_cascaded_permission_409", "two permissions pending in one turn; reject #1 -> OpenCode cascade-rejects #2; once on #2 -> 409, 0 dispatch", { notReproduced: reqs }, false,
+        { defectIfFailed: "OpenCode did not publish two concurrent permissions; stale crossing not exercised" });
+      await api("POST", `/heartbeat-runs/${run.id}/cancel`, {});
+      await waitTerminal(run.id, 60_000).catch(() => null);
+    } else {
+      const [r1, r2] = reqs;
+      const cwd = r1.permission.cwd;
+      const rej1 = await api("POST", resolvePath(run.id, r1.requestId), { resolution: { action: "permission_decision", decision: "reject", contractSha256: r1.permission.contractSha256 } });
+      // Wait until the server no longer lists #2 as pending (runnerd retired
+      // it after the proxy reported the provider cascade) or 10s.
+      const settledLive = await waitFor(async () => (!pendingPermissions(await runEvents(run.id)).some((r) => r.requestId === r2.requestId) ? true : null), "stale #2 settled", 10_000, 250).catch(() => false);
+      const liveOnce = await api("POST", resolvePath(run.id, r2.requestId), once(r2));
+      const st = await waitTerminal(run.id, 90_000).catch((e) => `not terminal: ${e.message}`);
+      await sleep(1500);
+      const afterOnce = await api("POST", resolvePath(run.id, r2.requestId), once(r2));
+      const claims = await claimsFor(run.id);
+      const ev = await runEvents(run.id);
+      const created = ev.filter((e) => (e.eventType ?? e.type) === "runtime_request.created").length;
+      receipt.adversarial.stale = { runId: run.id, requests: [r1.requestId, r2.requestId], rej1: rej1.status, settledLive, liveOnce: { status: liveOnce.status, body: liveOnce.text.slice(0, 200) }, afterOnce: afterOnce.status, runStatus: st, claims, counter: counterValue(cwd), created,
+        digest: eventDigest(ev).filter((d) => /runtime_request|permission|terminal|turn\./.test(d)).slice(-14) };
+      record("adv.stale_cascaded_permission_409", "two permissions in one turn; reject #1 (202) -> OpenCode cascade-rejects #2 natively; server stops listing #2; once on #2 while the run is live -> 409 and again after the turn ended -> 409; only #1's reject claim (delivered); counter 0; no re-prompt",
+        { rej1: rej1.status, serverSettledStale: settledLive, liveOnce: liveOnce.status, afterTurnOnce: afterOnce.status, runStatus: st, claims: claims.map((c) => `${c.request_id === r1.requestId ? "r1" : "r2"}:${c.decision}:${c.status}`), counter: counterValue(cwd), permissionsCreated: created },
+        rej1.status === 202 && settledLive === true && liveOnce.status === 409 && afterOnce.status === 409 && claims.length === 1 && claims[0].request_id === r1.requestId && claims[0].status === "delivered" &&
+          counterValue(cwd) === 0 && created === 2 && typeof st === "string" && !st.startsWith("not terminal"),
+        { defectIfFailed: "a permission the provider already settled (cascade reject) stays decidable on the server and a later once is dispatched" });
+      parkCounter(cwd, "stale");
+    }
+    scenario = { kind: "write2" };
+  }
+
   // ---- 2. Restart without replay. (a) a request pending with no decision;
   // (b) a decision durably claimed (row `claimed`) and the server killed
   // before any dispatch. The claimed row is written with the server's own
@@ -754,6 +883,107 @@ async function main() {
     const leftover = await waitFor(async () => { const alive = processTable().map((p) => p.pid); const l = [...runOc, ...runRunnerd].filter((pid) => alive.includes(pid)); return l.length === 0 ? [] : null; }, "orphans reaped", 30_000, 1000).catch(() => { const alive = processTable().map((p) => p.pid); return [...runOc, ...runRunnerd].filter((pid) => alive.includes(pid)); });
     record(`adv.restart_${variant}.orphan_processes_stopped`, "after restart + reconciliation, the killed server's runnerd/OpenCode for this run exit within 30s",
       { opencodeBeforeKill: runOc, runnerdBeforeKill: runRunnerd, stillAlive: leftover }, leftover.length === 0, { defectIfFailed: "runnerd/OpenCode of a crashed server's run survive and are not reaped after native_restart_recovery_blocked" });
+  }
+
+  // ---- 8. Typed permission expiry (restricted_v1 TTL). The server is
+  // restarted with PAPERCLIP_OPENCODE_PERMISSION_TTL_MS so the proxy of the
+  // next run gets a short TTL through the env allowlists (server -> runnerd ->
+  // proxy). The undecided permission must be rejected natively exactly once,
+  // published as runtime_request.expired with permission_expired, and a later
+  // decision must be 409 with zero dispatch and no re-prompt.
+  {
+    const killed = await killServerHard();
+    killed.pgStopped = await stopOrphanPostgres();
+    await startServerProcess({ PAPERCLIP_OPENCODE_PERMISSION_TTL_MS: String(PERMISSION_TTL_MS) });
+    try { await pgSql?.end({ timeout: 2 }); } catch {}
+    pgSql = createRequire(join(ROOT, "packages/db/package.json"))("postgres")(`postgres://paperclip:paperclip@127.0.0.1:${PG_PORT}/paperclip`, { max: 2, onnotice: () => {} });
+    fixturePhase = "expiry";
+    const { run, req } = await startRunAndWaitPermission("E2E adv: typed permission expiry");
+    const cwd = req.permission.cwd;
+    const createdAt = Date.now();
+    // The controller publishes the settlement as runtime_request.cancelled
+    // (serverRequest/resolved) or .expired; either takes it off the pending set.
+    const settledTypes = ["runtime_request.expired", "runtime_request.cancelled"];
+    const expiredEv = await waitFor(async () => (await runEvents(run.id)).find((e) => settledTypes.includes(e.eventType ?? e.type) && eventPayload(e).requestId === req.requestId) ?? null,
+      "runtime_request.expired", PERMISSION_TTL_MS + 30_000, 500).catch(() => null);
+    const expiredAfterMs = Date.now() - createdAt;
+    const late = await api("POST", resolvePath(run.id, req.requestId), once(req));
+    const st = await waitTerminal(run.id, 90_000).catch((e) => `not terminal: ${e.message}`);
+    await sleep(1500);
+    const late2 = await api("POST", resolvePath(run.id, req.requestId), once(req));
+    const ev = await runEvents(run.id);
+    const claims = await claimsFor(run.id);
+    const diags = ev.filter((e) => (e.eventType ?? e.type) === "harness.diagnostic").map((e) => eventPayload(e).code);
+    const created = ev.filter((e) => (e.eventType ?? e.type) === "runtime_request.created").length;
+    const expiredCount = ev.filter((e) => settledTypes.includes(e.eventType ?? e.type) && eventPayload(e).requestId === req.requestId).length;
+    const fixtureCalls = receipt.fixture.requests.filter((q) => q.phase === "expiry");
+    const toolCalls = fixtureCalls.filter((q) => q.action && q.action !== "text").length;
+    const terminalSeq = ev.find((e) => (e.eventType ?? e.type) === "run.terminal")?.seq ?? null;
+    const settledBeforeTerminal = Boolean(expiredEv) && (terminalSeq === null || expiredEv.seq < terminalSeq);
+    receipt.adversarial.expiry = { runId: run.id, requestId: req.requestId, ttlMs: PERMISSION_TTL_MS, expiredAfterMs, expiredEvent: expiredEv ? { type: expiredEv.eventType ?? expiredEv.type, seq: expiredEv.seq, payload: eventPayload(expiredEv) } : null, terminalSeq, digest: eventDigest(ev).filter((d) => /runtime_request|permission|terminal|turn\./.test(d)).slice(-12), late: { status: late.status, body: late.text.slice(0, 200) }, late2: late2.status, runStatus: st, claims, diags, created, expiredCount, fixtureCalls, killed: { survivors: killed.survivors.length } };
+    record("adv.expiry.permission_expired_409", `TTL ${PERMISSION_TTL_MS}ms via env allowlists; undecided permission is rejected natively once (OpenCode ends the turn), runnerd publishes diagnostic permission_expired and the controller settles the request (runtime_request.cancelled|expired, before run.terminal) exactly once after >= TTL; later once -> 409 (twice); 0 claims; counter 0; no re-prompt (1 permission created, 1 provider tool call)`,
+      { settled: expiredEv ? `${expiredEv.eventType ?? expiredEv.type}:${eventPayload(expiredEv).reason}` : null, settledBeforeTerminal, expiredAfterMs, settledCount: expiredCount, diagnostics: diags.filter((d) => /permission/.test(d ?? "")), late: late.status, late2: late2.status, runStatus: st, claims: claims.length, counter: counterValue(cwd), permissionsCreated: created, providerToolCalls: toolCalls },
+      Boolean(expiredEv) && settledBeforeTerminal && expiredCount === 1 && expiredAfterMs >= PERMISSION_TTL_MS - 2000 && diags.includes("permission_expired") &&
+        late.status === 409 && late2.status === 409 && claims.length === 0 && counterValue(cwd) === 0 && created === 1 && toolCalls === 1 && typeof st === "string" && !st.startsWith("not terminal"));
+    fixturePhase = null;
+    parkCounter(cwd, "expiry");
+  }
+
+  // ---- 9. Internal loss after delivery server<->runnerd + restart. Only the
+  // separately built `e2e-fault-injection` runnerd has the seam: with the
+  // trigger file present it aborts right after writing the `once` to the
+  // OpenCode proxy and before the request.resolve result is acknowledged.
+  if (!fs.existsSync(RUNNERD_FAULT)) {
+    record("adv.internal_loss.no_reexecution", "fault-injection runnerd present", { missing: RUNNERD_FAULT }, false);
+  } else {
+    const killed = await killServerHard();
+    killed.pgStopped = await stopOrphanPostgres();
+    await startServerProcess({ PAPERCLIP_RUNNER_BINARY: RUNNERD_FAULT });
+    try { await pgSql?.end({ timeout: 2 }); } catch {}
+    pgSql = createRequire(join(ROOT, "packages/db/package.json"))("postgres")(`postgres://paperclip:paperclip@127.0.0.1:${PG_PORT}/paperclip`, { max: 2, onnotice: () => {} });
+    fixturePhase = "fault";
+    const preRd = processTable().filter(isRunnerd).map((p) => p.pid);
+    const { run, req } = await startRunAndWaitPermission("E2E adv: runnerd lost after delivery");
+    const cwd = req.permission.cwd;
+    const faultRunnerd = processTable().filter(isRunnerd).filter((p) => !preRd.includes(p.pid)).map((p) => ({ pid: p.pid, args: p.args.slice(0, 120) }));
+    fs.mkdirSync(FAULT_DIR, { recursive: true });
+    fs.writeFileSync(join(FAULT_DIR, "crash-after-permission-delivery"), "1\n");
+    const dec = await api("POST", resolvePath(run.id, req.requestId), once(req));
+    const crashed = await waitFor(async () => (fs.existsSync(join(FAULT_DIR, "crashed-after-permission-delivery")) ? fs.readFileSync(join(FAULT_DIR, "crashed-after-permission-delivery"), "utf8").trim() : null), "runnerd fault fired", 30_000, 250).catch(() => null);
+    const claimAfterCrash = await waitFor(async () => (await claimsFor(run.id)).find((c) => c.status !== "claimed") ?? null, "claim settled after runnerd loss", 60_000, 500).catch(async () => (await claimsFor(run.id))[0] ?? null);
+    const stBeforeRestart = await waitTerminal(run.id, 120_000).catch((e) => `not terminal: ${e.message}`);
+    const counterBeforeRestart = counterValue(cwd);
+    const retryBefore = await api("POST", resolvePath(run.id, req.requestId), once(req));
+    // Restart the server on the default (seam-free) runnerd.
+    const killed2 = await killServerHard();
+    killed2.pgStopped = await stopOrphanPostgres();
+    const fixtureMark = receipt.fixture.requests.length;
+    await startServerProcess();
+    try { await pgSql?.end({ timeout: 2 }); } catch {}
+    pgSql = createRequire(join(ROOT, "packages/db/package.json"))("postgres")(`postgres://paperclip:paperclip@127.0.0.1:${PG_PORT}/paperclip`, { max: 2, onnotice: () => {} });
+    const retryAfter = await api("POST", resolvePath(run.id, req.requestId), once(req));
+    const stAfter = await waitTerminal(run.id, 120_000).catch((e) => `not terminal: ${e.message}`);
+    await sleep(3000);
+    const claims = await claimsFor(run.id);
+    const onceRows = await onceDecisions(run.id);
+    const row = (await pgSql`select status, error_code, error from heartbeat_runs where id = ${run.id}`)[0];
+    const replayed = receipt.fixture.requests.slice(fixtureMark).filter((q) => q.action && q.action !== "text");
+    const ev = await runEvents(run.id);
+    const counter = counterValue(cwd);
+    receipt.adversarial.internalLoss = { runId: run.id, requestId: req.requestId, faultRunnerd, decision: { status: dec.status, body: dec.text.slice(0, 200) }, crashed, claimAfterCrash, stBeforeRestart, counterBeforeRestart,
+      retryBefore: retryBefore.status, retryAfter: { status: retryAfter.status, body: retryAfter.text.slice(0, 200) }, stAfter, row, claims, onceRows, replayedAfterRestart: replayed, counter,
+      killed: { survivors: killed.survivors.length }, killed2: { survivors: killed2.survivors.map((p) => p.args.slice(0, 60)) }, digest: eventDigest(ev).slice(-16) };
+    const reqClaims = claims.filter((c) => c.request_id === req.requestId);
+    record("adv.internal_loss.no_reexecution", "fault runnerd aborts after writing once to the proxy, before acking request.resolve; the command is indeterminate: exactly one claim for the request, never delivered, ends dispatch_uncertain (blocked for reconciliation); retry once -> 409 before and after server restart; no second once (counter <= 1, unchanged after restart); no new provider tool call after restart; run terminal",
+      { decision: dec.status, faultFired: Boolean(crashed), claimAfterCrash: claimAfterCrash ? `${claimAfterCrash.decision}:${claimAfterCrash.status}` : null, claims: reqClaims.map((c) => `${c.decision}:${c.status}`), retryBefore: retryBefore.status, retryAfter: retryAfter.status,
+        runBefore: stBeforeRestart, runAfter: stAfter, errorCode: row?.error_code, counterBeforeRestart, counter, onceAudit: onceRows.map((o) => o.status), replayedToolCalls: replayed.length },
+      Boolean(crashed) && reqClaims.length === 1 && reqClaims[0].decision === "once" && reqClaims[0].status === "dispatch_uncertain" && retryBefore.status === 409 && retryAfter.status === 409 &&
+        counter <= 1 && counter === counterBeforeRestart && replayed.length === 0 && onceRows.filter((o) => o.status === "delivered").length === 0 &&
+        typeof stAfter === "string" && !stAfter.startsWith("not terminal"),
+      { defectIfFailed: "a request.resolve lost inside runnerd after delivery is not reconciled as dispatch_uncertain or is re-executed" });
+    fixturePhase = null;
+    try { fs.rmSync(FAULT_DIR, { recursive: true, force: true }); } catch {}
+    parkCounter(cwd, "internalLoss");
   }
 
   await authenticatedPhase({ foreignSha: sha });

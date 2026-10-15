@@ -3367,13 +3367,17 @@ impl CodexCommandExecutor {
             RuntimeRequestResolution::Input => {
                 json!({"provider": provider_label, "requestId": request_id, "status": "delivered"})
             }
-            RuntimeRequestResolution::Permission { decision } => json!({
+            RuntimeRequestResolution::Permission { decision } => {
+                #[cfg(feature = "e2e-fault-injection")]
+                crate::e2e_fault::crash_after_permission_delivery(request_id, &decision);
+                json!({
                 "provider": provider_label,
                 "requestId": request_id,
                 "status": "delivered",
                 "type": "permission",
                 "decision": decision,
-            }),
+                })
+            }
         };
         Ok(CommandExecution {
             result: json!({"status": "delivered", "requestId": request_id}),
@@ -4319,6 +4323,34 @@ impl CodexCommandExecutor {
                         state.push_receipt_limit_cleanup_event(event)?;
                     } else {
                         state.push_event(event)?;
+                    }
+                    self.save_state()?;
+                }
+                CodexProviderEvent::RuntimeRequestSettled {
+                    event_type,
+                    payload,
+                    diagnostic,
+                } => {
+                    let state = self
+                        .state
+                        .as_mut()
+                        .expect("Codex state remains available while polling");
+                    let diagnostic = diagnostic.map(|payload| NormalizedProviderEvent {
+                        event_type: "harness.diagnostic".to_owned(),
+                        priority: EventPriority::P0,
+                        payload,
+                    });
+                    let settled = NormalizedProviderEvent {
+                        event_type: event_type.to_owned(),
+                        priority: EventPriority::P0,
+                        payload,
+                    };
+                    for event in diagnostic.into_iter().chain([settled]) {
+                        if receipt_limit_terminal_poll {
+                            state.push_receipt_limit_cleanup_event(event)?;
+                        } else {
+                            state.push_event(event)?;
+                        }
                     }
                     self.save_state()?;
                 }

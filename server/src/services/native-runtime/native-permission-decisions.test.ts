@@ -14,10 +14,34 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../../__tests__/helpers/embedded-postgres.js";
 import {
+  applyNativePermissionSettle,
   claimNativePermissionDecision,
+  nativePermissionOutcomeFromEvent,
   reconcileCrashedNativePermissionClaims,
   settleNativePermissionDecision,
 } from "./native-permission-decisions.js";
+
+describe("native permission outcome relayed by runnerd", () => {
+  const diagnostic = (payload: Record<string, unknown>) => ({ eventType: "harness.diagnostic", payload });
+  it("extracts only a valid permission_native_outcome diagnostic", () => {
+    expect(nativePermissionOutcomeFromEvent(diagnostic({
+      code: "permission_native_outcome", requestId: "runtime-request-1", nativeOutcome: "rejected_terminal",
+    }))).toEqual({ requestId: "runtime-request-1", nativeOutcome: "rejected_terminal" });
+    expect(nativePermissionOutcomeFromEvent(diagnostic({
+      code: "permission_native_outcome", requestId: "runtime-request-1", nativeOutcome: "once",
+    }))).toBeNull();
+    expect(nativePermissionOutcomeFromEvent(diagnostic({
+      code: "permission_native_outcome", nativeOutcome: "once_applied",
+    }))).toBeNull();
+    expect(nativePermissionOutcomeFromEvent(diagnostic({
+      code: "permission_expired", requestId: "runtime-request-1", nativeOutcome: "rejected_expired",
+    }))).toBeNull();
+    expect(nativePermissionOutcomeFromEvent({
+      eventType: "runtime_request.resolved",
+      payload: { code: "permission_native_outcome", requestId: "runtime-request-1", nativeOutcome: "once_applied" },
+    })).toBeNull();
+  });
+});
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = support.supported ? describe : describe.skip;
@@ -123,5 +147,52 @@ describeEmbeddedPostgres("native permission decision claims (embedded Postgres)"
     await expect(reconcileCrashedNativePermissionClaims(db, {
       companyId, runId, claimedBefore: boundary, reason: "again",
     })).resolves.toEqual([]);
+  });
+  it("records native_outcome first-write-wins and audits conflicts (cancel||once race)", async () => {
+    const claim = await claimNativePermissionDecision(db, {
+      ...claimInput("once"),
+      requestId: "perm-race",
+    });
+    expect(claim).not.toBeNull();
+    await settleNativePermissionDecision(db, { id: claim!.id, status: "delivered" });
+    const audits: Array<{ action: string; details: Record<string, unknown> }> = [];
+    const audit = async (entry: { action: string; details: Record<string, unknown> }) => {
+      audits.push({ action: entry.action, details: entry.details });
+    };
+    const settle = (nativeOutcome: unknown, requestId = "perm-race") =>
+      applyNativePermissionSettle(db, { companyId, agentId, runId, requestId, nativeOutcome }, audit);
+
+    // Delivered but no settle yet: outcome stays null.
+    let [row] = await db.select().from(nativePermissionDecisions)
+      .where(eq(nativePermissionDecisions.id, claim!.id));
+    expect(row).toMatchObject({ status: "delivered", nativeOutcome: null });
+
+    // Unknown values and requests without a claim are ignored.
+    await expect(settle("granted")).resolves.toBeNull();
+    await expect(settle("rejected_terminal", "no-such-request")).resolves.toEqual({ kind: "no_claim" });
+
+    // Terminal state won the race: the driver sent native reject.
+    await expect(settle("rejected_terminal")).resolves.toEqual({ kind: "recorded", id: claim!.id });
+    // Duplicate settle is a no-op; a conflicting one never overwrites.
+    await expect(settle("rejected_terminal")).resolves.toEqual({ kind: "unchanged", id: claim!.id });
+    await expect(settle("once_applied")).resolves.toEqual({
+      kind: "conflict", id: claim!.id, existing: "rejected_terminal",
+    });
+    [row] = await db.select().from(nativePermissionDecisions)
+      .where(eq(nativePermissionDecisions.id, claim!.id));
+    expect(row).toMatchObject({ status: "delivered", nativeOutcome: "rejected_terminal" });
+    expect(audits).toEqual([
+      {
+        action: "heartbeat.runtime_permission_native_outcome",
+        details: { agentId, runId, requestId: "perm-race", nativeOutcome: "rejected_terminal" },
+      },
+      {
+        action: "heartbeat.runtime_permission_native_outcome_conflict",
+        details: {
+          agentId, runId, requestId: "perm-race",
+          nativeOutcome: "once_applied", existingNativeOutcome: "rejected_terminal",
+        },
+      },
+    ]);
   });
 });

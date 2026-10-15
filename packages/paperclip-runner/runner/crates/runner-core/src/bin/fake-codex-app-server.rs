@@ -643,6 +643,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let emit_opencode_proxy_invalid_permission = args
         .iter()
         .any(|value| value == "--opencode-proxy-invalid-permission");
+    let expire_opencode_proxy_permission = args
+        .iter()
+        .any(|value| value == "--opencode-proxy-permission-expire");
+    let report_opencode_proxy_permission_terminal = args
+        .iter()
+        .any(|value| value == "--opencode-proxy-permission-report-terminal");
     let emit_runtime_elicitation = args.iter().any(|value| value == "--runtime-elicitation");
     let emit_structured_activity = args.iter().any(|value| value == "--structured-activity");
     let emit_split_event_burst = args.iter().any(|value| value == "--split-event-burst");
@@ -904,6 +910,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if message.get("method").is_none()
             && message.get("id") == Some(&json!("opencode-permission-request-1"))
         {
+            if message.get("error").is_some() && message.get("result").is_none() {
+                log_call(call_log.as_deref(), "opencode-permission-response:expired")?;
+                finish_turn(&state_path, &mut state, "completed")?;
+                continue;
+            }
             let expected_sha = opencode_permission_fixture()
                 .pointer("/request/permission/contractSha256")
                 .cloned();
@@ -930,6 +941,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 call_log.as_deref(),
                 &format!("opencode-permission-response:{outcome}"),
             )?;
+            if report_opencode_proxy_permission_terminal && outcome == "once" {
+                // The terminal state won after the delivery: the driver's own
+                // late `cancelled` settlement reports the native `reject`. A
+                // second report for the same request must be ignored.
+                for (status, native_outcome) in [
+                    ("cancelled", "rejected_terminal"),
+                    ("applied", "once_applied"),
+                ] {
+                    send(json!({
+                        "method": "paperclip/runtimeRequestSettled",
+                        "params": {
+                            "threadId": state.thread_id,
+                            "turnId": state.active_turn_id,
+                            "requestId": opencode_permission_fixture()
+                                .pointer("/request/requestId")
+                                .cloned(),
+                            "status": status,
+                            "reason": "terminal",
+                            "nativeOutcome": native_outcome,
+                        }
+                    }))?;
+                }
+            }
             if outcome != "cancel" {
                 finish_turn(&state_path, &mut state, "completed")?;
             }
@@ -1669,6 +1703,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     send_opencode_proxy_permission(&state, "opencode-permission-invalid-1", true)?;
                 } else if emit_opencode_proxy_permission {
                     send_opencode_proxy_permission(&state, "opencode-permission-request-1", false)?;
+                    if expire_opencode_proxy_permission {
+                        // The proxy's TTL fired: it rejected natively and
+                        // tells runnerd to retire the pending request.
+                        send(json!({
+                            "method": "paperclip/runtimeRequestSettled",
+                            "params": {
+                                "threadId": state.thread_id,
+                                "turnId": state.active_turn_id,
+                                "requestId": opencode_permission_fixture()
+                                    .pointer("/request/requestId")
+                                    .cloned(),
+                                "status": "expired",
+                                "reason": "permission_expired",
+                            }
+                        }))?;
+                    }
                 } else if emit_runtime_elicitation {
                     send_runtime_elicitation(&state)?;
                 } else if emit_structured_activity {

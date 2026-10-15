@@ -10,6 +10,7 @@ CREATE TABLE "native_permission_decisions" (
 	"resolver_user_id" text NOT NULL,
 	"status" text DEFAULT 'claimed' NOT NULL,
 	"error" text,
+	"native_outcome" text,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );

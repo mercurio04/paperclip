@@ -31007,6 +31007,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "native_outcome": {
+          "name": "native_outcome",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamp with time zone",

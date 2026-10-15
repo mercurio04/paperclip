@@ -32,6 +32,21 @@ export function parseOpenCodeProxyPermissionProfile(
 }
 
 /**
+ * `PAPERCLIP_OPENCODE_PERMISSION_TTL_MS` bounds how long a typed permission
+ * stays pending (restricted_v1). Unset keeps the driver default; anything but
+ * a positive integer of at most 24h fails closed.
+ */
+export function parseOpenCodeProxyPermissionTtlMs(
+  value: string | undefined,
+): number | undefined {
+  const configured = value?.trim();
+  if (!configured) return undefined;
+  const parsed = /^[1-9][0-9]{0,8}$/.test(configured) ? Number(configured) : NaN;
+  if (Number.isSafeInteger(parsed) && parsed <= 24 * 60 * 60_000) return parsed;
+  throw new Error("PAPERCLIP_OPENCODE_PERMISSION_TTL_MS is invalid");
+}
+
+/**
  * Settles the controller's answer to a `paperclip/runtimeRequest` for a
  * permission. The runnerd resolution passes through unchanged; a JSON-RPC
  * error (or a missing resolution) becomes `cancel`, which the driver turns

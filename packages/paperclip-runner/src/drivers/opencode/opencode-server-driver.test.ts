@@ -1850,6 +1850,7 @@ describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
       metadata?: Record<string, unknown>;
       withToolPart?: boolean;
       failReply?: boolean;
+      permissionTtlMs?: number;
     } = {},
   ) {
     await chmod(fixture, 0o755);
@@ -1959,6 +1960,9 @@ describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
       model,
       permissionProfile: "restricted_v1",
       llamaCppBaseUrl: baseUrl,
+      ...(options.permissionTtlMs !== undefined
+        ? { permissionTtlMs: options.permissionTtlMs }
+        : {}),
       onSpawn: async ({ pid }) => {
         state.childPid = pid;
       },
@@ -2382,11 +2386,91 @@ describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
     const transcript = await h.session.transcript();
     expect(transcript.events).toContainEqual(
       expect.objectContaining({
-        payload: expect.objectContaining({ code: "permission_decision_after_terminal" }),
+        payload: expect.objectContaining({
+          code: "permission_decision_after_terminal",
+          nativeOutcome: "rejected_terminal",
+        }),
       }),
     );
     expect(h.state.replies).toEqual([{ id: permissionId, body: { reply: "reject" } }]);
     await h.session.close({ reason: "sse test complete" });
+  });
+
+  it("expires an undecided typed permission after its TTL with exactly one native reject and refuses a later once", async () => {
+    const h = await harness({ permissionTtlMs: 40 });
+    await h.session.startTurn({ message: { role: "user", text: "edit" } });
+    const created = await h.next("runtime_request.created");
+    const request = (created!.payload as { request: { permission: { contractSha256: string } } }).request;
+    const expired = await h.next("runtime_request.expired");
+    expect(expired?.payload).toEqual(
+      expect.objectContaining({
+        requestId: permissionId,
+        reason: "permission_expired",
+        nativeOutcome: "rejected_expired",
+      }),
+    );
+    expect(h.events).toContainEqual(
+      expect.objectContaining({
+        eventType: "harness.diagnostic",
+        payload: expect.objectContaining({ code: "permission_expired", ttlMs: 40 }),
+      }),
+    );
+    for (let attempt = 0; attempt < 50 && h.state.replies.length === 0; attempt += 1)
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+    expect(h.state.replies).toEqual([{ id: permissionId, body: { reply: "reject" } }]);
+    expect(h.session.pendingRuntimeRequests?.()).toEqual([]);
+    await expect(
+      h.session.resolveRuntimeRequest!({
+        requestId: permissionId,
+        turnId: (created as { turnId: string }).turnId,
+        resolution: {
+          action: "permission_decision",
+          decision: "once",
+          contractSha256: request.permission.contractSha256,
+        } as never,
+      }),
+    ).rejects.toThrow(/no longer pending/);
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 60));
+    // Exactly one native reply (the expiry reject), never a once, no re-prompt.
+    expect(h.state.replies).toEqual([{ id: permissionId, body: { reply: "reject" } }]);
+    expect(
+      h.events.filter((event) => event.eventType === "runtime_request.created"),
+    ).toHaveLength(1);
+    await h.session.close({ reason: "terminal test complete" });
+  });
+
+  it("does not expire a typed permission whose decision already reached OpenCode", async () => {
+    const h = await harness({ permissionTtlMs: 80 });
+    await h.session.startTurn({ message: { role: "user", text: "edit" } });
+    const created = await h.next("runtime_request.created");
+    const request = (created!.payload as { request: { permission: { contractSha256: string } } }).request;
+    await h.session.resolveRuntimeRequest!({
+      requestId: permissionId,
+      turnId: (created as { turnId: string }).turnId,
+      resolution: {
+        action: "permission_decision",
+        decision: "reject",
+        contractSha256: request.permission.contractSha256,
+      } as never,
+    });
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 160));
+    expect(h.state.replies).toEqual([{ id: permissionId, body: { reply: "reject" } }]);
+    expect(h.events.some((event) => event.eventType === "runtime_request.expired")).toBe(false);
+    await h.session.close({ reason: "terminal test complete" });
+  });
+
+  it("rejects an invalid permission TTL at construction", () => {
+    for (const permissionTtlMs of [0, -1, 1.5, 25 * 60 * 60_000])
+      expect(
+        () =>
+          new OpenCodeServerDriver({
+            model,
+            permissionProfile: "restricted_v1",
+            llamaCppBaseUrl: baseUrl,
+            permissionTtlMs,
+            runtimeDirectory: "/tmp/unused",
+          }),
+      ).toThrow(/permission TTL is invalid/);
   });
 
   it("settles a pending permission with exactly one native reject on terminal cancellation", async () => {
@@ -2516,6 +2600,11 @@ describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
       { id: permissionId, body: { reply: "once" } },
     ]);
     expect(h.session.pendingRuntimeRequests?.()).toEqual([]);
+    const onceResolved = await h.next("runtime_request.resolved");
+    expect(onceResolved?.payload).toMatchObject({
+      reason: "permission_once",
+      nativeOutcome: "once_applied",
+    });
     await h.session.close({ reason: "typed test complete" });
   });
 
@@ -2536,7 +2625,8 @@ describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
     expect(h.state.replies).toEqual([
       { id: permissionId, body: { reply: "reject" } },
     ]);
-    await h.next("runtime_request.resolved");
+    const driftResolved = await h.next("runtime_request.resolved");
+    expect(driftResolved?.payload).toMatchObject({ nativeOutcome: "rejected_drift" });
     expect(h.events).toContainEqual(
       expect.objectContaining({
         eventType: "harness.diagnostic",

@@ -99,6 +99,52 @@ Runs are strictly serial; the fixture switches scenario between runs.
   without Origin 403; then 0 claims, and the admin's reject is the single
   delivered claim.
 
+## Inherited TAX-476 rows (`adv.cancel_once_race`, `adv.stale_*`, `adv.expiry.*`, `adv.internal_loss.*`)
+
+- `adv.cancel_once_race.single_terminal_winner`: three runs, each firing
+  board cancel and `once` together (`Promise.all`). Run terminal, late `once`
+  409, counter <= 1 and unchanged after the terminal, claims consistent with
+  the winner (a 409 decision leaves no delivered claim and counter 0).
+  `native_permission_decisions.native_outcome` must agree with what OpenCode
+  received: counter 1 (native `once`) => `once_applied`; counter 0 => never
+  `once_applied`; a delivered `once` claim with counter 0 passes only if
+  `native_outcome` is `rejected_*`; every delivered claim carries a non-null
+  outcome (the proxy reports `paperclip/runtimeRequestSettled{status:"applied",
+  nativeOutcome}` after the delivery, runnerd relays it as the diagnostic
+  `permission_native_outcome`, the server records it first-write-wins and
+  audits `heartbeat.runtime_permission_native_outcome`).
+  `TAX452_REQUIRE_NATIVE_OUTCOME=0` allows a null outcome (debug only).
+- `adv.stale_cascaded_permission_409`: fixture scenario `parallel2` asks two
+  writes in one model response, so two permissions are pending in the same
+  turn. Reject #1; OpenCode cascade-rejects #2 natively; the proxy reports
+  the settlement (`paperclip/runtimeRequestSettled`) and runnerd publishes
+  `runtime_request.cancelled`, so `once` on #2 is 409 while the run is live
+  and after the turn ended; counter 0.
+- `adv.expiry.permission_expired_409`: the server is restarted with
+  `PAPERCLIP_OPENCODE_PERMISSION_TTL_MS=8000` (server env -> runnerd
+  sanitized env allowlist -> Rust `OPENCODE_PROVIDER_ENVIRONMENT_KEYS` ->
+  proxy -> driver `permissionTtlMs`, default 15 min). The undecided
+  permission is rejected natively once, `runtime_request.expired`
+  (`permission_expired`) is published, a later `once` is 409, 0 claims, no
+  re-prompt.
+- `adv.internal_loss.no_reexecution`: needs a second runnerd built with the
+  non-default Cargo feature `e2e-fault-injection`:
+
+  ```sh
+  cargo build --release -j2 -p paperclip-runner-core --bin paperclip-runnerd --features e2e-fault-injection
+  mkdir -p target/e2e-fault && cp target/release/paperclip-runnerd target/e2e-fault/
+  cargo build --release -j2 -p paperclip-runner-core --bin paperclip-runnerd   # restore the default binary
+  strings target/release/paperclip-runnerd | grep -c crash-after-permission    # must be 0
+  ```
+
+  The server is restarted on that binary; with
+  `/tmp/paperclip-e2e-fault/crash-after-permission-delivery` present (the
+  namespace's private tmpfs) runnerd aborts right after writing the `once` to
+  the proxy and before the `request.resolve` result is acknowledged. Then the
+  server is restarted on the default binary. Expected: one claim, never
+  `delivered`, `dispatch_uncertain`; retries 409; counter <= 1 and unchanged;
+  no new provider tool call.
+
 Cases recorded with `defectIfFailed` describe a known product defect when
 they fail; they are not waived. `ns-inner.sh` keeps bash as PID 1 of the
 namespace so orphans (e.g. a SIGKILLed postmaster) are reaped; with node as

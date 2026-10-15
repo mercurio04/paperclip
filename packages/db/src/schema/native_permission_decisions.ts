@@ -10,6 +10,13 @@ import { heartbeatRuns } from "./heartbeat_runs.js";
  * once and an uncertain dispatch is never retried.
  *
  * status: claimed -> delivered | dispatch_uncertain | stale
+ *
+ * native_outcome: what OpenCode actually received, as reported by the
+ * driver's settle signal (`paperclip/runtimeRequestSettled.nativeOutcome`).
+ * `delivered` only means "handed to runnerd"; a `once` can still lose the
+ * race to a terminal run and be answered natively with `reject`.
+ * Values: once_applied | rejected_terminal | rejected_drift |
+ * rejected_expired | unknown. Null until a settle arrives. First write wins.
  */
 export const nativePermissionDecisions = pgTable(
   "native_permission_decisions",
@@ -25,6 +32,7 @@ export const nativePermissionDecisions = pgTable(
     resolverUserId: text("resolver_user_id").notNull(),
     status: text("status").notNull().default("claimed"),
     error: text("error"),
+    nativeOutcome: text("native_outcome"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

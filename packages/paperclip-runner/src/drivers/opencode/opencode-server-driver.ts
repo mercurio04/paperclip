@@ -84,6 +84,9 @@ import { materializeNativeRuntimeSkills } from "../runtime-context-materializer.
 
 export const OPENCODE_SERVER_DRIVER_KIND = "opencode_server" as const;
 export const QUALIFIED_OPENCODE_VERSION = "1.18.29" as const;
+/** restricted_v1: default and maximum lifetime of a pending typed permission. */
+export const DEFAULT_PERMISSION_TTL_MS = 15 * 60_000;
+const MAX_PERMISSION_TTL_MS = 24 * 60 * 60_000;
 export const QUALIFIED_OPENCODE_MODEL =
   "openrouter/deepseek/deepseek-v4-flash-0731" as const;
 
@@ -109,6 +112,12 @@ export interface OpenCodeServerDriverOptions {
   permissionProfile?: OpenCodePermissionProfile;
   /** Required with `restricted_v1`: http URL on 127.0.0.1, localhost, or ::1. */
   llamaCppBaseUrl?: string;
+  /**
+   * restricted_v1: bounded lifetime of a pending typed permission. When it
+   * elapses the native permission is rejected exactly once and the request
+   * settles as `runtime_request.expired` (`permission_expired`). Default 15 min.
+   */
+  permissionTtlMs?: number;
   taskEnvelope?: CodexTaskEnvelope;
   runnerInstanceId?: string;
   command?: string;
@@ -143,6 +152,7 @@ interface OpenCodeRuntime {
   version: string;
   permissionMode: "allow" | "ask" | "deny";
   permissionProfile: OpenCodePermissionProfile | null;
+  permissionTtlMs: number;
   process: ChildProcess;
   bridge: OpenCodeMcpBridge;
   trace: ProviderTraceFileSink | null;
@@ -178,6 +188,19 @@ const CAPABILITIES: NativeSessionCapabilities = {
   unsupported: ["steering", "goals", "threadLineage"],
 };
 
+/**
+ * What OpenCode actually received for a typed permission. Carried as
+ * `nativeOutcome` on the driver's settle events (runtime_request.resolved /
+ * expired / cancelled, and the permission_decision_after_terminal diagnostic)
+ * and recorded on native_permission_decisions.native_outcome.
+ */
+export type PaperclipPermissionNativeOutcome =
+  | "once_applied"
+  | "rejected_terminal"
+  | "rejected_drift"
+  | "rejected_expired"
+  | "unknown";
+
 export class OpenCodeServerDriver implements HarnessDriver {
   readonly #options: OpenCodeServerDriverOptions;
 
@@ -188,6 +211,13 @@ export class OpenCodeServerDriver implements HarnessDriver {
       restrictedLlamaCppModelId(options.model);
       validateLoopbackLlamaCppBaseUrl(options.llamaCppBaseUrl);
     }
+    if (
+      options.permissionTtlMs !== undefined &&
+      (!Number.isSafeInteger(options.permissionTtlMs) ||
+        options.permissionTtlMs < 1 ||
+        options.permissionTtlMs > MAX_PERMISSION_TTL_MS)
+    )
+      throw new Error("OpenCode permission TTL is invalid");
     this.#options = options;
   }
 
@@ -462,6 +492,8 @@ class OpenCodeHarnessSession implements HarnessSession {
   readonly #invalidatedPermissions = new Set<string>();
   /** restricted_v1: frozen resolution of tool-argument paths (not hashed). */
   readonly #frozenArgumentTargets = new Map<string, string>();
+  /** restricted_v1: expiry timer of each published typed permission. */
+  readonly #permissionExpiryTimers = new Map<string, NodeJS.Timeout>();
   #activeTraceFrameId: number | null = null;
   #activeTraceEmittedEventIds: string[] = [];
   #sourceSequence: number;
@@ -928,6 +960,9 @@ class OpenCodeHarnessSession implements HarnessSession {
     if (this.#closed) return;
     this.#closed = true;
     this.#abort.abort();
+    for (const timer of this.#permissionExpiryTimers.values())
+      clearTimeout(timer);
+    this.#permissionExpiryTimers.clear();
     for (const id of this.#typedPermissionsInFlight)
       this.#invalidatedPermissions.add(id);
     for (const [id, { request }] of this.#pendingRuntimeRequests)
@@ -1377,6 +1412,12 @@ class OpenCodeHarnessSession implements HarnessSession {
         },
         { turnId, itemId: requestId },
       );
+      const timer = setTimeout(
+        () => void this.#expireTypedPermission(requestId, turnId),
+        this.#runtime.permissionTtlMs,
+      );
+      timer.unref?.();
+      this.#permissionExpiryTimers.set(requestId, timer);
     } finally {
       this.#typedPermissionsInFlight.delete(requestId);
     }
@@ -1486,6 +1527,59 @@ class OpenCodeHarnessSession implements HarnessSession {
     );
   }
 
+  /**
+   * restricted_v1 expiry: a typed permission nobody decided within the TTL is
+   * settled natively with exactly one `reject` and can never be granted later
+   * (no re-prompt: OpenCode treats the reject as the tool result). A decision
+   * already on the wire (reply sent) wins; one still being re-verified loses at
+   * its pre-POST re-check.
+   */
+  async #expireTypedPermission(
+    requestId: string,
+    turnId: string,
+  ): Promise<void> {
+    this.#permissionExpiryTimers.delete(requestId);
+    const entry = this.#pendingRuntimeRequests.get(requestId);
+    if (
+      !entry ||
+      entry.request.permission === undefined ||
+      this.#paperclipPermissionReplies.has(requestId) ||
+      this.#providerRejectedPermissions.has(requestId)
+    )
+      return;
+    this.#invalidatedPermissions.add(requestId);
+    this.#pendingRuntimeRequests.delete(requestId);
+    this.#frozenArgumentTargets.delete(requestId);
+    this.#emit(
+      "harness.diagnostic",
+      {
+        code: "permission_expired",
+        adapter: "opencode-server",
+        providerRequestId: requestId,
+        ttlMs: this.#runtime.permissionTtlMs,
+      },
+      { turnId: entry.request.turnId, itemId: requestId },
+    );
+    this.#emit(
+      "runtime_request.expired",
+      {
+        ...harnessRuntimeRequestOutcome(entry.request, {
+          reason: "permission_expired",
+        }),
+        nativeOutcome: "rejected_expired" satisfies PaperclipPermissionNativeOutcome,
+      },
+      { turnId: entry.request.turnId, itemId: entry.request.itemId },
+    );
+    if (this.#closed) return;
+    const delivered = await this.#replyPermissionOnce(
+      requestId,
+      "reject",
+      turnId,
+    );
+    if (!delivered)
+      await this.#failTurnClosed(turnId, "permission_reply_uncertain");
+  }
+
   #emitDecisionAfterTerminal(requestId: string, turnId: string): void {
     this.#emit(
       "harness.diagnostic",
@@ -1493,6 +1587,10 @@ class OpenCodeHarnessSession implements HarnessSession {
         code: "permission_decision_after_terminal",
         adapter: "opencode-server",
         providerRequestId: requestId,
+        // The terminal state won: OpenCode receives (or already received)
+        // exactly one native `reject`, never the late `once`.
+        nativeOutcome:
+          "rejected_terminal" satisfies PaperclipPermissionNativeOutcome,
       },
       { turnId, itemId: requestId },
     );
@@ -1528,7 +1626,11 @@ class OpenCodeHarnessSession implements HarnessSession {
       if (entry && this.#pendingRuntimeRequests.delete(id))
         this.#emit(
           "runtime_request.cancelled",
-          harnessRuntimeRequestOutcome(entry.request, { reason }),
+          {
+            ...harnessRuntimeRequestOutcome(entry.request, { reason }),
+            nativeOutcome:
+              "rejected_terminal" satisfies PaperclipPermissionNativeOutcome,
+          },
           { turnId: entry.request.turnId, itemId: entry.request.itemId },
         );
       if (
@@ -1639,10 +1741,18 @@ class OpenCodeHarnessSession implements HarnessSession {
     }
     this.#emit(
       "runtime_request.resolved",
-      harnessRuntimeRequestOutcome(pending.request, {
-        action: resolution.action,
-        reason: reply === "once" ? "permission_once" : "permission_rejected",
-      }),
+      {
+        ...harnessRuntimeRequestOutcome(pending.request, {
+          action: resolution.action,
+          reason: reply === "once" ? "permission_once" : "permission_rejected",
+        }),
+        nativeOutcome: (reply === "once"
+          ? "once_applied"
+          : diagnostic === "permission_contract_drift" ||
+              diagnostic === "permission_contract_mismatch"
+            ? "rejected_drift"
+            : "unknown") satisfies PaperclipPermissionNativeOutcome,
+      },
       { turnId, itemId: pending.request.itemId },
     );
   }
@@ -2759,6 +2869,8 @@ async function startRuntime(input: {
         ? "ask"
         : (input.options.permissionMode ?? "allow"),
       permissionProfile: restricted ? "restricted_v1" : null,
+      permissionTtlMs:
+        input.options.permissionTtlMs ?? DEFAULT_PERMISSION_TTL_MS,
       process: child,
       bridge,
       trace: input.trace,

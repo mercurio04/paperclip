@@ -38,6 +38,7 @@ const OPENCODE_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "PAPERCLIP_NATIVE_MCP_TOKEN",
     "PAPERCLIP_OPENCODE_PERMISSION_MODE",
     "PAPERCLIP_OPENCODE_PERMISSION_PROFILE",
+    "PAPERCLIP_OPENCODE_PERMISSION_TTL_MS",
     "PAPERCLIP_OPENCODE_LLAMACPP_BASE_URL",
     "PAPERCLIP_OPENCODE_RUNTIME_DIR",
     "PAPERCLIP_RUNNER_INSTANCE_ID",
@@ -55,6 +56,20 @@ const MAX_COMPLETED_TOOL_CALL_IDS: usize = 4_096;
 const MAX_PENDING_RUNTIME_REQUESTS: usize = 128;
 const MAX_PENDING_RUNTIME_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const OPENCODE_RUNTIME_REQUEST_METHOD: &str = "paperclip/runtimeRequest";
+/// Proxy -> runnerd notification: the driver settled a pending typed
+/// permission on its own (TTL expiry, provider cascade reject, terminal turn,
+/// SSE loss) and the native permission is already rejected. runnerd retires
+/// its pending request and publishes `runtime_request.expired|cancelled`, so
+/// the server refuses any later decision instead of dispatching it.
+const OPENCODE_RUNTIME_REQUEST_SETTLED_METHOD: &str = "paperclip/runtimeRequestSettled";
+const MAX_DELIVERED_PERMISSION_OUTCOMES: usize = 64;
+const PERMISSION_NATIVE_OUTCOMES: [&str; 5] = [
+    "once_applied",
+    "rejected_terminal",
+    "rejected_drift",
+    "rejected_expired",
+    "unknown",
+];
 const OPENCODE_PERMISSION_REQUEST_SCHEMA: &str = "paperclip.runtime_request.permission.v1";
 const OPENCODE_PERMISSION_CONTRACT_SCHEMA: &str = "paperclip.opencode_permission_contract.v1";
 const PERMISSION_DECISION_SCHEMA: &str = "paperclip.permission_decision.v1";
@@ -503,6 +518,14 @@ pub enum CodexProviderEvent {
     RuntimeRequestRejected {
         diagnostic: Value,
     },
+    /// The proxy settled a pending typed OpenCode permission (expired or
+    /// cancelled). The runner-scoped request is retired; `event_type` is
+    /// `runtime_request.expired|cancelled` and `diagnostic` an optional warning.
+    RuntimeRequestSettled {
+        event_type: &'static str,
+        payload: Value,
+        diagnostic: Option<Value>,
+    },
     Exited {
         exit_code: Option<i32>,
         success: bool,
@@ -666,6 +689,10 @@ pub struct CodexProvider {
     pending_tool_request_bytes: usize,
     pending_runtime_requests: BTreeMap<String, PendingRuntimeRequest>,
     pending_runtime_request_bytes: usize,
+    /// Typed permissions whose board decision was handed to the provider
+    /// (provider request id, Paperclip request id). Bounded; lets the proxy
+    /// report what the provider natively received after the delivery.
+    delivered_permission_requests: VecDeque<(String, String)>,
     runtime_request_scope: [u8; 16],
     next_runtime_request_sequence: u64,
     expected_shutdown: bool,
@@ -996,6 +1023,7 @@ impl CodexProvider {
             pending_tool_request_bytes: 0,
             pending_runtime_requests: BTreeMap::new(),
             pending_runtime_request_bytes: 0,
+            delivered_permission_requests: VecDeque::new(),
             runtime_request_scope,
             next_runtime_request_sequence: 1,
             expected_shutdown: false,
@@ -1312,7 +1340,8 @@ impl CodexProvider {
                 Some(CodexProviderEvent::ToolCall { .. })
                 | Some(CodexProviderEvent::RuntimeRequest { .. })
                 | Some(CodexProviderEvent::PermissionRequest { .. })
-                | Some(CodexProviderEvent::RuntimeRequestRejected { .. }) => {
+                | Some(CodexProviderEvent::RuntimeRequestRejected { .. })
+                | Some(CodexProviderEvent::RuntimeRequestSettled { .. }) => {
                     return Err(LocalRunnerError::invalid(
                         "Codex warm run attachment observed a post-terminal provider request",
                     ));
@@ -1980,6 +2009,17 @@ impl CodexProvider {
                     .pending_runtime_request_bytes
                     .saturating_sub(completed.retained_bytes);
             }
+            if let Some(provider_request_id) = pending
+                .params
+                .pointer("/request/requestId")
+                .and_then(Value::as_str)
+            {
+                if self.delivered_permission_requests.len() >= MAX_DELIVERED_PERMISSION_OUTCOMES {
+                    self.delivered_permission_requests.pop_front();
+                }
+                self.delivered_permission_requests
+                    .push_back((provider_request_id.to_owned(), request_id.to_owned()));
+            }
             self.process
                 .send(&json!({"id": pending.rpc_id, "result": result}))?;
             return Ok(RuntimeRequestResolution::Permission { decision });
@@ -2104,6 +2144,173 @@ impl CodexProvider {
             }
             PendingRuntimeRegistration::Duplicate => Ok(None),
             PendingRuntimeRegistration::Rejected(event) => Ok(Some(event)),
+        }
+    }
+
+    /// Retires a pending typed permission the proxy settled. The native
+    /// permission is already rejected; the outstanding JSON-RPC request is
+    /// answered with an error so the proxy never resolves it a second time.
+    fn settle_opencode_permission_request(
+        &mut self,
+        params: &Value,
+    ) -> Result<Option<CodexProviderEvent>, LocalRunnerError> {
+        if params.get("status").and_then(Value::as_str) == Some("applied") {
+            return Ok(Some(self.record_opencode_permission_native_outcome(params)));
+        }
+        let expired = match params.get("status").and_then(Value::as_str) {
+            Some("expired") => true,
+            Some("cancelled") => false,
+            _ => {
+                return Ok(Some(CodexProviderEvent::Notification {
+                    method: "warning".to_owned(),
+                    params: json!({
+                        "threadId": self.thread_id,
+                        "message": "ignored an OpenCode permission settlement with an unknown status",
+                        "providerMethod": OPENCODE_RUNTIME_REQUEST_SETTLED_METHOD,
+                    }),
+                }))
+            }
+        };
+        let reason = params
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|reason| {
+                !reason.is_empty()
+                    && reason.len() <= 64
+                    && reason
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            })
+            .unwrap_or(if expired {
+                "permission_expired"
+            } else {
+                "provider_settled"
+            })
+            .to_owned();
+        let provider_request_id = params.get("requestId").and_then(Value::as_str);
+        let found = provider_request_id.and_then(|provider_request_id| {
+            self.pending_runtime_requests
+                .iter()
+                .find(|(_, pending)| {
+                    matches!(pending.kind, PendingRuntimeRequestKind::Permission { .. })
+                        && pending.method == OPENCODE_RUNTIME_REQUEST_METHOD
+                        && pending
+                            .params
+                            .pointer("/request/requestId")
+                            .and_then(Value::as_str)
+                            == Some(provider_request_id)
+                })
+                .map(|(request_id, _)| request_id.clone())
+        });
+        let Some(request_id) = found else {
+            // The board decision was already delivered when the driver's own
+            // settlement arrived (cancel || once race): the request is no
+            // longer pending, but the settlement still reports what OpenCode
+            // natively received. Record it as that delivered request's outcome.
+            if params.get("nativeOutcome").is_some()
+                && provider_request_id.is_some_and(|provider_request_id| {
+                    self.delivered_permission_requests
+                        .iter()
+                        .any(|(delivered, _)| delivered == provider_request_id)
+                })
+            {
+                return Ok(Some(self.record_opencode_permission_native_outcome(params)));
+            }
+            return Ok(Some(CodexProviderEvent::Notification {
+                method: "warning".to_owned(),
+                params: json!({
+                    "threadId": self.thread_id,
+                    "message": "ignored the settlement of an OpenCode permission that is not pending",
+                    "providerMethod": OPENCODE_RUNTIME_REQUEST_SETTLED_METHOD,
+                }),
+            }));
+        };
+        let pending = self
+            .pending_runtime_requests
+            .remove(&request_id)
+            .expect("pending permission located above");
+        self.pending_runtime_request_bytes = self
+            .pending_runtime_request_bytes
+            .saturating_sub(pending.retained_bytes);
+        self.send_frame(&json!({
+            "id": pending.rpc_id,
+            "error": {
+                "code": -32000,
+                "message": "Paperclip settled the OpenCode permission request without a decision",
+            },
+        }))?;
+        Ok(Some(CodexProviderEvent::RuntimeRequestSettled {
+            event_type: if expired {
+                "runtime_request.expired"
+            } else {
+                "runtime_request.cancelled"
+            },
+            payload: json!({
+                "requestId": request_id,
+                "requestKind": "runtime",
+                "type": "permission",
+                "status": if expired { "expired" } else { "cancelled" },
+                "reason": reason,
+                "turnId": pending.turn_id,
+                "replayAllowed": false,
+            }),
+            diagnostic: expired.then(|| {
+                json!({
+                    "provider": self.config.provider,
+                    "code": "permission_expired",
+                    "severity": "warning",
+                    "message": "OpenCode permission expired before a decision; it was rejected natively",
+                    "requestId": request_id,
+                    "paperclipExecuted": false,
+                })
+            }),
+        }))
+    }
+
+    /// Post-delivery report of what OpenCode natively received for a typed
+    /// permission whose board decision runnerd already handed over (for
+    /// example `once` delivered, but the terminal state won and the driver
+    /// sent native `reject`). Only a decision this runnerd delivered is
+    /// accepted, at most once; it is published as a diagnostic so the server
+    /// records the claim's actual native outcome. It never re-answers OpenCode.
+    fn record_opencode_permission_native_outcome(&mut self, params: &Value) -> CodexProviderEvent {
+        let ignored = |message: &str| CodexProviderEvent::Notification {
+            method: "warning".to_owned(),
+            params: json!({
+                "threadId": self.thread_id,
+                "message": message,
+                "providerMethod": OPENCODE_RUNTIME_REQUEST_SETTLED_METHOD,
+            }),
+        };
+        let Some(native_outcome) = params
+            .get("nativeOutcome")
+            .and_then(Value::as_str)
+            .filter(|outcome| PERMISSION_NATIVE_OUTCOMES.contains(outcome))
+        else {
+            return ignored("ignored an OpenCode permission outcome with an unknown value");
+        };
+        let provider_request_id = params.get("requestId").and_then(Value::as_str);
+        let Some(index) = provider_request_id.and_then(|provider_request_id| {
+            self.delivered_permission_requests
+                .iter()
+                .position(|(delivered, _)| delivered == provider_request_id)
+        }) else {
+            return ignored("ignored the outcome of an OpenCode permission that was not delivered");
+        };
+        let (_, request_id) = self
+            .delivered_permission_requests
+            .remove(index)
+            .expect("delivered permission located above");
+        CodexProviderEvent::RuntimeRequestRejected {
+            diagnostic: json!({
+                "provider": self.config.provider,
+                "code": "permission_native_outcome",
+                "severity": "info",
+                "message": "OpenCode reported what it natively received for a delivered permission decision",
+                "requestId": request_id,
+                "nativeOutcome": native_outcome,
+                "paperclipExecuted": false,
+            }),
         }
     }
 
@@ -2632,6 +2839,9 @@ impl CodexProvider {
 
         if let Some(method) = message.get("method").and_then(Value::as_str) {
             let params = message.get("params").cloned().unwrap_or(Value::Null);
+            if method == OPENCODE_RUNTIME_REQUEST_SETTLED_METHOD {
+                return self.settle_opencode_permission_request(&params);
+            }
             let identity = match classify_notification_thread(
                 method,
                 &self.thread_id,
@@ -4914,6 +5124,9 @@ done
         );
         assert!(
             OPENCODE_PROVIDER_ENVIRONMENT_KEYS.contains(&"PAPERCLIP_OPENCODE_LLAMACPP_BASE_URL")
+        );
+        assert!(
+            OPENCODE_PROVIDER_ENVIRONMENT_KEYS.contains(&"PAPERCLIP_OPENCODE_PERMISSION_TTL_MS")
         );
     }
 

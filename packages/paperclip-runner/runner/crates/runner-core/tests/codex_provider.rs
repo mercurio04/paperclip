@@ -6303,6 +6303,152 @@ fn interrupting_a_turn_cancels_its_pending_opencode_permission() {
 }
 
 #[test]
+fn delivered_opencode_permission_reports_its_native_outcome_once() {
+    let directory = temporary_directory("opencode-permission-native-outcome");
+    let config = provider_config(
+        &directory,
+        &[
+            "--opencode-proxy-permission",
+            "--opencode-proxy-permission-report-terminal",
+        ],
+    );
+    let mut provider = CodexProvider::start(&config, None).expect("start facade provider");
+    provider
+        .start_turn("Ask for a permission.", &config.cwd)
+        .expect("start provider turn");
+    let request_id = (0..64)
+        .find_map(|_| match provider.poll().expect("poll permission") {
+            Some(CodexProviderEvent::PermissionRequest { request_id, .. }) => Some(request_id),
+            _ => None,
+        })
+        .expect("the typed permission reaches runnerd");
+    let fixture = opencode_permission_fixture();
+    provider
+        .resolve_runtime_request(&request_id, &fixture["decisions"]["once"])
+        .expect("deliver the board decision");
+    let mut outcomes = Vec::new();
+    let mut ignored = 0;
+    for _ in 0..256 {
+        match provider.poll().expect("poll native outcome") {
+            Some(CodexProviderEvent::RuntimeRequestRejected { diagnostic })
+                if diagnostic["code"] == "permission_native_outcome" =>
+            {
+                outcomes.push(diagnostic)
+            }
+            Some(CodexProviderEvent::Notification { method, params })
+                if method == "warning"
+                    && params["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("was not delivered")) =>
+            {
+                ignored += 1
+            }
+            _ => {}
+        }
+        if outcomes.len() == 1 && ignored == 1 {
+            break;
+        }
+    }
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "exactly one outcome per delivered decision"
+    );
+    assert_eq!(outcomes[0]["requestId"], json!(request_id));
+    assert_eq!(outcomes[0]["nativeOutcome"], "rejected_terminal");
+    assert_eq!(outcomes[0]["paperclipExecuted"], false);
+    assert_eq!(
+        ignored, 1,
+        "a second report for the same request is ignored"
+    );
+    assert_eq!(
+        call_count(&directory, "opencode-permission-response:once"),
+        1
+    );
+    let _ = provider.shutdown();
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn proxy_expiry_retires_the_pending_opencode_permission_and_refuses_a_later_decision() {
+    let directory = temporary_directory("opencode-permission-expire");
+    let mut executor = prepare_opencode_permission_executor(
+        &directory,
+        &[
+            "--opencode-proxy-permission",
+            "--opencode-proxy-permission-expire",
+        ],
+    );
+    // created, the permission_expired diagnostic and expired may share a poll.
+    let mut seen = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline
+        && !seen
+            .iter()
+            .any(|event: &PolledEvent| event.event_type == "runtime_request.expired")
+    {
+        seen.extend(poll_and_ack(&mut executor).expect("poll permission events"));
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let find = |event_type: &str| {
+        seen.iter()
+            .find(|event| event.event_type == event_type)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing {event_type} in {:?}",
+                    seen.iter()
+                        .map(|e| (&e.event_type, &e.payload))
+                        .collect::<Vec<_>>()
+                )
+            })
+    };
+    let request_id = find("runtime_request.created").payload["request"]["requestId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let expired = find("runtime_request.expired");
+    assert!(seen
+        .iter()
+        .any(|event| event.event_type == "harness.diagnostic"
+            && event.payload["code"] == "permission_expired"));
+    assert_eq!(expired.payload["requestId"], json!(request_id));
+    assert_eq!(expired.payload["reason"], "permission_expired");
+    assert_eq!(expired.payload["type"], "permission");
+    let once = opencode_permission_fixture()["decisions"]["once"].clone();
+    let late = executor
+        .execute(&permission_resolve(4, &request_id, once))
+        .expect_err("an expired permission is never answered");
+    // The fake ends the turn once runnerd answers the expiry, so the late
+    // decision finds either no pending request or no active turn.
+    assert!(
+        late.to_string().contains("no pending")
+            || late.to_string().contains("outside an active turn"),
+        "{late}"
+    );
+    if !seen
+        .iter()
+        .any(|event| event.event_type == "turn.completed")
+    {
+        wait_for_executor_event(&mut executor, "turn.completed");
+    }
+    assert_eq!(
+        call_count(&directory, "opencode-permission-response:expired"),
+        1
+    );
+    for outcome in ["once", "reject", "cancel"] {
+        assert_eq!(
+            call_count(
+                &directory,
+                &format!("opencode-permission-response:{outcome}")
+            ),
+            0
+        );
+    }
+    executor.shutdown().expect("stop provider process");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
 fn provider_level_permission_resolution_reports_the_decision() {
     let directory = temporary_directory("opencode-permission-provider");
     let config = provider_config(&directory, &["--opencode-proxy-permission"]);
