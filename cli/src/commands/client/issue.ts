@@ -367,6 +367,7 @@ export function registerIssueCommands(program: Command): void {
         "Bind uploaded issue attachments to this comment",
       )
       .option("--reopen", "Reopen if issue is done/cancelled")
+      .option("--no-reopen", "Keep a done/cancelled issue closed when adding this comment")
       .option("--resume", "Request explicit follow-up and wake the assignee when resumable")
       .action(async (issueId: string, opts: IssueCommentOptions) => {
         try {

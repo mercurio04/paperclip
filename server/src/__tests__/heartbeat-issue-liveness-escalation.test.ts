@@ -533,6 +533,47 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     },
   );
 
+  it("covers the response-to-enqueue gap without consuming the recovery key", async () => {
+    const fixture = await seedResolvedDependencyBackstopFixture();
+    const interaction = await seedPendingInteraction(fixture);
+    await db.update(issueThreadInteractions).set({ status: "accepted", resolvedAt: new Date() })
+      .where(eq(issueThreadInteractions.id, interaction.id));
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, fixture.blockedIssueId));
+    const app = await createDependencyApp(fixture.companyId, fixture.ownerUserId);
+    const res = await request(app).patch(`/api/issues/${fixture.blockedIssueId}`).send({
+      status: "blocked", blockedByIssueIds: [fixture.blockerIssueId],
+      unblockDescriptor: { owner: "board", action: "Await the committed interaction continuation" },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await vi.waitFor(async () => expect(await db.select().from(activityLog).where(
+      eq(activityLog.action, "issue.blockers_resolved_wake_suppressed"))).toHaveLength(1));
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+    // Simulate a dispatch that never writes its receipt. The existing startup/
+    // periodic recovery still heals once; the route did not reserve its key.
+    expect((await heartbeatService(db).reconcileResolvedDependencyWakes()).healed).toBe(1);
+    expect((await heartbeatService(db).reconcileResolvedDependencyWakes()).healed).toBe(0);
+  });
+
+  it("does not let an old resolved interaction suppress a new blocked cycle", async () => {
+    const fixture = await seedResolvedDependencyBackstopFixture();
+    const interaction = await seedPendingInteraction(fixture);
+    await db.update(issueThreadInteractions).set({ status: "accepted",
+      resolvedAt: new Date(Date.now() - 60_000) }).where(eq(issueThreadInteractions.id, interaction.id));
+    await db.insert(agentWakeupRequests).values({ companyId: fixture.companyId,
+      agentId: fixture.agentId, source: "automation", status: "completed",
+      payload: { issueId: fixture.blockedIssueId, interactionId: interaction.id },
+    });
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, fixture.blockedIssueId));
+    const app = await createDependencyApp(fixture.companyId, fixture.ownerUserId);
+    const res = await request(app).patch(`/api/issues/${fixture.blockedIssueId}`).send({
+      status: "blocked", blockedByIssueIds: [fixture.blockerIssueId],
+      unblockDescriptor: { owner: "board", action: "Review a new ready state" },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await vi.waitFor(async () => expect(await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "issue_blockers_resolved"))).toHaveLength(1));
+  });
+
   it("keeps blocker_done evidence while the dependent has a pending interaction", async () => {
     const fixture = await seedResolvedDependencyBackstopFixture();
     await seedPendingInteraction(fixture);
@@ -571,6 +612,13 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
           .send(endpoint === "respond" ? { answers: [{ questionId: "continue", optionIds: ["yes"] }] } : {});
         expect(res.status, JSON.stringify(res.body)).toBe(200);
         await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1));
+        const restored = await request(app).patch(`/api/issues/${fixture.blockedIssueId}`).send({
+          status: "blocked", blockedByIssueIds: [fixture.blockerIssueId],
+          unblockDescriptor: { owner: "board", action: "Await the live continuation" },
+        });
+        expect(restored.status, JSON.stringify(restored.body)).toBe(200);
+        await vi.waitFor(async () => expect(await db.select().from(activityLog).where(
+          eq(activityLog.action, "issue.blockers_resolved_wake_suppressed"))).toHaveLength(1));
         expect((await hb.reconcileResolvedDependencyWakes()).healed).toBe(0);
         expect(await db.select().from(agentWakeupRequests)).toHaveLength(1);
       } finally {

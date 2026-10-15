@@ -1,4 +1,4 @@
-import { findPendingWakeInteraction } from "../services/pending-wake-interaction.js";
+import { findPendingWakeInteraction, findRestoredBlockedInteractionContinuation } from "../services/pending-wake-interaction.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
@@ -14750,7 +14750,12 @@ export function issueRoutes(
             const pendingInteraction = await findPendingWakeInteraction(
               db, issue.companyId, issue.id,
             );
-            if (pendingInteraction) {
+            const continuationInteraction = pendingInteraction ? null :
+              await findRestoredBlockedInteractionContinuation(
+                db, issue.companyId, issue.id, issue.assigneeAgentId!,
+              );
+            const waitingInteraction = pendingInteraction ?? continuationInteraction;
+            if (waitingInteraction) {
               await logActivity(db, {
                 companyId: issue.companyId,
                 actorType: actor.actorType,
@@ -14762,7 +14767,8 @@ export function issueRoutes(
                 entityType: "issue",
                 entityId: issue.id,
                 details: {
-                  interactionId: pendingInteraction.id,
+                  interactionId: waitingInteraction.id,
+                  reason: pendingInteraction ? "interaction_pending" : "interaction_continuation",
                   source: "issue.blockers_restored",
                   mutation: "blocked_dependency_restored",
                 },

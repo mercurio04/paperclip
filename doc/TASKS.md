@@ -318,13 +318,22 @@ mentions still wake their targets. The flag applies to the state read at request
 start. It does not suppress an explicit resume or status change, and it does not
 change comment behavior on open issues.
 
+The CLI equivalent is `paperclipai issue comment <id> --body "..." --no-reopen`.
+The default and `--reopen` behavior are unchanged. HTTP clients can send
+`POST /api/issues/:id/comments` with `{"body": "...", "reopen": false}` or
+`PATCH /api/issues/:id` with `{"comment": "...", "reopen": false}`.
+
 When a PATCH restores a dependency-ready `blocked` issue, a pending interaction
 on the same company and issue suppresses the dependency wake if its continuation
 policy is `wake_assignee` or `wake_assignee_on_accept`. The server records
 `issue.blockers_resolved_wake_suppressed` with the interaction ID. This check does
 not write a wake key or change issue status. A blocker that becomes `done` still
 emits its normal dependency wake. The recovery backstop keeps its existing wait
-and deduplication rules.
+and deduplication rules. The restored-blocked route also suppresses a duplicate
+while a resolved interaction still awaits its wake receipt, or its continuation
+remains queued or active. If dispatch fails before writing a receipt, the
+unchanged backstop heals the ready task on its next pass. A completed historical
+continuation does not suppress a new ready state.
 
 ---
 
