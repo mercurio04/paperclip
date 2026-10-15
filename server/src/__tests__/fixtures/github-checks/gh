@@ -1,0 +1,15 @@
+#!/usr/bin/env node
+// Test-only read executor. It never contacts GitHub or reads authentication.
+import fs from 'node:fs';
+const fixture = JSON.parse(fs.readFileSync(process.env.GITHUB_MONITOR_FIXTURE, 'utf8'));
+fs.appendFileSync(process.env.GITHUB_MONITOR_FIXTURE + '.calls', JSON.stringify(process.argv.slice(2)) + '\n');
+if (process.argv.slice(2, 7).join(' ') !== 'api --hostname github.com --method GET') process.exit(9);
+const endpoint = process.argv[7];
+const reply = () => {
+  if (fixture.error) { process.stderr.write(fixture.error); process.exit(1); }
+  if (endpoint.includes('/pulls/')) process.stdout.write(JSON.stringify(fixture.pr));
+  else if (endpoint.includes('/check-runs?')) process.stdout.write(JSON.stringify({check_runs: fixture.runs ?? []}));
+  else if (endpoint.includes('/statuses?')) process.stdout.write(JSON.stringify(fixture.statuses ?? []));
+  else process.exit(8);
+};
+if (fixture.delay) setTimeout(reply, fixture.delay); else reply();
