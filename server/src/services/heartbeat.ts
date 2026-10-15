@@ -26520,6 +26520,12 @@ export function heartbeatService(
             const [liveClaim] = await tx.select({ id: issues.id }).from(issues)
               .where(githubMonitorClaimCondition(opts.githubMonitorClaim));
             if (!liveClaim) return { kind: "skipped" as const };
+            // A saved event can be replayed by overlapping dispatches of the
+            // same claim. Serialize receipt dedup with admission, not gh I/O.
+            const [receipt] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+              .where(and(eq(agentWakeupRequests.companyId, issue.companyId),
+                eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey!))).limit(1);
+            if (receipt) return { kind: "skipped" as const };
           }
 
           if (opts.failedRunId) {

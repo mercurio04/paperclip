@@ -43,6 +43,10 @@ It updates the policy/state schedule and attempt projection together. The first
 interval is the declared interval, clamped to 5–30 minutes. Later waiting polls
 multiply it by 1.5, up to 30 minutes. The next poll never exceeds `timeoutAt`.
 The bounds never increase. Exhaustion uses the existing clear-and-recover path.
+If a poll starts within the deadline and finishes after it, an observed failure,
+changed HEAD, closed PR or all-green completion is preserved in the result wake.
+Errors and non-decisive results still use deadline recovery. No extra attempt or
+later poll is permitted by this rule.
 
 The server emits one structured `githubChecks` wake payload for a changed HEAD,
 a closed or merged PR, a failed/cancelled/timed-out/action-required check, all
@@ -56,13 +60,15 @@ responses use backoff. Three consecutive errors wake with `probeError`.
 A successful poll resets the consecutive error counter. Raw `gh` output is not
 included in errors, the database, agent payloads or logs.
 
-The existing claim is reclaimed after five minutes. Typed dispatches also take
-a transaction-scoped advisory lock per company and issue. CAS writes match the
-claim timestamp, schedule, target policy, owner and eligible status. Each API
+The existing claim is reclaimed after five minutes. The scheduler takes the claim
+in a short transaction. Typed polls reserve their attempt once per claim with an
+atomic update. No transaction or reserved pool connection spans GitHub I/O.
+CAS writes match the claim timestamp, schedule, target policy, owner and eligible status. Each API
 request rechecks the claim. Cancellation cannot undo an API request already in
 flight, but prevents later requests and result persistence. A pending event is
 saved before delivery. After a crash, the next claim reuses it and checks the
-existing `issue-monitor:{id}:{scheduledAt}` receipt before delivery.
+existing `issue-monitor:{id}:{scheduledAt}` receipt before delivery. Wake admission
+rechecks both the claim and the receipt under its existing issue lock.
 An explicit new schedule resets the server-owned probe history. No additional
 poll runs for a cleared monitor or a closed task.
 
@@ -79,7 +85,7 @@ Run from a disposable checkout with Node 24.11+ and pnpm 9.15.4:
 pnpm install --frozen-lockfile
 pnpm --filter @paperclipai/shared typecheck
 pnpm --filter @paperclipai/server typecheck
-pnpm exec vitest run server/src/__tests__/github-checks-probe.test.ts server/src/__tests__/issue-monitor-scheduler.test.ts --maxWorkers=1
+pnpm exec vitest run server/src/__tests__/github-checks-probe.test.ts server/src/__tests__/issue-monitor-scheduler.test.ts server/src/__tests__/github-checks-monitor-pool.test.ts --maxWorkers=1
 pnpm build
 ```
 
@@ -96,3 +102,12 @@ and check one wake with the exact SHA and no later API request. Run `G2 real
 process restart` to prove that a new server process uses the persisted schedule.
 These fixtures prove local behavior. They do not prove live GitHub access,
 external compatibility, required remote CI, a production rollout or savings.
+
+The pool regression suite runs the production probe module in disposable child
+processes with pool sizes 1, 2 and 3, N concurrent slow probes and repeated
+invocations of the same claim. It checks `pg_stat_activity` during an in-flight
+request and checks durable reservation after a process crash. Delivery in that
+fixture uses a receipt callback; the scheduler suite tests real wake admission,
+concurrent receipts, five-minute reclaim, and all deadline outcomes. Existing
+external-service tests remain the control. This does not change or certify the
+legacy wake-enqueue path's minimum pool capacity.

@@ -646,6 +646,42 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       expect(parseIssueExecutionState(row.executionState)?.monitor?.clearReason).toBe(kind === "timeout" ? "timeout_exceeded" : "max_attempts_exhausted");
       expect(await wakes()).toHaveLength(1);
     });
+    it.each(["failure", "cancelled", "timed_out", "green", "head_changed"])("O2 decisive %s observed after deadline is preserved in the wake", async kind => {
+      const deadline = new Date(tickAt.getTime() + 100);
+      const { issueId } = await seedFixture({ monitor: { ...target, timeoutAt: deadline.toISOString(), maxAttempts: 1 } });
+      fixture.delay = 150;
+      if (kind === "head_changed") fixture.pr = { head: { sha: "b".repeat(40) }, state: "open", merged: false };
+      else fixture.runs = [run("build", "success"), run("test", kind === "green" ? "success" : kind)];
+      saveFixture();
+      await heartbeatService(db).tickTimers(tickAt);
+      const receipts = await wakes();
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]!.reason).toBe("issue_monitor_due");
+      expect(receipts[0]!.payload?.githubChecks).toMatchObject({
+        headSha, reason: kind === "head_changed" ? kind : kind === "green" ? "checks_completed" : "checks_failed",
+      });
+      const row = await readIssue(issueId);
+      expect(row.monitorAttemptCount).toBe(1); expect(row.monitorNextCheckAt).toBeNull();
+      expect(parseIssueExecutionState(row.executionState)?.monitor).toMatchObject({ timeoutAt: deadline.toISOString(), maxAttempts: 1 });
+      await heartbeatService(db).tickTimers(new Date(tickAt.getTime() + 6 * 60_000));
+      expect(await wakes()).toHaveLength(1);
+    });
+    it.each(["HTTP 500", "HTTP 401", "waiting", "neutral", "missing"])("O2 %s after deadline uses clear/recover and never reports green", async kind => {
+      const deadline = new Date(tickAt.getTime() + 100);
+      const { issueId } = await seedFixture({ monitor: { ...target, timeoutAt: deadline.toISOString() } });
+      fixture.delay = 150;
+      if (kind.startsWith("HTTP")) fixture.error = kind;
+      if (kind === "neutral") fixture.runs = [run("build", "success"), run("test", "neutral")];
+      if (kind === "missing") fixture.runs = [run("build", "success")];
+      saveFixture();
+      await heartbeatService(db).tickTimers(tickAt);
+      const receipts = await wakes(); expect(receipts).toHaveLength(1);
+      expect(receipts[0]!.reason).toBe("issue_monitor_recovery");
+      expect(receipts[0]!.payload).toMatchObject({ clearReason: "timeout_exceeded", timeoutAt: deadline.toISOString() });
+      expect(receipts[0]!.payload).not.toHaveProperty("githubChecks");
+      const row = await readIssue(issueId);
+      expect(row.monitorAttemptCount).toBe(1); expect(row.monitorNextCheckAt).toBeNull();
+    });
     it("G2 clamps next poll to the original deadline", async () => {
       const deadline = new Date(tickAt.getTime() + 60_000);
       const { issueId } = await seedFixture({ monitor: { ...target, intervalMinutes: 1, timeoutAt: deadline.toISOString() } });
@@ -661,6 +697,21 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       expect((await readIssue(issueId)).monitorAttemptCount).toBe(1);
       expect(calls()).toHaveLength(3);
       expect(await wakes()).toHaveLength(0);
+    });
+    it("O1 concurrent saved-event admission creates at most one wake receipt", async () => {
+      const { issueId, agentId } = await seedFixture({ monitor: target });
+      await db.update(issues).set({ monitorWakeRequestedAt: tickAt }).where(eq(issues.id, issueId));
+      const claim = await readIssue(issueId);
+      const heartbeat = heartbeatService(db);
+      const opts = { source: "automation" as const, triggerDetail: "system" as const, reason: "issue_monitor_due",
+        githubMonitorClaim: claim, idempotencyKey: `issue-monitor:${issueId}:${claim.monitorNextCheckAt!.toISOString()}`,
+        requestedByActorType: "system" as const, requestedByActorId: "heartbeat_scheduler",
+        payload: { issueId, githubChecks: { reason: "checks_completed", headSha, allGreen: true } },
+        contextSnapshot: { issueId, source: "issue.monitor", wakeReason: "issue_monitor_due" },
+      };
+      await Promise.all([heartbeat.wakeup(agentId, opts), heartbeatService(db).wakeup(agentId, opts)]);
+      expect(await wakes()).toHaveLength(1);
+      expect(calls()).toHaveLength(0);
     });
     it("G2 crash after claim: lease recovers only after five minutes", async () => {
       const { issueId } = await seedFixture({ monitor: target });
@@ -690,7 +741,9 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       await db.update(issues).set(kind === "close" ? { status: "done" } : kind === "clear" ? { monitorNextCheckAt: null, monitorWakeRequestedAt: null } : { monitorNextCheckAt: new Date(tickAt.getTime() + 60_000), monitorWakeRequestedAt: null }).where(eq(issues.id, issueId));
       await tick;
       expect(await wakes()).toHaveLength(0);
-      expect((await readIssue(issueId)).monitorProbeState).toBeNull();
+      // The attempt reservation is durable; a cancelled query cannot save its result.
+      expect((await readIssue(issueId)).monitorProbeState).not.toHaveProperty("checks");
+      expect((await readIssue(issueId)).monitorProbeState).not.toHaveProperty("pendingEvent");
     });
     it.each(["disabled", "external_service"])("G2 %s: legacy one-shot behavior and no gh calls", async kind => {
       if (kind === "disabled") vi.stubEnv("PAPERCLIP_GITHUB_CHECKS_MONITOR_ENABLED", "false");
