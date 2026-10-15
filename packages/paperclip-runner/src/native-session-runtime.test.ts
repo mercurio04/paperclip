@@ -30,7 +30,7 @@ import {
   completeTerminatedRemoteNativeSessionCleanup,
   completeTerminatedLocalNativeSessionCleanup,
   localNativeSessionCleanupQuarantined,
-  authorizeTerminatedLocalNativeSessionCleanup,
+  beginLocalNativeSessionTerminationProof,
   type ExecuteNativeSessionOptions,
 } from "./native-session-runtime.js";
 
@@ -4066,7 +4066,84 @@ describe("executeNativeSession recovery", () => {
     completeTerminatedLocalNativeSessionCleanup(binding);
   });
 
-  it("does not quarantine an unrecoverable close of a run whose termination the controller pre-authorized", async () => {
+  describe("pending local termination proof", () => {
+    const setup = (runId: string, runnerInstanceId = "proof-runner") => {
+      const scopedIdentity = { ...identity, companyId: "proof-company", runId };
+      const binding = { ...scopedIdentity, runnerInstanceId };
+      const scopedInput = { ...input, binding: { ...input.binding, companyId: scopedIdentity.companyId, runId } };
+      const failure = new NativeSessionCloseUnrecoverableError();
+      const capabilities = { resume: true, typedEvents: true, steering: false, interruption: false, structuredResult: true };
+      const session: NativeSession = {
+        identity: () => scopedIdentity, capabilities: async () => capabilities,
+        async *events() { throw new Error("local transport stopped"); },
+        startTurn: async () => ({ turnId: "proof-turn" }), result: async () => null,
+        close: vi.fn(async () => { throw failure; }),
+      };
+      const backend: NativeSessionBackend = {
+        descriptor: async () => ({ kind: "local", name: `proof-test-${runId}`, version: "1", capabilities }),
+        openSession: vi.fn(async () => session),
+      };
+      const controlPlane: ControlPlanePort = {
+        openRun: async () => {}, checkpointSession: async () => {},
+        appendEvent: async () => ({ cursor: 0, highestContiguousSourceSeq: 0, disposition: "committed" }),
+        replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }), completeRun: vi.fn(async () => {}),
+      };
+      const options = { input: scopedInput, backend, controlPlane, runnerInstanceId,
+        controlPlaneInstanceId: "control", requireSessionCloseBeforeReturn: true };
+      return { scopedIdentity, binding, failure, backend, options };
+    };
+
+    it("admission waits for the controller's proof and opens only after the proven release", async () => {
+      const { scopedIdentity, binding, failure, backend, options } = setup("proof-released");
+      const proof = beginLocalNativeSessionTerminationProof({ ...binding, maxWaitMs: 10_000 });
+      await expect(executeNativeSession(options)).rejects.toBe(failure);
+      // The unrecoverable close still quarantined: a pending proof suppresses nothing.
+      expect(localNativeSessionCleanupQuarantined(scopedIdentity)).toBe(true);
+      let settled = false;
+      const next = executeNativeSession(options).finally(() => { settled = true; });
+      next.catch(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(settled).toBe(false);
+      expect(backend.openSession).toHaveBeenCalledOnce();
+      // Proof of termination first, then release, then the verdict.
+      expect(completeTerminatedLocalNativeSessionCleanup(binding)).toBe(true);
+      proof.settle();
+      await expect(next).rejects.toBe(failure);
+      expect(backend.openSession).toHaveBeenCalledTimes(2);
+      completeTerminatedLocalNativeSessionCleanup(binding);
+    });
+
+    it("keeps the quarantine and fails closed when the proof settles without release", async () => {
+      const { scopedIdentity, failure, binding, backend, options } = setup("proof-kept");
+      const proof = beginLocalNativeSessionTerminationProof({ ...binding, maxWaitMs: 10_000 });
+      await expect(executeNativeSession(options)).rejects.toBe(failure);
+      const next = executeNativeSession(options);
+      next.catch(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      proof.settle(); // survivors / unknown identity: no release
+      await expect(next).rejects.toBeInstanceOf(NativeSessionCleanupQuarantinedError);
+      expect(localNativeSessionCleanupQuarantined(scopedIdentity)).toBe(true);
+      expect(backend.openSession).toHaveBeenCalledOnce();
+      completeTerminatedLocalNativeSessionCleanup(binding);
+    });
+
+    it("does not defer admission for a proof of another runner instance or after its bound", async () => {
+      const { failure, binding, backend, options } = setup("proof-other");
+      const other = beginLocalNativeSessionTerminationProof({ ...binding, runnerInstanceId: "other-runner", maxWaitMs: 10_000 });
+      await expect(executeNativeSession(options)).rejects.toBe(failure);
+      await expect(executeNativeSession(options)).rejects.toBeInstanceOf(NativeSessionCleanupQuarantinedError);
+      other.settle();
+      const expired = beginLocalNativeSessionTerminationProof({ ...binding, maxWaitMs: 30 });
+      const started = Date.now();
+      await expect(executeNativeSession(options)).rejects.toBeInstanceOf(NativeSessionCleanupQuarantinedError);
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expired.settle();
+      expect(backend.openSession).toHaveBeenCalledOnce();
+      completeTerminatedLocalNativeSessionCleanup(binding);
+    });
+  });
+
+  it("QA restores quarantine when the close fails before the reaper proved termination", async () => {
     const scopedIdentity = { ...identity, companyId: "auth-stop-company", runId: "auth-stop-run" };
     const binding = { ...scopedIdentity, runnerInstanceId: "auth-runner" };
     const scopedInput = { ...input, binding: { ...input.binding, companyId: scopedIdentity.companyId, runId: scopedIdentity.runId } };
@@ -4089,21 +4166,20 @@ describe("executeNativeSession recovery", () => {
     };
     const options = { input: scopedInput, backend, controlPlane, runnerInstanceId: binding.runnerInstanceId,
       controlPlaneInstanceId: "control", requireSessionCloseBeforeReturn: true };
-    // Another runner instance's authorization never matches.
-    const foreign = authorizeTerminatedLocalNativeSessionCleanup({ ...binding, runnerInstanceId: "other-runner" });
+    // QA TAX-476 H11 (adapted: the pre-authorization API was removed). A close
+    // that fails before the reaper proved termination always quarantines, and
+    // nothing short of the post-proof release for this run + runner retires it.
     await expect(executeNativeSession(options)).rejects.toBe(failure);
     expect(localNativeSessionCleanupQuarantined(scopedIdentity)).toBe(true);
-    foreign.revoke();
+    // Survivors / identity change / unknown state: the reaper never releases.
+    await expect(executeNativeSession(options)).rejects.toBeInstanceOf(NativeSessionCleanupQuarantinedError);
+    expect(localNativeSessionCleanupQuarantined(scopedIdentity)).toBe(true);
+    expect(completeTerminatedLocalNativeSessionCleanup({ ...binding, runnerInstanceId: "other-runner" })).toBe(false);
+    expect(localNativeSessionCleanupQuarantined(scopedIdentity)).toBe(true);
+    // Proven termination: exactly this run + runner instance is released.
     expect(completeTerminatedLocalNativeSessionCleanup(binding)).toBe(true);
-    authorizeTerminatedLocalNativeSessionCleanup(binding);
-    await expect(executeNativeSession(options)).rejects.toBe(failure);
     expect(localNativeSessionCleanupQuarantined(scopedIdentity)).toBe(false);
-    // Consumed: a later failure quarantines again.
-    await expect(executeNativeSession(options)).rejects.toBe(failure);
-    expect(localNativeSessionCleanupQuarantined(scopedIdentity)).toBe(true);
-    // A revoked authorization does not suppress anything.
-    completeTerminatedLocalNativeSessionCleanup(binding);
-    authorizeTerminatedLocalNativeSessionCleanup(binding).revoke();
+    // A later failure quarantines again (nothing was pre-authorized/consumed).
     await expect(executeNativeSession(options)).rejects.toBe(failure);
     expect(localNativeSessionCleanupQuarantined(scopedIdentity)).toBe(true);
     completeTerminatedLocalNativeSessionCleanup(binding);

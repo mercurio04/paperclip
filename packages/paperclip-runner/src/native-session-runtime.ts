@@ -153,59 +153,8 @@ export function completeTerminatedRemoteNativeSessionCleanup(binding: {
   return true;
 }
 
-/** Host-only counterpart of remote resource termination. The caller has verified
- * both exact local process identities and durably fenced their run. This removes
- * only cleanup ownership; the retained checkpoint is never made resumable.
- */
-const terminatedLocalCleanupAuthorizations = new Map<string, string>();
-const terminatedLocalCleanupKey = (companyId: string, runId: string) =>
-  JSON.stringify([companyId, runId]);
-
-/**
- * The controller is about to terminate (and will prove absent) the exact
- * local processes of this run. A close of that run's session that then fails
- * as unrecoverable is retired instead of quarantining the whole cleanup
- * domain. Only the given runner instance matches; `revoke` withdraws it (for
- * example when a process survived). An already-present quarantine is retired
- * now when nothing is in flight.
- */
-export function authorizeTerminatedLocalNativeSessionCleanup(binding: {
-  companyId: string;
-  runId: string;
-  runnerInstanceId: string;
-}): { revoke: () => void } {
-  const key = terminatedLocalCleanupKey(binding.companyId, binding.runId);
-  terminatedLocalCleanupAuthorizations.set(key, binding.runnerInstanceId);
-  const expiry = setTimeout(() => {
-    if (terminatedLocalCleanupAuthorizations.get(key) === binding.runnerInstanceId)
-      terminatedLocalCleanupAuthorizations.delete(key);
-  }, 120_000);
-  expiry.unref?.();
-  return {
-    revoke: () => {
-      clearTimeout(expiry);
-      if (terminatedLocalCleanupAuthorizations.get(key) === binding.runnerInstanceId)
-        terminatedLocalCleanupAuthorizations.delete(key);
-    },
-  };
-}
-
-function consumeTerminatedLocalCleanupAuthorization(
-  session: NativeSession,
-  cleanupDomain: NativeSessionCleanupDomain,
-): boolean {
-  if ((JSON.parse(cleanupDomain) as string[]).length !== 3) return false;
-  const identity = session.identity();
-  const key = terminatedLocalCleanupKey(identity.companyId, identity.runId);
-  const runnerInstanceId = terminatedLocalCleanupAuthorizations.get(key);
-  if (runnerInstanceId === undefined ||
-      sessionOriginRunnerInstances.get(session) !== runnerInstanceId) return false;
-  terminatedLocalCleanupAuthorizations.delete(key);
-  return true;
-}
-
-/** True while a local cleanup of exactly this run is quarantined. Lets the
- * controller retire it only after it proved the run's processes terminated. */
+/** True while a local cleanup of exactly this run is quarantined. Read-only:
+ * the controller releases it only through the call below, after proof. */
 export function localNativeSessionCleanupQuarantined(binding: {
   companyId: string;
   runId: string;
@@ -217,6 +166,82 @@ export function localNativeSessionCleanupQuarantined(binding: {
   });
 }
 
+/**
+ * Termination proofs in progress for local runs, keyed by company + run. A
+ * pending proof never suppresses, retires or pre-authorizes anything: an
+ * unrecoverable close still quarantines (operator recovery) exactly as before.
+ * It only lets a later admission of the same cleanup domain wait, bounded, for
+ * the controller's verdict instead of failing fast on a quarantine the
+ * controller is about to release with proof. When the proof settles without a
+ * release, the quarantine stays and admission fails closed as before.
+ */
+type PendingLocalTerminationProof = {
+  runnerInstanceId: string;
+  settled: Promise<void>;
+  deadline: number;
+};
+const pendingLocalTerminationProofs = new Map<string, PendingLocalTerminationProof>();
+const localTerminationProofKey = (companyId: string, runId: string) =>
+  JSON.stringify([companyId, runId]);
+const MAX_LOCAL_TERMINATION_PROOF_WAIT_MS = 120_000;
+
+export function beginLocalNativeSessionTerminationProof(binding: {
+  companyId: string;
+  runId: string;
+  runnerInstanceId: string;
+  /** Upper bound for the proof (settle + signalling + release window). */
+  maxWaitMs: number;
+}): { settle: () => void } {
+  const key = localTerminationProofKey(binding.companyId, binding.runId);
+  let resolve!: () => void;
+  const settled = new Promise<void>((done) => { resolve = done; });
+  const waitMs = Math.max(0, Math.min(binding.maxWaitMs, MAX_LOCAL_TERMINATION_PROOF_WAIT_MS));
+  const proof: PendingLocalTerminationProof = {
+    runnerInstanceId: binding.runnerInstanceId,
+    settled,
+    deadline: Date.now() + waitMs,
+  };
+  pendingLocalTerminationProofs.set(key, proof);
+  const finish = () => {
+    clearTimeout(expiry);
+    if (pendingLocalTerminationProofs.get(key) === proof) pendingLocalTerminationProofs.delete(key);
+    resolve();
+  };
+  const expiry = setTimeout(finish, waitMs);
+  expiry.unref?.();
+  return { settle: finish };
+}
+
+/** The pending proofs that cover every operator-recovery quarantine of this
+ * domain, or null when any such entry has no matching pending proof. */
+function pendingProofsCoveringOperatorQuarantines(
+  cleanupDomain: NativeSessionCleanupDomain,
+): PendingLocalTerminationProof[] | null {
+  const blocking = [...quarantinedSessionCleanups].filter(
+    (cleanup) => cleanup.domain === cleanupDomain && cleanup.operatorRecoveryRequired,
+  );
+  if (blocking.length === 0) return [];
+  const proofs = new Set<PendingLocalTerminationProof>();
+  for (const cleanup of blocking) {
+    if ((JSON.parse(cleanup.domain) as string[]).length !== 3) return null;
+    const identity = cleanup.session.identity();
+    const proof = pendingLocalTerminationProofs.get(
+      localTerminationProofKey(identity.companyId, identity.runId),
+    );
+    if (!proof || Date.now() >= proof.deadline ||
+        sessionOriginRunnerInstances.get(cleanup.session) !== proof.runnerInstanceId) return null;
+    proofs.add(proof);
+  }
+  return [...proofs];
+}
+
+/** Host-only counterpart of remote resource termination. The caller has verified
+ * both exact local process identities and durably fenced their run. This removes
+ * only cleanup ownership; the retained checkpoint is never made resumable.
+ * Callers release only after proof (e.g. the dedicated-process reaper, once every
+ * process group of the run is proven terminated); there is no pre-authorization:
+ * an unrecoverable close always quarantines first.
+ */
 export function completeTerminatedLocalNativeSessionCleanup(binding: {
   companyId: string;
   runId: string;
@@ -685,8 +710,6 @@ function quarantineSessionCleanup(
   const existing = [...quarantinedSessionCleanups].find(
     (entry) => entry.session === session,
   );
-  if (!existing && consumeTerminatedLocalCleanupAuthorization(session, cleanupDomain))
-    return;
   if (existing) {
     if (operatorRecoveryRequired) {
       existing.operatorRecoveryRequired = true;
@@ -817,13 +840,19 @@ async function retryQuarantinedSessionCleanups(
   let observedOwnerPhases = 0;
   while (true) {
     signal?.throwIfAborted();
-    if (
-      [...quarantinedSessionCleanups].some(
-        (cleanup) =>
-          cleanup.domain === cleanupDomain && cleanup.operatorRecoveryRequired,
-      )
-    ) {
-      throw new NativeSessionCleanupQuarantinedError();
+    const pendingProofs = pendingProofsCoveringOperatorQuarantines(cleanupDomain);
+    if (pendingProofs === null) throw new NativeSessionCleanupQuarantinedError();
+    if (pendingProofs.length > 0) {
+      // Every operator-recovery entry belongs to a run whose controller is
+      // still proving termination. Wait (bounded) for that verdict, then
+      // re-evaluate: released entries are gone, kept ones fail closed.
+      const deadline = Math.min(...pendingProofs.map((proof) => proof.deadline));
+      await settlesWithin(
+        Promise.race(pendingProofs.map((proof) => proof.settled)),
+        Math.max(0, deadline - Date.now()),
+        signal,
+      );
+      continue;
     }
     const cleanupOwners = new Set<Promise<void>>(
       [...failedSessionCleanupOwners]

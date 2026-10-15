@@ -13614,8 +13614,13 @@ export function heartbeatService(
    * interrupt, which used to leave the run's dedicated runnerd/OpenCode alive
    * after `cancelled`. The driver now rejects pending permissions so the
    * session closes normally; this is the bounded backstop: after the settle
-   * window, SIGTERM then SIGKILL the identity-verified process groups (the
-   * session cleanup is then unproven and fails closed). Never throws.
+   * window, SIGTERM then SIGKILL the identity-verified process groups
+   * (identity re-verified before every signal). The owner's failed close
+   * quarantines the cleanup as usual; the reaper releases that run + runner
+   * entry only after proving every recorded group terminated (signalled to
+   * exit, or already verifiably gone), otherwise it stays quarantined. While
+   * the proof runs, the agent's next admission waits for that verdict instead
+   * of failing fast. Never throws.
    */
   function reapCancelledNativeRunProcesses(run: typeof heartbeatRuns.$inferSelect) {
     if (run.runtimeMode !== "native") return;
@@ -13625,7 +13630,7 @@ export function heartbeatService(
       reason: "board_cancel",
       settleMs: NATIVE_CANCEL_REAP_SETTLE_MS,
     }).then((outcome) => {
-      if (outcome && outcome.targets.length > 0)
+      if (outcome && (outcome.targets.length > 0 || outcome.unverified.length > 0 || outcome.cleanupQuarantine !== "not_observed"))
         logger.info({ runId: run.id, ...outcome }, "native cancel reaped dedicated processes");
     }).catch((error) => {
       logger.warn({ err: error, runId: run.id }, "native cancel process reap failed");
