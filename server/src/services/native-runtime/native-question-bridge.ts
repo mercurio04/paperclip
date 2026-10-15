@@ -215,6 +215,15 @@ export async function projectNativeRuntimeRequest(input: {
     throw new Error("native_runtime_request_binding_mismatch");
   }
   const request = record(record(input.event.payload)?.request);
+  // Typed OpenCode permissions (TAX-452) are decided through the runtime
+  // request resolve route, never as a task-thread question card.
+  if (
+    request?.type === "permission"
+    && request.schema === "paperclip.runtime_request.permission.v1"
+    && request.requestKind === "runtime"
+  ) {
+    return null;
+  }
   if (
     !request
     || request.schema !== "paperclip.runtime_request.v2"

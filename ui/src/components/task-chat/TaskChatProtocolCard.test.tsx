@@ -536,6 +536,132 @@ describe("TaskChatProtocolCard", () => {
     expect(onDecision).toHaveBeenCalledWith({ action: "accept" });
   });
 
+  describe("typed OpenCode permission contract", () => {
+    const SHA = "cd".repeat(32);
+    function permissionItem(
+      overrides: Partial<Extract<TaskChatProtocolItem, { surface: "runtime_request" }>> = {},
+    ): TaskChatProtocolItem {
+      return {
+        id: "permission-request",
+        kind: "protocol",
+        surface: "runtime_request",
+        runId: "run-1",
+        requestId: "perm-1",
+        requestKind: "runtime",
+        turnId: "turn-1",
+        requestType: "permission",
+        status: "pending",
+        prompt: "OpenCode wants to edit src/a.ts",
+        choices: [],
+        fields: [],
+        permissionContract: {
+          schema: "paperclip.opencode_permission_contract.v1",
+          provider: "opencode",
+          providerVersion: "1.18.29",
+          providerSessionId: "ses_1",
+          providerRequestId: "per_1",
+          permission: "edit",
+          tool: { messageId: "msg_1", callId: "call_1" },
+          patterns: ["src/a.ts"],
+          always: ["src/*"],
+          cwd: "/work/repo",
+          targets: [{ pattern: "src/a.ts", resolvedPath: "/work/repo/src/a.ts" }],
+          argumentsJson: JSON.stringify({ filePath: "src/a.ts" }, null, 2),
+          metadataJson: null,
+          policy: { profile: "restricted_v1", permissionDefault: "ask" },
+          contractSha256: SHA,
+          contractShaPrefix: SHA.slice(0, 12),
+          decisions: ["once", "reject"],
+        },
+        ...overrides,
+      };
+    }
+
+    it("renders the frozen contract read-only with exactly once/reject", () => {
+      renderCard(root, permissionItem(), vi.fn());
+      const contract = container.querySelector(
+        '[data-testid="task-chat-runtime-permission-contract"]',
+      );
+      expect(contract?.textContent).toContain("edit");
+      expect(contract?.textContent).toContain("msg_1 / call_1");
+      expect(contract?.textContent).toContain("src/a.ts");
+      expect(contract?.textContent).toContain("/work/repo");
+      expect(contract?.textContent).toContain("/work/repo/src/a.ts");
+      const pre = container.querySelector(
+        '[data-testid="task-chat-runtime-permission-arguments"]',
+      );
+      expect(pre?.tagName).toBe("PRE");
+      expect(pre?.textContent).toBe(JSON.stringify({ filePath: "src/a.ts" }, null, 2));
+      expect(
+        container.querySelector('[data-testid="task-chat-runtime-permission-sha"]')
+          ?.textContent,
+      ).toBe(`sha256:${SHA.slice(0, 12)}`);
+      expect(container.querySelectorAll("input, textarea")).toHaveLength(0);
+      const labels = Array.from(container.querySelectorAll("button"))
+        .map((button) => button.textContent?.trim())
+        .filter((label) => label === "Allow once" || label === "Reject" || /always|session/i.test(label ?? ""));
+      expect(labels).toEqual(["Allow once", "Reject"]);
+    });
+
+    it.each([
+      ["Allow once", "once"],
+      ["Reject", "reject"],
+    ] as const)("posts %s bound to the contract sha", async (label, decision) => {
+      const onDecision = vi.fn().mockResolvedValue(undefined);
+      renderCard(root, permissionItem(), onDecision);
+      const button = Array.from(container.querySelectorAll("button")).find(
+        (candidate) => candidate.textContent === label,
+      );
+      await act(async () => button?.click());
+      expect(onDecision).toHaveBeenCalledWith({
+        action: "permission_decision",
+        decision,
+        contractSha256: SHA,
+      });
+    });
+
+    it("shows the server error from a rejected decision", async () => {
+      const onDecision = vi
+        .fn()
+        .mockRejectedValue(new Error("This permission was already decided (409)"));
+      renderCard(root, permissionItem(), onDecision);
+      const button = Array.from(container.querySelectorAll("button")).find(
+        (candidate) => candidate.textContent === "Allow once",
+      );
+      await act(async () => button?.click());
+      expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+        "This permission was already decided (409)",
+      );
+    });
+
+    it("offers no decision for a malformed contract or a resolved request", () => {
+      renderCard(
+        root,
+        permissionItem({ permissionContract: null, permissionContractInvalid: true }),
+        vi.fn(),
+      );
+      expect(
+        container.querySelector('[data-testid="task-chat-runtime-permission-invalid"]'),
+      ).not.toBeNull();
+      expect(
+        Array.from(container.querySelectorAll("button")).some((button) =>
+          ["Allow once", "Reject"].includes(button.textContent ?? ""),
+        ),
+      ).toBe(false);
+      renderCard(
+        root,
+        permissionItem({ status: "resolved", permissionDecision: "once" }),
+        vi.fn(),
+      );
+      expect(container.textContent).toContain("Allowed once");
+      expect(
+        Array.from(container.querySelectorAll("button")).some((button) =>
+          ["Allow once", "Reject"].includes(button.textContent ?? ""),
+        ),
+      ).toBe(false);
+    });
+  });
+
   it("submits structured runtime input through the production card", async () => {
     const onDecision = vi.fn().mockResolvedValue(undefined);
     renderCard(

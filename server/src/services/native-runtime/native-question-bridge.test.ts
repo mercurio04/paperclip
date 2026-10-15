@@ -296,6 +296,27 @@ describeEmbeddedPostgres("native question bridge", () => {
     await expect(nativeQuestionRunToCancel(db, answered)).resolves.toBeNull();
   });
 
+  it("skips typed OpenCode permission requests instead of projecting a question card", async () => {
+    await seed();
+    const event = runtimeRequestEvent();
+    event.payload = {
+      request: {
+        schema: "paperclip.runtime_request.permission.v1",
+        requestKind: "runtime",
+        requestId: "perm-1",
+        type: "permission",
+        status: "pending",
+        prompt: "edit",
+        turnId: "turn-1",
+        decisions: ["once", "reject"],
+        permission: { contractSha256: "a".repeat(64) },
+      },
+    };
+    await expect(projectNativeRuntimeRequest({ db, binding: binding(), event }))
+      .resolves.toBeNull();
+    expect(await db.select().from(issueThreadInteractions)).toHaveLength(0);
+  });
+
   it("does not duplicate the task card when the runner replays a request", async () => {
     await seed();
     const first = await projectNativeRuntimeRequest({ db, binding: binding(), event: runtimeRequestEvent() });

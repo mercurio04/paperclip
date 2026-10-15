@@ -122,6 +122,57 @@ export class PaperclipRunnerProviderProfileError extends Error {
   }
 }
 
+export type PaperclipRunnerOpenCodePermissionProfile = "restricted_v1";
+
+export interface PaperclipRunnerOpenCodeRuntimeOptions {
+  opencodePermissionProfile?: PaperclipRunnerOpenCodePermissionProfile;
+  llamaCppBaseUrl?: string;
+}
+
+/**
+ * Opt-in OpenCode runtime options (TAX-452). Absent fields keep the existing
+ * behavior; malformed values fail closed instead of silently falling back to
+ * an unrestricted profile.
+ */
+export function resolvePaperclipRunnerOpenCodeRuntimeOptions(
+  adapterConfig: unknown,
+): PaperclipRunnerOpenCodeRuntimeOptions {
+  const config = asRecord(adapterConfig);
+  const options: PaperclipRunnerOpenCodeRuntimeOptions = {};
+  const profile = config.opencodePermissionProfile;
+  if (profile !== undefined && profile !== null && profile !== "") {
+    if (profile !== "restricted_v1") {
+      throw new PaperclipRunnerProviderProfileError(
+        "paperclip_runner_opencode_permission_profile_invalid",
+        "opencodePermissionProfile must be \"restricted_v1\" when set.",
+      );
+    }
+    options.opencodePermissionProfile = profile;
+  }
+  const baseUrl = config.llamaCppBaseUrl;
+  if (baseUrl !== undefined && baseUrl !== null && baseUrl !== "") {
+    let parsed: URL | null = null;
+    try {
+      parsed = typeof baseUrl === "string" ? new URL(baseUrl) : null;
+    } catch {
+      parsed = null;
+    }
+    if (
+      !parsed
+      || (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+      || parsed.username
+      || parsed.password
+    ) {
+      throw new PaperclipRunnerProviderProfileError(
+        "paperclip_runner_llama_cpp_base_url_invalid",
+        "llamaCppBaseUrl must be an http(s) URL without credentials.",
+      );
+    }
+    options.llamaCppBaseUrl = baseUrl as string;
+  }
+  return options;
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -459,13 +510,18 @@ export function resolvePaperclipRunnerNativeProviderInput(input: {
     );
   }
   if (profile.provider === "opencode") {
+    const runtime = resolvePaperclipRunnerOpenCodeRuntimeOptions(config);
     return {
       provider: "opencode",
       model: profile.model,
-      opencodePermissionMode: resolvePaperclipRunnerPermissionMode(
-        "opencode",
-        config.opencodePermissionMode,
-      ) as "allow" | "ask" | "deny",
+      // The restricted profile routes every tool permission through a typed,
+      // human-decided contract; it is only meaningful with "ask".
+      opencodePermissionMode: runtime.opencodePermissionProfile === "restricted_v1"
+        ? "ask"
+        : resolvePaperclipRunnerPermissionMode(
+            "opencode",
+            config.opencodePermissionMode,
+          ) as "allow" | "ask" | "deny",
     };
   }
   if (profile.provider === "acpx") {

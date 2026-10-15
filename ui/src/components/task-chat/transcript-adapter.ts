@@ -20,7 +20,9 @@ import type {
   TaskChatRunResultItem,
   TaskChatMessageItem,
   TaskChatPlanDocumentItem,
+  TaskChatRuntimeRequestItem,
 } from "./task-chat-model";
+import type { NativeRuntimeRequestEntry } from "../transcript/native-run-events";
 import {
   humanizeToolName,
   isGenericToolName,
@@ -35,6 +37,27 @@ const TERMINAL_STATUSES = new Set([
   "interrupted",
   "succeeded",
 ]);
+
+/** Carry the typed permission contract (if any) from a native runtime request entry. */
+function runtimePermissionFields(
+  entry: Extract<TranscriptEntry, { kind: "runtime_request" }>,
+): Pick<
+  TaskChatRuntimeRequestItem,
+  "permissionContract" | "permissionContractInvalid" | "permissionDecision"
+> {
+  const native = entry as NativeRuntimeRequestEntry;
+  return {
+    ...(native.permissionContract
+      ? { permissionContract: native.permissionContract }
+      : {}),
+    ...(native.permissionContractInvalid
+      ? { permissionContractInvalid: true }
+      : {}),
+    ...(native.permissionDecision
+      ? { permissionDecision: native.permissionDecision }
+      : {}),
+  };
+}
 
 export function isTerminalRunStatus(
   status: string | undefined | null,
@@ -917,6 +940,7 @@ export function transcriptToTaskChatItems(
           questionSet: entry.questionSet,
           resolvedAction: entry.resolvedAction,
           response: entry.response,
+          ...runtimePermissionFields(entry),
         };
         const existingIndex = protocolIndexByKey.get(key);
         if (existingIndex == null) {

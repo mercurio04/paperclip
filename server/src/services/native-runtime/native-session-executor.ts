@@ -41,6 +41,7 @@ import type {
   AdapterRuntimeEvent,
 } from "../../adapters/index.js";
 import type { NativeFinalizationResult } from "@paperclipai/shared";
+import type { PaperclipRunnerOpenCodePermissionProfile } from "./provider-profile.js";
 import type {
   HarnessRuntimeRequestResolution,
   NativeExecutionInput,
@@ -6831,6 +6832,10 @@ export async function executePaperclipNativeSession(input: {
   db: Db;
   execution: NativeExecutionInput;
   runnerInstanceId: string;
+  /** Opt-in OpenCode permission profile (TAX-452); absent = unchanged. */
+  opencodePermissionProfile?: PaperclipRunnerOpenCodePermissionProfile;
+  /** Optional llama.cpp endpoint for the OpenCode provider. */
+  llamaCppBaseUrl?: string;
   /** Trusted task identity from the heartbeat orchestration. */
   conversationMode?: boolean;
   /** Configured total turn bound; zero/unset is unlimited. */
@@ -9864,6 +9869,8 @@ export async function createRunnerdBackend(input: {
   db: Db;
   execution: NativeExecutionInput;
   runnerInstanceId: string;
+  opencodePermissionProfile?: PaperclipRunnerOpenCodePermissionProfile;
+  llamaCppBaseUrl?: string;
   chatAttachmentReadScope?: NativeChatAttachmentReadScope;
   restartRecovery?: NativeRestartRecoveryClaim;
   durableEnvironmentLeaseId?: string;
@@ -11595,7 +11602,18 @@ async function createRunnerdBackendWithinSessionClaim(
           : {}),
         ...(input.execution.provider.kind === "opencode"
           ? {
-              opencodePermissionMode: input.execution.provider.permissionMode,
+              // restricted_v1 is only valid with "ask": the profile routes
+              // every tool permission through a human-decided contract.
+              opencodePermissionMode:
+                input.opencodePermissionProfile === "restricted_v1"
+                  ? "ask"
+                  : input.execution.provider.permissionMode,
+              ...(input.opencodePermissionProfile
+                ? { opencodePermissionProfile: input.opencodePermissionProfile }
+                : {}),
+              ...(input.llamaCppBaseUrl
+                ? { llamaCppBaseUrl: input.llamaCppBaseUrl }
+                : {}),
             }
           : {}),
         ...(input.execution.provider.kind === "claude_managed"

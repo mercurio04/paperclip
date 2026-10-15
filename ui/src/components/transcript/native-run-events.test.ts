@@ -1,7 +1,11 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import type { HeartbeatRunEvent } from "@paperclipai/shared";
-import { nativeRunEventsToTranscript } from "./native-run-events";
+import {
+  nativeRunEventsToTranscript,
+  normalizePermissionContract,
+  type NativeRuntimeRequestEntry,
+} from "./native-run-events";
 
 const RUN_ID = "10000000-0000-4000-8000-000000000001";
 
@@ -868,6 +872,161 @@ describe("nativeRunEventsToTranscript", () => {
       malformed,
       event(3, "extension.unknown", { explanation: "not a transcript row" }),
     ])).toEqual([]);
+  });
+
+  describe("typed OpenCode permission requests", () => {
+    const SHA = "ab".repeat(32);
+    function permissionRequest(overrides: Record<string, unknown> = {}, contract: Record<string, unknown> = {}) {
+      return {
+        schema: "paperclip.runtime_request.permission.v1",
+        requestKind: "runtime",
+        requestId: "perm-1",
+        type: "permission",
+        status: "pending",
+        prompt: "OpenCode wants to edit src/a.ts",
+        turnId: "turn-1",
+        decisions: ["once", "reject"],
+        permission: {
+          schema: "paperclip.opencode_permission_contract.v1",
+          provider: "opencode",
+          providerVersion: "1.18.29",
+          providerSessionId: "ses_1",
+          providerRequestId: "per_1",
+          permission: "edit",
+          tool: { messageId: "msg_1", callId: "call_1" },
+          patterns: ["src/a.ts"],
+          always: ["src/*"],
+          metadata: { diff: "+x" },
+          arguments: { filePath: "src/a.ts", newString: "x" },
+          cwd: "/work/repo",
+          targets: [{ pattern: "src/a.ts", resolvedPath: "/work/repo/src/a.ts" }],
+          policy: { profile: "restricted_v1", permissionDefault: "ask" },
+          contractSha256: SHA,
+          ...contract,
+        },
+        ...overrides,
+      };
+    }
+
+    it("normalizes the frozen contract with once/reject only", () => {
+      const [entry] = nativeRunEventsToTranscript([
+        event(1, "runtime_request.created", {
+          request: permissionRequest({ decisions: ["once", "always", "reject", "session"] }),
+        }),
+      ]) as NativeRuntimeRequestEntry[];
+      expect(entry).toMatchObject({
+        kind: "runtime_request",
+        requestId: "perm-1",
+        requestKind: "runtime",
+        requestType: "permission",
+        status: "pending",
+        turnId: "turn-1",
+      });
+      expect(entry.permissionContract).toEqual({
+        schema: "paperclip.opencode_permission_contract.v1",
+        provider: "opencode",
+        providerVersion: "1.18.29",
+        providerSessionId: "ses_1",
+        providerRequestId: "per_1",
+        permission: "edit",
+        tool: { messageId: "msg_1", callId: "call_1" },
+        patterns: ["src/a.ts"],
+        always: ["src/*"],
+        cwd: "/work/repo",
+        targets: [{ pattern: "src/a.ts", resolvedPath: "/work/repo/src/a.ts" }],
+        argumentsJson: JSON.stringify({ filePath: "src/a.ts", newString: "x" }, null, 2),
+        metadataJson: JSON.stringify({ diff: "+x" }, null, 2),
+        policy: { profile: "restricted_v1", permissionDefault: "ask" },
+        contractSha256: SHA,
+        contractShaPrefix: SHA.slice(0, 12),
+        decisions: ["once", "reject"],
+      });
+      expect(entry.permissionContractInvalid).toBeUndefined();
+    });
+
+    it("keeps the frozen contract through resolution and records the decision", () => {
+      const entries = nativeRunEventsToTranscript([
+        event(1, "runtime_request.created", { request: permissionRequest() }),
+        event(2, "runtime_request.resolved", {
+          request: {
+            requestId: "perm-1",
+            status: "resolved",
+            action: "permission_decision",
+            response: {
+              schema: "paperclip.permission_decision.v1",
+              decision: "reject",
+              contractSha256: SHA,
+            },
+          },
+        }),
+      ]) as NativeRuntimeRequestEntry[];
+      expect(entries[1]).toMatchObject({
+        status: "resolved",
+        permissionDecision: "reject",
+        permissionContract: expect.objectContaining({ contractSha256: SHA }),
+      });
+    });
+
+    it("accepts a tool-less contract with null arguments and unresolved targets", () => {
+      const contract = normalizePermissionContract(
+        permissionRequest({}, { tool: null, arguments: null, targets: [{ pattern: "*", resolvedPath: null }] }),
+      );
+      expect(contract).toMatchObject({
+        tool: null,
+        argumentsJson: null,
+        targets: [{ pattern: "*", resolvedPath: null }],
+      });
+    });
+
+    it.each([
+      ["missing contract", { permission: undefined }, {}],
+      ["wrong contract schema", {}, { schema: "other" }],
+      ["bad sha", {}, { contractSha256: "nothex" }],
+      ["missing permission name", {}, { permission: 42 }],
+      ["non-string patterns", {}, { patterns: [1] }],
+      ["malformed tool", {}, { tool: { messageId: "m" } }],
+      ["malformed targets", {}, { targets: "x" }],
+      ["array arguments", {}, { arguments: [1, 2] }],
+      ["no supported decisions", { decisions: ["always"] }, {}],
+    ])("fails closed without crashing on %s", (_label, overrides, contract) => {
+      const request = permissionRequest(overrides, contract);
+      if ("permission" in overrides && overrides.permission === undefined) {
+        delete (request as Record<string, unknown>).permission;
+      }
+      let entries: NativeRuntimeRequestEntry[] = [];
+      expect(() => {
+        entries = nativeRunEventsToTranscript([
+          event(1, "runtime_request.created", { request }),
+        ]) as NativeRuntimeRequestEntry[];
+      }).not.toThrow();
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({
+        kind: "runtime_request",
+        requestType: "permission",
+        permissionContract: null,
+        permissionContractInvalid: true,
+        choices: [],
+      });
+    });
+
+    it("leaves legacy permission requests untouched", () => {
+      const [entry] = nativeRunEventsToTranscript([
+        event(1, "runtime_request.created", {
+          request: {
+            schema: "paperclip.runtime_request.v1",
+            requestId: "legacy-1",
+            requestKind: "command_approval",
+            type: "permission",
+            status: "pending",
+            prompt: "Allow?",
+            choices: [{ key: "accept", label: "Allow once" }],
+          },
+        }),
+      ]) as NativeRuntimeRequestEntry[];
+      expect(entry.choices).toEqual([{ key: "accept", label: "Allow once" }]);
+      expect("permissionContract" in entry).toBe(false);
+      expect("permissionContractInvalid" in entry).toBe(false);
+    });
   });
 
   it("projects structured questions through resolution without losing identity", () => {

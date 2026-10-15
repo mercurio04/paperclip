@@ -681,6 +681,148 @@ function RuntimeQuestionReceipt({
   );
 }
 
+function PermissionContractField({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <dt className="text-xs font-medium text-muted-foreground">{label}</dt>
+      <dd className="min-w-0 break-words text-sm text-foreground">
+        {children}
+      </dd>
+    </div>
+  );
+}
+
+function RuntimePermissionContract({
+  item,
+}: {
+  item: TaskChatRuntimeRequestItem;
+}) {
+  const contract = item.permissionContract;
+  if (!contract) {
+    return (
+      <p
+        className="text-xs text-destructive"
+        role="alert"
+        data-testid="task-chat-runtime-permission-invalid"
+      >
+        This permission contract arrived incomplete or malformed; it cannot be
+        decided from Paperclip.
+      </p>
+    );
+  }
+  const decisionLabel =
+    item.permissionDecision === "once"
+      ? "Allowed once"
+      : item.permissionDecision === "reject"
+        ? "Rejected"
+        : null;
+  return (
+    <dl
+      className="flex flex-col gap-2"
+      data-testid="task-chat-runtime-permission-contract"
+      data-contract-sha256={contract.contractSha256}
+    >
+      <PermissionContractField label="Permission">
+        <code className="font-mono">{contract.permission}</code>
+      </PermissionContractField>
+      <PermissionContractField label="Tool">
+        {contract.tool ? (
+          <code className="font-mono text-xs">
+            {contract.tool.messageId} / {contract.tool.callId}
+          </code>
+        ) : (
+          <span className="text-muted-foreground">No associated tool</span>
+        )}
+      </PermissionContractField>
+      <PermissionContractField label="Patterns">
+        {contract.patterns.length > 0 ? (
+          <ul className="flex flex-col gap-0.5">
+            {contract.patterns.map((pattern, index) => (
+              <li key={`${index}:${pattern}`}>
+                <code className="font-mono text-xs">{pattern}</code>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <span className="text-muted-foreground">None</span>
+        )}
+      </PermissionContractField>
+      <PermissionContractField label="Directory">
+        {contract.cwd ? (
+          <code className="font-mono text-xs">{contract.cwd}</code>
+        ) : (
+          <span className="text-muted-foreground">Not reported</span>
+        )}
+      </PermissionContractField>
+      <PermissionContractField label="Targets">
+        {contract.targets.length > 0 ? (
+          <ul className="flex flex-col gap-0.5">
+            {contract.targets.map((target, index) => (
+              <li key={`${index}:${target.pattern}`}>
+                <code className="font-mono text-xs">{target.pattern}</code>
+                {" → "}
+                {target.resolvedPath ? (
+                  <code className="font-mono text-xs">
+                    {target.resolvedPath}
+                  </code>
+                ) : (
+                  <span className="text-xs text-muted-foreground">
+                    sin resolver
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <span className="text-muted-foreground">None</span>
+        )}
+      </PermissionContractField>
+      <PermissionContractField label="Arguments">
+        {contract.argumentsJson !== null ? (
+          <pre
+            className="max-h-64 overflow-auto whitespace-pre rounded-sm bg-muted/35 p-2 font-mono text-xs"
+            data-testid="task-chat-runtime-permission-arguments"
+          >
+            {contract.argumentsJson}
+          </pre>
+        ) : (
+          <span className="text-muted-foreground">No arguments</span>
+        )}
+      </PermissionContractField>
+      {contract.metadataJson !== null ? (
+        <details>
+          <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
+            Provider metadata
+          </summary>
+          <pre className="mt-1 max-h-64 overflow-auto whitespace-pre rounded-sm bg-muted/35 p-2 font-mono text-xs">
+            {contract.metadataJson}
+          </pre>
+        </details>
+      ) : null}
+      <PermissionContractField label="Contract">
+        <code
+          className="font-mono text-xs"
+          title={contract.contractSha256}
+          data-testid="task-chat-runtime-permission-sha"
+        >
+          sha256:{contract.contractShaPrefix}
+        </code>
+      </PermissionContractField>
+      {decisionLabel ? (
+        <PermissionContractField label="Decision">
+          {decisionLabel}
+        </PermissionContractField>
+      ) : null}
+    </dl>
+  );
+}
+
 function RuntimeRequestCard({
   item,
   onDecision,
@@ -776,7 +918,48 @@ function RuntimeRequestCard({
       testId="task-chat-runtime-request"
       presentation={presentation}
     >
-      {item.requestType === "input" &&
+      {item.permissionContract || item.permissionContractInvalid ? (
+        <div className="flex flex-col gap-3">
+          <RuntimePermissionContract item={item} />
+          {item.status === "pending" && item.permissionContract ? (
+            <div className="flex flex-wrap gap-2">
+              {item.permissionContract.decisions.includes("once") ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={!onDecision || submitting}
+                  onClick={() =>
+                    void submit({
+                      action: "permission_decision",
+                      decision: "once",
+                      contractSha256: item.permissionContract!.contractSha256,
+                    })
+                  }
+                >
+                  Allow once
+                </Button>
+              ) : null}
+              {item.permissionContract.decisions.includes("reject") ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={!onDecision || submitting}
+                  onClick={() =>
+                    void submit({
+                      action: "permission_decision",
+                      decision: "reject",
+                      contractSha256: item.permissionContract!.contractSha256,
+                    })
+                  }
+                >
+                  Reject
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      ) : item.requestType === "input" &&
       item.status === "pending" &&
       item.questionSet ? (
         <QuestionForm

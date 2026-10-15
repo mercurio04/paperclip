@@ -1,12 +1,11 @@
 import type { IncomingMessage, Server } from "node:http";
 import type { Duplex } from "node:stream";
 
-import type {
-  DurablePrpControlPlane,
-  HarnessRuntimeRequestResolution,
-} from "../vendor/paperclip-runner/index.js";
+import type { DurablePrpControlPlane } from "../vendor/paperclip-runner/index.js";
 import {
   assertNativeRuntimeRequestResolverAuthorized,
+  NATIVE_PERMISSION_DECISION_SCHEMA,
+  type NativeRuntimeResolutionPayload,
   type NativeRuntimeRequestResolver,
   type PendingNativeRuntimeRequest,
 } from "../services/native-runtime/runtime-request-resolution-authority.js";
@@ -237,6 +236,50 @@ export class RunnerPrpRuntimeRequestResolutionError extends Error {
 }
 
 /**
+ * Build the PRP `request.resolve` payload. A typed OpenCode permission
+ * (TAX-452 contract §2) carries only the frozen decision; it is never mixed
+ * with the generic resolution envelope, and generic resolutions never answer
+ * a permission request.
+ */
+export function runnerPrpRequestResolvePayload(
+  pending: PendingNativeRuntimeRequest,
+  resolution: NativeRuntimeResolutionPayload,
+  actor: NativeRuntimeRequestResolver,
+): Record<string, unknown> {
+  if (pending.permission) {
+    if (
+      resolution.action !== "permission_decision"
+      || resolution.contractSha256 !== pending.permission.contractSha256
+    ) {
+      throw new RunnerPrpRuntimeRequestResolutionError(
+        "runtime_request_resolution_conflict",
+      );
+    }
+    return {
+      requestId: pending.requestId,
+      turnId: pending.turnId,
+      response: {
+        schema: NATIVE_PERMISSION_DECISION_SCHEMA,
+        decision: resolution.decision,
+        contractSha256: resolution.contractSha256,
+      },
+    };
+  }
+  if (resolution.action === "permission_decision") {
+    throw new RunnerPrpRuntimeRequestResolutionError(
+      "runtime_request_resolution_conflict",
+    );
+  }
+  return {
+    requestId: pending.requestId,
+    requestKind: pending.requestKind,
+    turnId: pending.turnId,
+    resolution,
+    resolutionActor: actor,
+  };
+}
+
+/**
  * Queue one turn-bound runtime response on the active durable PRP authority.
  * Identical browser retries reuse the original command; a different answer for
  * the same request fails closed instead of answering the provider twice.
@@ -246,7 +289,7 @@ export function queueRunnerPrpRuntimeRequestResolution(input: {
   readonly runId: string;
   readonly pendingRequest: PendingNativeRuntimeRequest;
   readonly actor: NativeRuntimeRequestResolver;
-  readonly resolution: HarnessRuntimeRequestResolution;
+  readonly resolution: NativeRuntimeResolutionPayload;
 }): { readonly commandId: string } {
   const registration = registrations.get(input.runId);
   if (
@@ -292,13 +335,7 @@ export function queueRunnerPrpRuntimeRequestResolution(input: {
 
   const command = registration.authority.queueCommand(
     "request.resolve",
-    {
-      requestId: pending.requestId,
-      requestKind: pending.requestKind,
-      turnId: pending.turnId,
-      resolution: input.resolution,
-      resolutionActor: input.actor,
-    },
+    runnerPrpRequestResolvePayload(pending, input.resolution, input.actor),
     undefined,
     true,
   );

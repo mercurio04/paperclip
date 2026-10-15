@@ -234,6 +234,7 @@ import {
   assertAgentCoreProfileRecoveryBinding,
   assertManagedProfileRecoveryBinding,
   resolvePaperclipRunnerNativeProviderInput,
+  resolvePaperclipRunnerOpenCodeRuntimeOptions,
 } from "./native-runtime/provider-profile.js";
 import {
   buildNativeHeartbeatPreparationSpans,
@@ -548,7 +549,11 @@ import {
   redactCurrentUserValue,
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
-import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import {
+  preserveNativePermissionContract,
+  redactEventPayload,
+  redactSensitiveText,
+} from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
@@ -13623,12 +13628,18 @@ export function heartbeatService(
     const secretSanitizedPayload = boundedPayload
       ? redactEventPayload(boundedPayload)
       : boundedPayload;
-    const sanitizedPayload = secretSanitizedPayload
-      ? redactCurrentUserValue(
-          secretSanitizedPayload,
-          currentUserRedactionOptions,
-        )
-      : secretSanitizedPayload;
+    // The frozen TAX-452 permission contract must survive bounding and
+    // current-user masking byte-for-byte: the approver sees it and the
+    // resolution authority recomputes its contractSha256 from storage.
+    const sanitizedPayload = preserveNativePermissionContract(
+      event.payload,
+      secretSanitizedPayload
+        ? redactCurrentUserValue(
+            secretSanitizedPayload,
+            currentUserRedactionOptions,
+          )
+        : secretSanitizedPayload,
+    );
     const issueId = readRuntimeStatusIssueIdCandidate(run) ?? null;
     const progress = buildRunEventRuntimeProgress({
       eventType: event.eventType,
@@ -23766,6 +23777,12 @@ export function heartbeatService(
                       backend:
                         options.nativeSessionBackendFactory?.(nativeExecution),
                       useRunnerd: agent.adapterType === "paperclip_runner",
+                      ...(agent.adapterType === "paperclip_runner"
+                        && nativeExecution.provider.kind === "opencode"
+                        ? resolvePaperclipRunnerOpenCodeRuntimeOptions(
+                            agent.adapterConfig,
+                          )
+                        : {}),
                       adapterType: agent.adapterType,
                       sessionGoalControl,
                       resumeSessionGoalHeartbeat:

@@ -128,6 +128,7 @@ import {
 } from "../adapters/index.js";
 import {
   REDACTED_EVENT_VALUE,
+  preserveNativePermissionContract,
   redactAgentAdapterConfig,
   redactEventPayload,
 } from "../redaction.js";
@@ -145,9 +146,38 @@ import {
 import {
   assertNativeRuntimeRequestResolverAuthorized,
   NativeRuntimeRequestResolutionAuthorizationError,
+  parseNativePermissionDecisionResolution,
   readPendingNativeRuntimeRequest,
   type NativeRuntimeRequestResolver,
+  type PendingNativeRuntimeRequest,
 } from "../services/native-runtime/runtime-request-resolution-authority.js";
+import {
+  claimNativePermissionDecision,
+  settleNativePermissionDecision,
+} from "../services/native-runtime/native-permission-decisions.js";
+
+/** A permission dispatch failure that provably happened before any mutation. */
+class NativePermissionNotDispatchedError extends Error {
+  constructor(readonly code: "runtime_request_stale") {
+    super(code);
+    this.name = "NativePermissionNotDispatchedError";
+  }
+}
+
+const NATIVE_PERMISSION_DISPATCH_TIMEOUT_MS = 30_000;
+
+/** Bound an in-process dispatch; a timeout is an uncertain outcome, never retried. */
+function withPermissionDispatchTimeout<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error("permission_dispatch_timeout")),
+      NATIVE_PERMISSION_DISPATCH_TIMEOUT_MS,
+    );
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 import {
   NativeRuntimeRequestResolutionError,
   resolveNativeRuntimeRequest,
@@ -6761,6 +6791,174 @@ export function agentRoutes(
     res.json(run);
   });
 
+  /**
+   * Typed OpenCode permission decision (TAX-452). The decision is claimed
+   * durably and atomically before dispatch; a claimed request is never
+   * dispatched twice, even when the first dispatch outcome is unknown.
+   */
+  async function resolveNativePermissionRequest(input: {
+    req: Request;
+    res: Response;
+    run: { id: string; companyId: string; agentId: string };
+    requestId: string;
+    pendingRequest: PendingNativeRuntimeRequest & {
+      permission: NonNullable<PendingNativeRuntimeRequest["permission"]>;
+    };
+    resolutionActor: NativeRuntimeRequestResolver;
+  }): Promise<void> {
+    const { req, res, run, requestId, pendingRequest, resolutionActor } = input;
+    if (req.actor.type !== "board" || !resolutionActor.userId.trim()) {
+      throw forbidden("A board user must decide runtime permissions.");
+    }
+    const resolution = parseNativePermissionDecisionResolution(req.body?.resolution);
+    if (!resolution) {
+      throw badRequest(
+        "Permission requests accept only {action:\"permission_decision\", decision:\"once\"|\"reject\", contractSha256}.",
+      );
+    }
+    if (resolution.contractSha256 !== pendingRequest.permission.contractSha256) {
+      throw conflict(
+        "The permission contract changed; reload the request before deciding.",
+      );
+    }
+    const samePending = (candidate: PendingNativeRuntimeRequest | null) =>
+      candidate !== null
+      && candidate.requestKind === pendingRequest.requestKind
+      && candidate.turnId === pendingRequest.turnId
+      && candidate.permission?.contractSha256 ===
+        pendingRequest.permission.contractSha256;
+    const currentPendingRequest = await readPendingNativeRuntimeRequest(db, {
+      companyId: run.companyId,
+      runId: run.id,
+      requestId,
+    });
+    if (!samePending(currentPendingRequest)) {
+      throw conflict("This runtime request is stale or is no longer pending.");
+    }
+    const claim = await claimNativePermissionDecision(db, {
+      companyId: run.companyId,
+      agentId: run.agentId,
+      runId: run.id,
+      requestId,
+      turnId: pendingRequest.turnId,
+      contractSha256: resolution.contractSha256,
+      decision: resolution.decision,
+      resolverUserId: resolutionActor.userId,
+    });
+    if (!claim) {
+      throw conflict("This permission request was already decided.");
+    }
+
+    // From here on the claim is final. `notDispatched` is set only for
+    // failures that provably happened before any provider/runner mutation.
+    let queued: { commandId: string } | null = null;
+    let failure: { status: "stale" | "dispatch_uncertain"; error: string } | null = null;
+    const authorizeBeforeDispatch = async () => {
+      const dispatchPending = await readPendingNativeRuntimeRequest(db, {
+        companyId: run.companyId,
+        runId: run.id,
+        requestId,
+      });
+      if (!samePending(dispatchPending)) {
+        throw new NativePermissionNotDispatchedError(
+          "runtime_request_stale",
+        );
+      }
+      assertNativeRuntimeRequestResolverAuthorized(
+        dispatchPending!,
+        resolutionActor,
+      );
+    };
+    const queueOnPrp = () => queueRunnerPrpRuntimeRequestResolution({
+      companyId: run.companyId,
+      runId: run.id,
+      pendingRequest: currentPendingRequest!,
+      actor: resolutionActor,
+      resolution,
+    });
+    try {
+      try {
+        queued = await withPermissionDispatchTimeout(resolveNativeRuntimeRequest({
+          runId: run.id,
+          requestId,
+          turnId: pendingRequest.turnId,
+          resolution,
+          authorizeBeforeDispatch,
+        }));
+      } catch (error) {
+        if (
+          error instanceof NativeRuntimeRequestResolutionError
+          && ["native_session_not_active", "runtime_request_resolution_unsupported"]
+            .includes(error.code)
+        ) {
+          await authorizeBeforeDispatch();
+          queued = queueOnPrp();
+        } else {
+          throw error;
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const provablyNotDispatched =
+        error instanceof NativePermissionNotDispatchedError
+        || error instanceof NativeRuntimeRequestResolutionAuthorizationError
+        || (
+          error instanceof NativeRuntimeRequestResolutionError
+          && error.code === "runtime_request_stale_turn"
+        )
+        || (
+          error instanceof RunnerPrpRuntimeRequestResolutionError
+          && error.code === "runner_prp_authority_not_active"
+        );
+      failure = {
+        status: provablyNotDispatched ? "stale" : "dispatch_uncertain",
+        error: message,
+      };
+    }
+    await settleNativePermissionDecision(db, {
+      id: claim.id,
+      status: failure ? failure.status : "delivered",
+      error: failure?.error ?? null,
+    });
+    await logActivity(db, {
+      companyId: run.companyId,
+      actorType: "user",
+      actorId: resolutionActor.userId,
+      action: "heartbeat.runtime_permission_decided",
+      entityType: "heartbeat_run",
+      entityId: run.id,
+      details: {
+        agentId: run.agentId,
+        runId: run.id,
+        requestId,
+        turnId: pendingRequest.turnId,
+        contractSha256: resolution.contractSha256,
+        decision: resolution.decision,
+        resolverUserId: resolutionActor.userId,
+        resolverPolicy: pendingRequest.resolverPolicy,
+        status: failure ? failure.status : "delivered",
+        ...(failure ? { error: failure.error.slice(0, 500) } : {}),
+      },
+    });
+    if (failure?.status === "stale") {
+      throw conflict(
+        "This runtime request is no longer pending; the decision was not delivered and will not be retried.",
+      );
+    }
+    if (failure) {
+      throw new HttpError(
+        502,
+        "The permission decision may or may not have reached the runner. It will not be retried; the runner fails closed if it did not arrive.",
+      );
+    }
+    res.status(202).json({
+      accepted: true,
+      commandId: queued!.commandId,
+      decision: resolution.decision,
+      status: "delivered",
+    });
+  }
+
   router.post(
     "/heartbeat-runs/:runId/runtime-requests/:requestId/resolve",
     async (req, res) => {
@@ -6812,6 +7010,20 @@ export function agentRoutes(
           );
         }
         throw error;
+      }
+      if (pendingRequest.permission) {
+        await resolveNativePermissionRequest({
+          req,
+          res,
+          run: existing,
+          requestId,
+          pendingRequest: {
+            ...pendingRequest,
+            permission: pendingRequest.permission,
+          },
+          resolutionActor,
+        });
+        return;
       }
       // Kind and turn are read only from the server-persisted PRP event. Body
       // values are deliberately ignored so a caller cannot downgrade an
@@ -7198,12 +7410,17 @@ export function agentRoutes(
     const limit = Number(req.query.limit ?? 200);
     const events = await heartbeat.listEvents(runId, Number.isFinite(afterSeq) ? afterSeq : 0, Number.isFinite(limit) ? limit : 200);
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-    const redactedEvents = events.map((event) =>
-      redactCurrentUserValue({
+    const redactedEvents = events.map((event) => {
+      const redacted = redactCurrentUserValue({
         ...event,
         payload: redactEventPayload(event.payload),
-      }, currentUserRedactionOptions),
-    );
+      }, currentUserRedactionOptions);
+      // Serve the frozen TAX-452 permission contract exactly as stored.
+      return {
+        ...redacted,
+        payload: preserveNativePermissionContract(event.payload, redacted.payload) ?? null,
+      };
+    });
     res.json(await runRedactions.redactForRun(run.companyId, run.id, redactedEvents));
   });
 

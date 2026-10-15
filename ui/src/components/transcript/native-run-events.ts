@@ -138,14 +138,155 @@ function verificationStatus(value: unknown): "passed" | "failed" | "not_run" {
   return value === "passed" || value === "failed" ? value : "not_run";
 }
 
+export const RUNTIME_PERMISSION_REQUEST_SCHEMA = "paperclip.runtime_request.permission.v1";
+export const OPENCODE_PERMISSION_CONTRACT_SCHEMA = "paperclip.opencode_permission_contract.v1";
+export const PERMISSION_CONTRACT_SHA_PREFIX_LENGTH = 12;
+
+export type NativePermissionDecision = "once" | "reject";
+
+/** Read-only, frozen view of a typed OpenCode permission contract (TAX-452). */
+export interface NativePermissionContract {
+  schema: typeof OPENCODE_PERMISSION_CONTRACT_SCHEMA;
+  provider: string;
+  providerVersion: string | null;
+  providerSessionId: string | null;
+  providerRequestId: string | null;
+  permission: string;
+  tool: { messageId: string; callId: string } | null;
+  patterns: string[];
+  always: string[];
+  cwd: string | null;
+  targets: Array<{ pattern: string; resolvedPath: string | null }>;
+  /** Pretty-printed JSON of the tool arguments, or null when the contract has no tool. */
+  argumentsJson: string | null;
+  /** Pretty-printed JSON of the provider metadata, or null when empty/absent. */
+  metadataJson: string | null;
+  policy: { profile: string; permissionDefault: string } | null;
+  contractSha256: string;
+  contractShaPrefix: string;
+  /** Only `once` and `reject` are ever offered; `always`/session grants are dropped. */
+  decisions: NativePermissionDecision[];
+}
+
+export type NativeRuntimeRequestEntry = Extract<TranscriptEntry, { kind: "runtime_request" }> & {
+  /** Present for `paperclip.runtime_request.permission.v1` requests whose contract is well formed. */
+  permissionContract?: NativePermissionContract | null;
+  /** True when the request claims the permission.v1 schema but its contract is malformed. */
+  permissionContractInvalid?: boolean;
+  /** Decision recorded by the server once a permission request is resolved. */
+  permissionDecision?: NativePermissionDecision | null;
+};
+
+function permissionDecisionFrom(value: unknown): NativePermissionDecision | null {
+  const response = record(value);
+  if (!response || response.schema !== "paperclip.permission_decision.v1") return null;
+  return response.decision === "once" || response.decision === "reject" ? response.decision : null;
+}
+
+function stringList(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  return value.every((entry) => typeof entry === "string") ? [...value] as string[] : null;
+}
+
+function prettyJson(value: unknown): string | null {
+  try {
+    return JSON.stringify(value, null, 2) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Normalize a `paperclip.runtime_request.permission.v1` request into the typed
+ * contract the UI renders. Returns null for any malformed contract so callers
+ * can fail closed (show the request read-only, offer no decision).
+ */
+export function normalizePermissionContract(
+  request: Record<string, unknown>,
+): NativePermissionContract | null {
+  if (request.schema !== RUNTIME_PERMISSION_REQUEST_SCHEMA) return null;
+  if (request.type !== undefined && request.type !== "permission") return null;
+  const contract = record(request.permission);
+  if (!contract || contract.schema !== OPENCODE_PERMISSION_CONTRACT_SCHEMA) return null;
+  const sha = text(contract.contractSha256);
+  if (!sha || !/^[0-9a-f]{64}$/i.test(sha)) return null;
+  const permission = text(contract.permission);
+  const provider = text(contract.provider);
+  if (!permission || !provider) return null;
+  const patterns = stringList(contract.patterns ?? []);
+  const always = stringList(contract.always ?? []);
+  if (!patterns || !always) return null;
+
+  let tool: NativePermissionContract["tool"] = null;
+  if (contract.tool !== null && contract.tool !== undefined) {
+    const rawTool = record(contract.tool);
+    const messageId = text(rawTool?.messageId);
+    const callId = text(rawTool?.callId);
+    if (!messageId || !callId) return null;
+    tool = { messageId, callId };
+  }
+
+  if (contract.targets !== undefined && !Array.isArray(contract.targets)) return null;
+  const targets: NativePermissionContract["targets"] = [];
+  for (const rawTarget of (contract.targets as unknown[] | undefined) ?? []) {
+    const target = record(rawTarget);
+    const pattern = typeof target?.pattern === "string" ? target.pattern : null;
+    if (!target || pattern === null) return null;
+    const resolvedPath = target.resolvedPath;
+    if (resolvedPath !== null && resolvedPath !== undefined && typeof resolvedPath !== "string") {
+      return null;
+    }
+    targets.push({ pattern, resolvedPath: typeof resolvedPath === "string" ? resolvedPath : null });
+  }
+
+  const rawArguments = contract.arguments;
+  if (rawArguments !== null && rawArguments !== undefined && !record(rawArguments)) return null;
+  const metadata = record(contract.metadata);
+  const rawPolicy = record(contract.policy);
+  const policyProfile = text(rawPolicy?.profile);
+  const permissionDefault = text(rawPolicy?.permissionDefault);
+
+  const rawDecisions = Array.isArray(request.decisions) ? request.decisions : [];
+  const decisions = (["once", "reject"] as const).filter((decision) =>
+    rawDecisions.includes(decision),
+  );
+  if (decisions.length === 0) return null;
+
+  return {
+    schema: OPENCODE_PERMISSION_CONTRACT_SCHEMA,
+    provider,
+    providerVersion: text(contract.providerVersion),
+    providerSessionId: text(contract.providerSessionId),
+    providerRequestId: text(contract.providerRequestId),
+    permission,
+    tool,
+    patterns,
+    always,
+    cwd: text(contract.cwd),
+    targets,
+    argumentsJson: record(rawArguments) ? prettyJson(rawArguments) : null,
+    metadataJson: metadata && Object.keys(metadata).length > 0 ? prettyJson(metadata) : null,
+    policy: policyProfile && permissionDefault
+      ? { profile: policyProfile, permissionDefault }
+      : null,
+    contractSha256: sha.toLowerCase(),
+    contractShaPrefix: sha.toLowerCase().slice(0, PERMISSION_CONTRACT_SHA_PREFIX_LENGTH),
+    decisions: [...decisions],
+  };
+}
+
 function runtimeRequestEntry(input: {
   eventType: string;
   envelope: Record<string, unknown>;
   payload: Record<string, unknown>;
   ts: string;
-  previous?: Extract<TranscriptEntry, { kind: "runtime_request" }>;
-}): Extract<TranscriptEntry, { kind: "runtime_request" }> | null {
+  previous?: NativeRuntimeRequestEntry;
+}): NativeRuntimeRequestEntry | null {
   const request = record(input.payload.request) ?? input.payload;
+  const isPermissionContractRequest = request.schema === RUNTIME_PERMISSION_REQUEST_SCHEMA;
+  const permissionContract = isPermissionContractRequest
+    ? normalizePermissionContract(request)
+    : null;
   const requestId = text(request.requestId) ?? text(input.payload.requestId);
   if (!requestId) return null;
   const suffix = input.eventType.split(".").at(-1);
@@ -223,7 +364,36 @@ function runtimeRequestEntry(input: {
     response: canonicalQuestionResponse(request.response ?? input.payload.response)
       ?? input.previous?.response
       ?? null,
+    ...permissionContractFields({
+      isPermissionContractRequest,
+      carriesContract: request.permission !== undefined,
+      permissionContract,
+      previous: input.previous,
+    }),
+    ...(() => {
+      const permissionDecision = permissionDecisionFrom(request.response ?? input.payload.response)
+        ?? input.previous?.permissionDecision
+        ?? null;
+      return permissionDecision ? { permissionDecision } : {};
+    })(),
   };
+}
+
+function permissionContractFields(input: {
+  isPermissionContractRequest: boolean;
+  carriesContract: boolean;
+  permissionContract: NativePermissionContract | null;
+  previous: NativeRuntimeRequestEntry | undefined;
+}): Pick<NativeRuntimeRequestEntry, "permissionContract" | "permissionContractInvalid"> {
+  const { isPermissionContractRequest, carriesContract, permissionContract, previous } = input;
+  if (permissionContract) return { permissionContract };
+  // Lifecycle updates (resolved/expired/cancelled) carry only the request id; keep the frozen contract.
+  if (!carriesContract && previous?.permissionContract) {
+    return { permissionContract: previous.permissionContract };
+  }
+  if (isPermissionContractRequest) return { permissionContract: null, permissionContractInvalid: true };
+  if (previous?.permissionContractInvalid) return { permissionContract: null, permissionContractInvalid: true };
+  return {};
 }
 
 function runResultEntry(
@@ -610,10 +780,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
   const hasAcceptedResult = orderedEvents.some(
     (event) => event.eventType === "run.result.accepted",
   );
-  const runtimeRequests = new Map<
-    string,
-    Extract<TranscriptEntry, { kind: "runtime_request" }>
-  >();
+  const runtimeRequests = new Map<string, NativeRuntimeRequestEntry>();
   let hasRunResult = false;
   let responseWakeCandidate: {
     entry: Extract<TranscriptEntry, { kind: "run_result" }>;

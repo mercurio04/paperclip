@@ -4,6 +4,7 @@ import {
   assertAgentCoreProfileRecoveryBinding,
   assertManagedProfileRecoveryBinding,
   resolvePaperclipRunnerNativeProviderInput,
+  resolvePaperclipRunnerOpenCodeRuntimeOptions,
 } from "./native-runtime/provider-profile.js";
 
 describe("Paperclip Runner native provider configuration", () => {
@@ -27,6 +28,34 @@ describe("Paperclip Runner native provider configuration", () => {
         },
       }),
     ).toThrow("codexPermissionMode set to never");
+  });
+
+  it("keeps OpenCode defaults unless the restricted_v1 profile is opted in", () => {
+    expect(resolvePaperclipRunnerOpenCodeRuntimeOptions({ provider: "opencode" })).toEqual({});
+    expect(resolvePaperclipRunnerOpenCodeRuntimeOptions({
+      provider: "opencode",
+      opencodePermissionProfile: "restricted_v1",
+      llamaCppBaseUrl: "http://127.0.0.1:8080",
+    })).toEqual({
+      opencodePermissionProfile: "restricted_v1",
+      llamaCppBaseUrl: "http://127.0.0.1:8080",
+    });
+    expect(() => resolvePaperclipRunnerOpenCodeRuntimeOptions({
+      opencodePermissionProfile: "always",
+    })).toThrow("restricted_v1");
+    expect(() => resolvePaperclipRunnerOpenCodeRuntimeOptions({
+      llamaCppBaseUrl: "file:///etc/passwd",
+    })).toThrow("llamaCppBaseUrl");
+    const restricted = resolvePaperclipRunnerNativeProviderInput({
+      backend: "opencode_server",
+      adapterConfig: {
+        provider: "opencode",
+        model: "llama/qwen",
+        opencodePermissionMode: "allow",
+        opencodePermissionProfile: "restricted_v1",
+      },
+    });
+    expect(restricted).toMatchObject({ provider: "opencode", opencodePermissionMode: "ask" });
   });
 
   it("requires persisted Claude recovery to use the qualified identity and current profile secret", () => {

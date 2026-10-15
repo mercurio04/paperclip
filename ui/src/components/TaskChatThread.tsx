@@ -112,6 +112,10 @@ import {
 } from "@/lib/issue-artifacts";
 import { heartbeatsApi, type RuntimeRequestResolution } from "@/api/heartbeats";
 import { issuesApi } from "@/api/issues";
+import {
+  permissionDecisionError,
+  permissionDecisionResolution,
+} from "./task-chat/runtime-permission-decision";
 import { queryKeys } from "@/lib/queryKeys";
 import { useQueryClient } from "@tanstack/react-query";
 import { TaskChatPresentationProvider } from "@/components/task-chat/presentation-mode";
@@ -2271,7 +2275,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         );
       }
       let resolution: RuntimeRequestResolution;
-      if (decision.action !== "submit") {
+      if (item.permissionContract || item.permissionContractInvalid) {
+        resolution = permissionDecisionResolution(item, decision);
+      } else if (decision.action === "permission_decision") {
+        throw new Error(
+          "This runtime request does not carry a typed permission contract.",
+        );
+      } else if (decision.action !== "submit") {
         resolution = decision;
       } else if ("response" in decision) {
         resolution = { action: "submit", response: decision.response };
@@ -2292,13 +2302,20 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           "This runtime permission does not accept submitted form data.",
         );
       }
-      await heartbeatsApi.resolveRuntimeRequest({
-        runId: item.runId,
-        requestId: item.requestId,
-        turnId: item.turnId,
-        requestKind: item.requestKind,
-        resolution,
-      });
+      try {
+        await heartbeatsApi.resolveRuntimeRequest({
+          runId: item.runId,
+          requestId: item.requestId,
+          turnId: item.turnId,
+          requestKind: item.requestKind,
+          resolution,
+        });
+      } catch (cause) {
+        if (resolution.action === "permission_decision") {
+          throw permissionDecisionError(cause);
+        }
+        throw cause;
+      }
     },
     [],
   );
