@@ -977,7 +977,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       settleRunDisposition: paperclipBridge?.settleRunDisposition,
       terminalResultCleanup: {
         graceMs: terminalResultCleanupGraceMs,
-        hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
+        hasTerminalResult: ({ stdout }) => stdout.split(/\r?\n/).some((line) => {
+          const event = parseJson(line);
+          // A resumed session can report an old background task before the prompt turn starts.
+          // Only a prompt-turn result may arm cleanup, even if a notification follows it.
+          return event?.type === "result" && parseObject(event.origin).kind !== "task-notification";
+        }),
       },
       localProcessSandbox,
     });
