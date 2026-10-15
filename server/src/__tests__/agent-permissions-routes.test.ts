@@ -2078,4 +2078,121 @@ describe.sequential("agent permission routes", () => {
     expect(res.body.error).toBe("Heartbeat run not found");
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
   });
+  describe("inert manual-only agents (TAX-452)", () => {
+    const boardActor = {
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    };
+    const inertPermissions = {
+      canCreateAgents: false,
+      canCreateSkills: false,
+      authorizationPolicy: {
+        protectedAgent: { blockAssignment: true, blockReason: "Inert manual-only agent: work cannot be assigned to it." },
+      },
+      invocationPolicy: { mode: "manual_only" },
+    };
+
+    it("creates an inert agent paused, locked and without default grants", async () => {
+      const app = await createApp(boardActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/companies/${companyId}/agents`)
+        .send({
+          name: "bombero",
+          role: "general",
+          adapterType: "process",
+          adapterConfig: {},
+          runtimeConfig: { heartbeat: { enabled: true, intervalSec: 60, wakeOnDemand: true } },
+          permissions: { canCreateAgents: true },
+          inert: true,
+        }));
+
+      expect([200, 201]).toContain(res.status);
+      expect(mockAgentService.create).toHaveBeenCalledTimes(1);
+      const [, created] = mockAgentService.create.mock.calls[0]!;
+      expect(created).toMatchObject({
+        status: "paused",
+        pauseReason: "manual",
+        permissions: inertPermissions,
+        runtimeConfig: {
+          heartbeat: {
+            enabled: false,
+            wakeOnDemand: false,
+            wakeOnAssignment: false,
+            wakeOnOnDemand: false,
+            wakeOnAutomation: false,
+          },
+        },
+      });
+      expect(created.pausedAt).toBeInstanceOf(Date);
+      expect(created).not.toHaveProperty("inert");
+      expect(mockAccessService.ensureMembership).not.toHaveBeenCalled();
+      expect(mockAccessService.setPrincipalPermission).not.toHaveBeenCalled();
+      expect(mockBuiltInAgentService.ensureCompanyDefaultAgentGrants).not.toHaveBeenCalled();
+    }, 15_000);
+
+    it("keeps the default create path unchanged without the opt-in (regression)", async () => {
+      const app = await createApp(boardActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/companies/${companyId}/agents`)
+        .send({ name: "Builder", role: "engineer", adapterType: "process", adapterConfig: {} }));
+      expect([200, 201]).toContain(res.status);
+      const [, created] = mockAgentService.create.mock.calls[0]!;
+      expect(created.status).toBe("idle");
+      expect(created.permissions).toBeUndefined();
+      expect(mockAccessService.setPrincipalPermission).toHaveBeenCalledWith(
+        companyId, "agent", agentId, "tasks:assign", true, "board-user",
+      );
+    }, 15_000);
+
+    it("rejects inert creation from an agent actor and for the CEO role", async () => {
+      const agentApp = await createApp({ type: "agent", agentId, companyId, source: "agent_key", runId: null });
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, role: "ceo", permissions: { canCreateAgents: true } });
+      const fromAgent = await requestApp(agentApp, (baseUrl) => request(baseUrl)
+        .post(`/api/companies/${companyId}/agents`)
+        .send({ name: "bombero", adapterType: "process", adapterConfig: {}, inert: true }));
+      expect(fromAgent.status).toBe(403);
+
+      const boardApp = await createApp(boardActor);
+      const asCeo = await requestApp(boardApp, (baseUrl) => request(baseUrl)
+        .post(`/api/companies/${companyId}/agents`)
+        .send({ name: "bombero", role: "ceo", adapterType: "process", adapterConfig: {}, inert: true }));
+      expect(asCeo.status).toBe(422);
+      expect(mockAgentService.create).not.toHaveBeenCalled();
+    }, 15_000);
+
+    it("does not let a CEO agent rewrite a manual-only agent's permissions", async () => {
+      const ceoId = "33333333-3333-4333-8333-333333333333";
+      mockAgentService.getById.mockImplementation(async (id: string) => id === ceoId
+        ? { ...baseAgent, id: ceoId, role: "ceo" }
+        : { ...baseAgent, permissions: inertPermissions });
+      const app = await createApp({ type: "agent", agentId: ceoId, companyId, source: "agent_key", runId: null });
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}/permissions`)
+        .send({ canCreateAgents: false, canAssignTasks: true, authorizationPolicy: {} }));
+      expect(res.status).toBe(403);
+      expect(mockAgentService.updatePermissions).not.toHaveBeenCalled();
+    });
+
+    it("keeps the assignment lock and manual-only gate on a board permissions rewrite", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, permissions: inertPermissions });
+      mockAgentService.updatePermissions.mockResolvedValue({ ...baseAgent, permissions: inertPermissions });
+      const app = await createApp(boardActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}/permissions`)
+        .send({ canCreateAgents: false, canAssignTasks: false, authorizationPolicy: {} }));
+      expect(res.status).toBe(200);
+      expect(mockAgentService.updatePermissions).toHaveBeenCalledWith(
+        agentId,
+        expect.objectContaining({
+          invocationPolicy: { mode: "manual_only" },
+          authorizationPolicy: expect.objectContaining({
+            protectedAgent: expect.objectContaining({ blockAssignment: true }),
+          }),
+        }),
+      );
+    });
+  });
 });
