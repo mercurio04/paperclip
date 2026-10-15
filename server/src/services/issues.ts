@@ -1779,7 +1779,7 @@ export interface IssueFilters {
 // Probe claims, digests and pending events belong to the scheduler, not the API.
 type IssueRow = Omit<typeof issues.$inferSelect, "monitorProbeState">;
 
-function toPublicIssue<T extends IssueRow>(row: T): Omit<T, "monitorProbeState"> {
+export function toPublicIssue<T extends IssueRow>(row: T): Omit<T, "monitorProbeState"> {
   const { monitorProbeState: _probeState, ...publicIssue } = row as T & {
     monitorProbeState?: unknown;
   };

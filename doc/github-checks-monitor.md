@@ -40,6 +40,9 @@ an agent decision. No checks is a missing-check event.
 
 A waiting poll saves its digest in server-owned `issues.monitor_probe_state`.
 Issue detail, list, mutation and conversation responses omit `monitorProbeState`.
+This includes recovery resolutions (also replays) and issues embedded in pipeline
+case details, conversation sources and issue links. Type annotations alone do not
+remove the private field; those raw-row responses apply the public projection.
 Diagnostics and portable exports use public field projections. The existing
 monitor schedule fields and structured `githubChecks` wake payload remain public.
 The scheduler reads the private column directly; API reads do not clear it.

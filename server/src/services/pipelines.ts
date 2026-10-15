@@ -50,7 +50,7 @@ import { logActivity } from "./activity-log.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService } from "./authorization.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import type { IssuePostCommitAction } from "./issues.js";
+import { toPublicIssue, type IssuePostCommitAction } from "./issues.js";
 import {
   formatPipelineCaseOutputContextMarkdown,
   pipelineCaseOutputsService,
@@ -190,7 +190,7 @@ type PipelineAutomationExecutionContext = {
 };
 
 export interface ResolvedPipelineCaseConversationSource {
-  issue: typeof issues.$inferSelect;
+  issue: Omit<typeof issues.$inferSelect, "monitorProbeState">;
   kind: PipelineCaseConversationSourceKind;
   isActive: boolean;
   reason: PipelineCaseConversationSourceReason;
@@ -366,7 +366,7 @@ async function getUsableConversationIssue(db: PipelineDb, companyId: string, iss
       ne(issues.status, "cancelled"),
     ))
     .limit(1)
-    .then((rows) => rows[0] ?? null);
+    .then((rows) => rows[0] ? toPublicIssue(rows[0]) : null);
 }
 
 async function resolveIssueFromRun(
@@ -420,7 +420,7 @@ async function resolveLatestCaseIssueLink(
   if (!row) return null;
   const role = row.link.role as PipelineCaseConversationSourceLinkRole;
   return {
-    issue: row.issue,
+    issue: toPublicIssue(row.issue),
     kind: role === "conversation" ? "explicit_conversation" : "own_producer",
     isActive: true,
     reason: input.reasonByRole[role],

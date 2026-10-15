@@ -275,6 +275,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
   readAcceptedPlanConfirmationTarget,
+  toPublicIssue,
   type IssuePostCommitAction,
 } from "../services/issues.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
@@ -9475,7 +9476,7 @@ export function issueRoutes(
       });
       if (result.replayed) {
         res.json({
-          issue: result.issue,
+          issue: toPublicIssue(result.issue),
           recoveryAction: result.recoveryAction,
         });
         return;
@@ -9583,7 +9584,7 @@ export function issueRoutes(
 
       res.json({
         issue: {
-          ...result.issue,
+          ...toPublicIssue(result.issue),
           activeRecoveryAction: null,
         },
         recoveryAction: result.recoveryAction,
