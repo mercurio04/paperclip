@@ -89,6 +89,8 @@ import {
   unwrapRunnerdProviderNotification,
   unwrapRunnerdProviderNotifications,
   withCodexCollaborationRuntimeInstructions,
+  bridgedPermissionRequestParams,
+  permissionDecisionResolveResponse,
 } from "./runnerd-codex-transport.js";
 
 // Explicit private-artifact test lane; production/default dist is never changed.
@@ -3211,6 +3213,43 @@ it("preserves OpenCode runtime bindings when a durable runner is respawned", () 
   expect(defaultPermissionEnvironment.PAPERCLIP_OPENCODE_PERMISSION_MODE).toBe(
     "ask",
   );
+  // Absent profile keeps the legacy bridge: no typed-permission env at all.
+  expect(
+    defaultPermissionEnvironment.PAPERCLIP_OPENCODE_PERMISSION_PROFILE,
+  ).toBeUndefined();
+  expect(
+    defaultPermissionEnvironment.PAPERCLIP_OPENCODE_LLAMACPP_BASE_URL,
+  ).toBeUndefined();
+});
+
+it("maps the typed OpenCode permission profile and llama.cpp URL into the proxy environment", () => {
+  const environment = createCapabilityRunnerdProviderEnvironment({
+    provider: "opencode",
+    options: {
+      provider: "opencode",
+      stateDirectory: "/isolated/session",
+      opencodePermissionMode: "ask",
+      opencodePermissionProfile: "restricted_v1",
+      llamaCppBaseUrl: " http://127.0.0.1:8080/v1 ",
+      environment: { PATH: "/bin" },
+    },
+    identity: {
+      runnerInstanceId: "runner-1",
+      environmentLeaseId: "lease-1",
+      runId: "run-1",
+      normalizedSessionId: "session-1",
+      turnId: "turn-1",
+      itemId: "item-1",
+    },
+    codexHome: "/isolated/codex-home",
+    runtimeContextPath: "/isolated/runtime-context.json",
+    hasRuntimeContext: false,
+  });
+  expect(environment).toMatchObject({
+    PAPERCLIP_OPENCODE_PERMISSION_MODE: "ask",
+    PAPERCLIP_OPENCODE_PERMISSION_PROFILE: "restricted_v1",
+    PAPERCLIP_OPENCODE_LLAMACPP_BASE_URL: "http://127.0.0.1:8080/v1",
+  });
 });
 
 it("passes the configured Codex API key only through the provider process environment", () => {
@@ -8869,4 +8908,88 @@ it.each(["claude", "codex"] as const)("keeps the explicitly assigned gateway in 
   expect(environment).toMatchObject(gateway);
   expect(environment.PAPERCLIP_API_KEY).toBeUndefined();
   expect(environment.DATABASE_URL).toBeUndefined();
+});
+
+function typedPermissionRequest(): Record<string, unknown> {
+  const unsigned = {
+    schema: "paperclip.opencode_permission_contract.v1",
+    provider: "opencode",
+    providerVersion: "1.18.29",
+    providerSessionId: "ses_1",
+    providerRequestId: "per_1",
+    permission: "edit",
+    tool: { messageId: "msg_1", callId: "call_1" },
+    patterns: ["notes.txt"],
+    always: ["*"],
+    metadata: { filepath: "notes.txt" },
+    arguments: { filePath: "notes.txt", content: "x" },
+    cwd: "/work",
+    targets: [{ pattern: "notes.txt", resolvedPath: "/work/notes.txt" }],
+    policy: { profile: "restricted_v1", permissionDefault: "ask" },
+  };
+  const canonical = (value: unknown): string =>
+    Array.isArray(value)
+      ? `[${value.map(canonical).join(",")}]`
+      : typeof value === "object" && value !== null
+        ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(",")}}`
+        : JSON.stringify(value);
+  return {
+    schema: "paperclip.runtime_request.permission.v1",
+    requestKind: "runtime",
+    requestId: "runnerd-scoped-request-1",
+    type: "permission",
+    status: "pending",
+    prompt: "OpenCode requests edit permission: notes.txt.",
+    turnId: "turn-1",
+    itemId: "per_1",
+    origin: { adapter: "opencode-server", provider: "opencode", method: "permission.asked" },
+    decisions: ["once", "reject"],
+    permission: {
+      ...unsigned,
+      contractSha256: createHash("sha256").update(canonical(unsigned)).digest("hex"),
+    },
+  };
+}
+
+it("bridges a typed runnerd permission request into a permission server request", () => {
+  const request = typedPermissionRequest();
+  const params = bridgedPermissionRequestParams(request, "thread-1", "provider-turn-1");
+  expect(params).toEqual({
+    threadId: "thread-1",
+    turnId: "provider-turn-1",
+    itemId: "per_1",
+    prompt: request.prompt,
+    origin: request.origin,
+    decisions: ["once", "reject"],
+    permission: request.permission,
+  });
+});
+
+it.each([
+  ["an unknown request key", (request: Record<string, any>) => { request.actions = ["accept"]; }],
+  ["an unknown contract key", (request: Record<string, any>) => { request.permission.extra = true; }],
+  ["an always decision", (request: Record<string, any>) => { request.decisions = ["once", "always", "reject"]; }],
+  ["a tampered contract", (request: Record<string, any>) => { request.permission.patterns = ["../etc/passwd"]; }],
+  ["a legacy schema", (request: Record<string, any>) => { request.schema = "paperclip.runtime_request.v2"; }],
+])("rejects a typed permission request with %s", (_name, mutate) => {
+  const request = typedPermissionRequest();
+  mutate(request as Record<string, any>);
+  expect(bridgedPermissionRequestParams(request, "thread-1", "turn-1")).toBeNull();
+});
+
+it("maps permission resolutions onto the PRP permission decision response", () => {
+  const sha = "a".repeat(64);
+  expect(
+    permissionDecisionResolveResponse(
+      { action: "permission_decision", decision: "once", contractSha256: sha },
+      "b".repeat(64),
+    ),
+  ).toEqual({ schema: "paperclip.permission_decision.v1", decision: "once", contractSha256: sha });
+  expect(permissionDecisionResolveResponse({ action: "cancel" }, sha)).toEqual({
+    schema: "paperclip.permission_decision.v1",
+    decision: "reject",
+    contractSha256: sha,
+  });
+  expect(() => permissionDecisionResolveResponse({ action: "accept_for_session" }, sha)).toThrow();
+  expect(() => permissionDecisionResolveResponse({ action: "accept" }, sha)).toThrow();
 });

@@ -9,6 +9,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
@@ -1822,3 +1823,546 @@ describe("OpenCodeServerDriver", () => {
     expect(error).not.toContain("super-secret-opencode-token");
   });
 });
+
+describe("OpenCodeServerDriver restricted_v1 typed permissions", () => {
+  const sessionId = "ses_restricted";
+  const permissionId = "per_restricted_1";
+  const model = "llamacpp/qwen3-coder";
+  const baseUrl = "http://127.0.0.1:8080/v1";
+
+  function canonical(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+    if (typeof value === "object" && value !== null)
+      return `{${Object.keys(value)
+        .sort()
+        .map(
+          (key) =>
+            `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`,
+        )
+        .join(",")}}`;
+    return JSON.stringify(value);
+  }
+
+  async function harness(
+    options: {
+      metadata?: Record<string, unknown>;
+      withToolPart?: boolean;
+      failReply?: boolean;
+    } = {},
+  ) {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-typed-"));
+    const workspace = await mkdtemp(
+      join(tmpdir(), "paperclip-opencode-typed-workspace-"),
+    );
+    roots.push(root, workspace);
+    await writeFile(join(workspace, "notes.txt"), "hello\n");
+    const encoder = new TextEncoder();
+    const queued: Uint8Array[] = [];
+    let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+    const emitNative = (event: Record<string, unknown>) => {
+      const frame = encoder.encode(`data: ${JSON.stringify(event)}\n\n`);
+      if (controller) controller.enqueue(frame);
+      else queued.push(frame);
+    };
+    const asked = {
+      id: permissionId,
+      sessionID: sessionId,
+      permission: "edit",
+      patterns: ["notes.txt", "missing/file.txt"],
+      metadata: options.metadata ?? { filepath: "notes.txt", diff: "+x" },
+      always: ["*"],
+      tool: { messageID: "msg_1", callID: "call_1" },
+    };
+    const state = {
+      toolInput: { filePath: "notes.txt", content: "x" } as Record<
+        string,
+        unknown
+      >,
+      live: [structuredClone(asked)] as Array<Record<string, unknown>>,
+      replies: [] as Array<{ id: string; body: unknown }>,
+      aborts: 0,
+      messageFetches: 0,
+    };
+    const fetcher: typeof globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input));
+      const method = String(init?.method ?? "GET").toUpperCase();
+      const json = (value: unknown, status = 200) =>
+        new Response(JSON.stringify(value), {
+          status,
+          headers: { "Content-Type": "application/json" },
+        });
+      if (url.pathname === "/global/health")
+        return json({ healthy: true, version: "1.18.29" });
+      if (url.pathname === "/event")
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(streamController) {
+              controller = streamController;
+              for (const frame of queued.splice(0))
+                streamController.enqueue(frame);
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } },
+        );
+      if (method === "POST" && url.pathname === "/session")
+        return json({ id: sessionId });
+      if (method === "GET" && url.pathname === "/question") return json([]);
+      if (method === "GET" && url.pathname === "/permission")
+        return json(state.live);
+      if (
+        method === "GET" &&
+        url.pathname === `/session/${sessionId}/message/msg_1`
+      ) {
+        state.messageFetches += 1;
+        return json({
+          info: { id: "msg_1", role: "assistant" },
+          parts:
+            options.withToolPart === false
+              ? []
+              : [
+                  {
+                    id: "prt_1",
+                    type: "tool",
+                    callID: "call_1",
+                    tool: "edit",
+                    state: { status: "running", input: state.toolInput },
+                  },
+                ],
+        });
+      }
+      if (method === "POST" && url.pathname === `/session/${sessionId}/prompt_async`) {
+        emitNative({ type: "permission.asked", id: "evt_asked", properties: asked });
+        return new Response(null, { status: 204 });
+      }
+      if (method === "POST" && /^\/permission\/[^/]+\/reply$/.test(url.pathname)) {
+        state.replies.push({
+          id: url.pathname.split("/")[2]!,
+          body: JSON.parse(String(init?.body)),
+        });
+        if (options.failReply) return json({ error: "boom" }, 500);
+        return json(true);
+      }
+      if (method === "POST" && url.pathname === `/session/${sessionId}/abort`) {
+        state.aborts += 1;
+        return json(true);
+      }
+      throw new Error(`unexpected OpenCode request ${method} ${url}`);
+    };
+    const driver = new OpenCodeServerDriver({
+      model,
+      permissionProfile: "restricted_v1",
+      llamaCppBaseUrl: baseUrl,
+      runtimeDirectory: root,
+      command: fixture,
+      fetch: fetcher,
+      environment: {
+        PATH: process.env.PATH,
+        LANG: "C.UTF-8",
+        OPENROUTER_API_KEY: "must-not-leak",
+        HTTPS_PROXY: "http://proxy.invalid:3128",
+        SSL_CERT_FILE: "/tmp/should-not-pass.pem",
+      },
+    });
+    const normalizedSessionId = "typed";
+    const session = await driver.openSession({
+      runId: "run-typed",
+      normalizedSessionId,
+      workingDirectory: workspace,
+    });
+    const events: Array<{ eventType: string; payload: Record<string, unknown> }> =
+      [];
+    const iterator = session.events()[Symbol.asyncIterator]();
+    const next = async (eventType: string, limit = 60) => {
+      for (let count = 0; count < limit; count += 1) {
+        const result = await iterator.next();
+        if (result.done) return null;
+        events.push(result.value as never);
+        if (result.value.eventType === eventType) return result.value;
+      }
+      return null;
+    };
+    return {
+      root,
+      workspace,
+      session,
+      state,
+      asked,
+      emitNative,
+      events,
+      next,
+      configPath: join(root, normalizedSessionId, "config", "opencode", "opencode.json"),
+      environmentPath: join(root, normalizedSessionId, "data", "fake-environment.json"),
+    };
+  }
+
+  it("freezes a typed, hash-bound request with fetched arguments and replies once when live state matches", async () => {
+    const h = await harness();
+    const { turnId } = await h.session.startTurn({
+      message: { role: "user", text: "edit" },
+    });
+    const created = await h.next("runtime_request.created");
+    const request = (created?.payload as Record<string, any>).request;
+    expect(Object.keys(request).sort()).toEqual(
+      [
+        "decisions",
+        "itemId",
+        "origin",
+        "permission",
+        "prompt",
+        "requestId",
+        "requestKind",
+        "schema",
+        "status",
+        "turnId",
+        "type",
+      ].sort(),
+    );
+    expect(request).toMatchObject({
+      schema: "paperclip.runtime_request.permission.v1",
+      requestKind: "runtime",
+      requestId: permissionId,
+      type: "permission",
+      decisions: ["once", "reject"],
+      origin: {
+        adapter: "opencode-server",
+        provider: "opencode",
+        method: "permission.asked",
+      },
+    });
+    const contract = request.permission;
+    const workspaceReal = await realpathOf(h.workspace);
+    expect(contract).toMatchObject({
+      schema: "paperclip.opencode_permission_contract.v1",
+      provider: "opencode",
+      providerVersion: "1.18.29",
+      providerSessionId: sessionId,
+      providerRequestId: permissionId,
+      permission: "edit",
+      tool: { messageId: "msg_1", callId: "call_1" },
+      arguments: { filePath: "notes.txt", content: "x" },
+      metadata: h.asked.metadata,
+      always: ["*"],
+      cwd: workspaceReal,
+      targets: [
+        { pattern: "notes.txt", resolvedPath: join(workspaceReal, "notes.txt") },
+        { pattern: "missing/file.txt", resolvedPath: null },
+      ],
+      policy: { profile: "restricted_v1", permissionDefault: "ask" },
+    });
+    const { contractSha256, ...unsigned } = contract;
+    expect(contractSha256).toBe(
+      createHash("sha256").update(canonical(unsigned)).digest("hex"),
+    );
+    expect(h.session.pendingRuntimeRequests?.()[0]).toMatchObject({
+      requestKind: "permission_approval",
+      decisions: ["once", "reject"],
+      permission: { contractSha256 },
+    });
+    await h.session.resolveRuntimeRequest?.({
+      requestId: permissionId,
+      turnId,
+      resolution: {
+        action: "permission_decision",
+        decision: "once",
+        contractSha256,
+      },
+    });
+    expect(h.state.replies).toEqual([
+      { id: permissionId, body: { reply: "once" } },
+    ]);
+    expect(h.session.pendingRuntimeRequests?.()).toEqual([]);
+    await h.session.close({ reason: "typed test complete" });
+  });
+
+  it("replies reject when tool arguments drift before a once decision", async () => {
+    const h = await harness();
+    const { turnId } = await h.session.startTurn({
+      message: { role: "user", text: "edit" },
+    });
+    const created = await h.next("runtime_request.created");
+    const sha = (created?.payload as Record<string, any>).request.permission
+      .contractSha256;
+    h.state.toolInput = { filePath: "notes.txt", content: "rm -rf" };
+    await h.session.resolveRuntimeRequest?.({
+      requestId: permissionId,
+      turnId,
+      resolution: { action: "permission_decision", decision: "once", contractSha256: sha },
+    });
+    expect(h.state.replies).toEqual([
+      { id: permissionId, body: { reply: "reject" } },
+    ]);
+    await h.next("runtime_request.resolved");
+    expect(h.events).toContainEqual(
+      expect.objectContaining({
+        eventType: "harness.diagnostic",
+        payload: expect.objectContaining({ code: "permission_contract_drift" }),
+      }),
+    );
+    await h.session.close({ reason: "drift test complete" });
+  });
+
+  it("replies reject when the native request disappeared or changed patterns", async () => {
+    const h = await harness();
+    const { turnId } = await h.session.startTurn({
+      message: { role: "user", text: "edit" },
+    });
+    const created = await h.next("runtime_request.created");
+    const sha = (created?.payload as Record<string, any>).request.permission
+      .contractSha256;
+    h.state.live = [{ ...h.asked, patterns: ["other.txt"] }];
+    await h.session.resolveRuntimeRequest?.({
+      requestId: permissionId,
+      turnId,
+      resolution: { action: "permission_decision", decision: "once", contractSha256: sha },
+    });
+    expect(h.state.replies).toEqual([
+      { id: permissionId, body: { reply: "reject" } },
+    ]);
+    await h.session.close({ reason: "pattern drift test complete" });
+  });
+
+  it("replies reject on a contract hash mismatch and on cancel, and never sends always", async () => {
+    const h = await harness();
+    const { turnId } = await h.session.startTurn({
+      message: { role: "user", text: "edit" },
+    });
+    await h.next("runtime_request.created");
+    await expect(
+      h.session.resolveRuntimeRequest!({
+        requestId: permissionId,
+        turnId,
+        resolution: { action: "accept_for_session" },
+      }),
+    ).rejects.toThrow(/permission_decision or cancel/);
+    await expect(
+      h.session.resolveRuntimeRequest!({
+        requestId: permissionId,
+        turnId,
+        resolution: { action: "accept" },
+      }),
+    ).rejects.toThrow();
+    expect(h.state.replies).toEqual([]);
+    await h.session.resolveRuntimeRequest?.({
+      requestId: permissionId,
+      turnId,
+      resolution: {
+        action: "permission_decision",
+        decision: "once",
+        contractSha256: "0".repeat(64),
+      },
+    });
+    expect(h.state.replies).toEqual([
+      { id: permissionId, body: { reply: "reject" } },
+    ]);
+    expect(h.events.concat(await drainUntil(h, "runtime_request.resolved"))).toContainEqual(
+      expect.objectContaining({
+        payload: expect.objectContaining({ code: "permission_contract_mismatch" }),
+      }),
+    );
+    await h.session.close({ reason: "mismatch test complete" });
+
+    const c = await harness();
+    const cancelTurn = await c.session.startTurn({
+      message: { role: "user", text: "edit" },
+    });
+    await c.next("runtime_request.created");
+    await c.session.resolveRuntimeRequest?.({
+      requestId: permissionId,
+      turnId: cancelTurn.turnId,
+      resolution: { action: "cancel" },
+    });
+    expect(c.state.replies).toEqual([
+      { id: permissionId, body: { reply: "reject" } },
+    ]);
+    expect(
+      [...h.state.replies, ...c.state.replies].some(
+        (reply) => (reply.body as { reply: string }).reply === "always",
+      ),
+    ).toBe(false);
+    await c.session.close({ reason: "cancel test complete" });
+  });
+
+  async function drainUntil(
+    h: Awaited<ReturnType<typeof harness>>,
+    eventType: string,
+  ) {
+    await h.next(eventType);
+    return h.events;
+  }
+
+  it.each([
+    { name: "missing tool part", options: { withToolPart: false } },
+    {
+      name: "oversize contract",
+      options: { metadata: { diff: "x".repeat(70 * 1024) } },
+    },
+  ])("rejects natively without a request for a $name", async ({ options }) => {
+    const h = await harness(options);
+    await h.session.startTurn({ message: { role: "user", text: "edit" } });
+    const diagnostic = await h.next("harness.diagnostic");
+    expect(diagnostic?.payload).toMatchObject({
+      code: "permission_contract_unrepresentable",
+      providerRequestId: permissionId,
+    });
+    for (let attempt = 0; attempt < 50 && h.state.replies.length === 0; attempt += 1)
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+    expect(h.state.replies).toEqual([
+      { id: permissionId, body: { reply: "reject" } },
+    ]);
+    expect(
+      h.events.some((event) => event.eventType === "runtime_request.created"),
+    ).toBe(false);
+    expect(h.session.pendingRuntimeRequests?.()).toEqual([]);
+    await h.session.close({ reason: "unrepresentable test complete" });
+  });
+
+  it("fails the turn closed on an out-of-band grant", async () => {
+    const h = await harness();
+    await h.session.startTurn({ message: { role: "user", text: "edit" } });
+    await h.next("runtime_request.created");
+    h.emitNative({
+      type: "permission.replied",
+      id: "evt_oob",
+      properties: { sessionID: sessionId, requestID: permissionId, reply: "once" },
+    });
+    const failed = await h.next("turn.failed");
+    expect(failed?.payload).toMatchObject({
+      error: { code: "permission_out_of_band_reply" },
+    });
+    expect(h.events).toContainEqual(
+      expect.objectContaining({
+        eventType: "harness.diagnostic",
+        payload: expect.objectContaining({ code: "permission_out_of_band_reply" }),
+      }),
+    );
+    for (let attempt = 0; attempt < 50 && h.state.aborts === 0; attempt += 1)
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+    expect(h.state.aborts).toBe(1);
+    expect(h.state.replies).toEqual([]);
+    await h.session.close({ reason: "oob test complete" });
+  });
+
+  it("does not retry a failed reply and fails the turn as uncertain", async () => {
+    const h = await harness({ failReply: true });
+    const { turnId } = await h.session.startTurn({
+      message: { role: "user", text: "edit" },
+    });
+    const created = await h.next("runtime_request.created");
+    const sha = (created?.payload as Record<string, any>).request.permission
+      .contractSha256;
+    await h.session.resolveRuntimeRequest?.({
+      requestId: permissionId,
+      turnId,
+      resolution: { action: "permission_decision", decision: "reject", contractSha256: sha },
+    });
+    expect(h.state.replies).toHaveLength(1);
+    await h.next("turn.failed");
+    expect(h.events).toContainEqual(
+      expect.objectContaining({
+        payload: expect.objectContaining({ code: "permission_reply_uncertain" }),
+      }),
+    );
+    expect(h.state.replies).toHaveLength(1);
+    await h.session.close({ reason: "uncertain test complete" });
+  });
+
+  it("writes a loopback llama.cpp-only config and an allowlisted environment", async () => {
+    const h = await harness();
+    const config = JSON.parse(await readFile(h.configPath, "utf8"));
+    expect(config).toMatchObject({
+      model,
+      small_model: model,
+      enabled_providers: ["llamacpp"],
+      provider: {
+        llamacpp: {
+          npm: "@ai-sdk/openai-compatible",
+          name: "llama.cpp",
+          options: { baseURL: baseUrl },
+          models: { "qwen3-coder": { name: "qwen3-coder", tool_call: true } },
+        },
+      },
+    });
+    expect(Object.keys(config.provider)).toEqual(["llamacpp"]);
+    expect(config.permission["*"]).toBe("ask");
+    expect(config.permission.external_directory).toBe("deny");
+    expect(config.permission.question).toBe("allow");
+    expect(config.permission["paperclip_*"]).toBe("deny");
+    expect(config.permission["mcp__paperclip__*"]).toBe("deny");
+    expect(config.permission.paperclip_read_document).toBe("allow");
+    expect(config.permission.paperclip_write_document).toBeUndefined();
+    expect(config.permission.paperclip_call_api).toBeUndefined();
+    expect(
+      Object.entries(config.permission).filter(
+        ([key, value]) => value === "allow" && key.endsWith("*"),
+      ),
+    ).toEqual([]);
+    let environment: { keys: string[] } | null = null;
+    for (let attempt = 0; attempt < 200 && environment === null; attempt += 1) {
+      environment = await readFile(h.environmentPath, "utf8")
+        .then((raw) => JSON.parse(raw))
+        .catch(() => null);
+      if (environment === null)
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+    }
+    expect(environment).not.toBeNull();
+    const keys = environment!.keys;
+    for (const forbidden of [
+      "OPENROUTER_API_KEY",
+      "HTTPS_PROXY",
+      "HTTP_PROXY",
+      "SSL_CERT_FILE",
+    ])
+      expect(keys).not.toContain(forbidden);
+    for (const required of [
+      "XDG_STATE_HOME",
+      "XDG_CONFIG_HOME",
+      "XDG_DATA_HOME",
+      "XDG_CACHE_HOME",
+      "HOME",
+      "OPENCODE_DISABLE_MODELS_FETCH",
+      "OPENCODE_DISABLE_AUTOUPDATE",
+      "OPENCODE_DISABLE_SHARE",
+      "OPENCODE_DISABLE_LSP_DOWNLOAD",
+      "OPENCODE_DISABLE_DEFAULT_PLUGINS",
+      "OPENCODE_DISABLE_CLAUDE_CODE",
+      "OPENCODE_DISABLE_EXTERNAL_SKILLS",
+    ])
+      expect(keys).toContain(required);
+    await h.session.close({ reason: "config test complete" });
+  });
+
+  it.each([
+    "http://10.0.0.5:8080/v1",
+    "https://127.0.0.1:8080/v1",
+    "http://localhost.evil.test/v1",
+    "not a url",
+  ])("rejects the non-loopback llama.cpp base URL %s", (llamaCppBaseUrl) => {
+    expect(
+      () =>
+        new OpenCodeServerDriver({
+          model,
+          permissionProfile: "restricted_v1",
+          llamaCppBaseUrl,
+          runtimeDirectory: "/tmp/paperclip-opencode-loopback",
+        }),
+    ).toThrow(/llamaCppBaseUrl/);
+  });
+
+  it("requires a llamacpp model under restricted_v1", () => {
+    expect(
+      () =>
+        new OpenCodeServerDriver({
+          model: "openrouter/deepseek/deepseek-v4-flash-0731",
+          permissionProfile: "restricted_v1",
+          llamaCppBaseUrl: baseUrl,
+          runtimeDirectory: "/tmp/paperclip-opencode-loopback",
+        }),
+    ).toThrow(/llamacpp/);
+  });
+});
+
+async function realpathOf(path: string): Promise<string> {
+  const { realpath } = await import("node:fs/promises");
+  return realpath(path);
+}

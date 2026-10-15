@@ -105,6 +105,38 @@ export type HarnessRuntimeRequestKind =
   | "user_input"
   | "elicitation";
 
+export const PAPERCLIP_RUNTIME_REQUEST_PERMISSION_SCHEMA_V1 =
+  "paperclip.runtime_request.permission.v1" as const;
+export const PAPERCLIP_OPENCODE_PERMISSION_CONTRACT_SCHEMA_V1 =
+  "paperclip.opencode_permission_contract.v1" as const;
+export const PAPERCLIP_PERMISSION_DECISION_SCHEMA_V1 =
+  "paperclip.permission_decision.v1" as const;
+export const PAPERCLIP_PERMISSION_DECISIONS = ["once", "reject"] as const;
+export type PaperclipPermissionDecision =
+  (typeof PAPERCLIP_PERMISSION_DECISIONS)[number];
+
+/**
+ * Frozen OpenCode permission contract (TAX-452 §1). The hash covers the
+ * canonical JSON of every field except `contractSha256` itself.
+ */
+export interface PaperclipOpenCodePermissionContract {
+  schema: typeof PAPERCLIP_OPENCODE_PERMISSION_CONTRACT_SCHEMA_V1;
+  provider: "opencode";
+  providerVersion: string;
+  providerSessionId: string;
+  providerRequestId: string;
+  permission: string;
+  tool: { messageId: string; callId: string } | null;
+  patterns: string[];
+  always: string[];
+  metadata: Record<string, unknown>;
+  arguments: Record<string, unknown> | null;
+  cwd: string;
+  targets: Array<{ pattern: string; resolvedPath: string | null }>;
+  policy: { profile: "restricted_v1"; permissionDefault: "ask" };
+  contractSha256: string;
+}
+
 export interface HarnessRuntimeRequest {
   requestId: string;
   requestKind: HarnessRuntimeRequestKind;
@@ -118,6 +150,10 @@ export interface HarnessRuntimeRequest {
   input?: PaperclipQuestionSet;
   /** Diagnostic origin only; provider response shapes never enter PRP. */
   origin?: PaperclipRuntimeRequestOrigin;
+  /** Typed permission contract; present only for restricted permission requests. */
+  permission?: PaperclipOpenCodePermissionContract;
+  /** Decisions a typed permission request accepts. */
+  decisions?: PaperclipPermissionDecision[];
 }
 
 export type HarnessRuntimeRequestResolution =
@@ -133,6 +169,11 @@ export type HarnessRuntimeRequestResolution =
   | {
       action: "submit";
       response: PaperclipQuestionResponse;
+    }
+  | {
+      action: "permission_decision";
+      decision: PaperclipPermissionDecision;
+      contractSha256: string;
     };
 
 export type HarnessRuntimeRequestAction =
@@ -157,6 +198,7 @@ const RUNTIME_REQUEST_ACTIONS: readonly HarnessRuntimeRequestAction[] = [
   "decline",
   "cancel",
   "submit",
+  "permission_decision",
 ];
 
 export class HarnessRuntimeRequestResolutionError extends Error {
@@ -201,6 +243,7 @@ export function parseHarnessRuntimeRequestResolution(
   requestKind: HarnessRuntimeRequestKind,
   value: unknown,
   questionSet?: PaperclipQuestionSet,
+  permission?: Pick<PaperclipOpenCodePermissionContract, "contractSha256">,
 ): HarnessRuntimeRequestResolution {
   const candidate = plainRecord(value) ?? {};
   const rawAction = candidate.action;
@@ -214,6 +257,13 @@ export function parseHarnessRuntimeRequestResolution(
     );
   }
   const action = rawAction as HarnessRuntimeRequestAction;
+  if (permission !== undefined || action === "permission_decision") {
+    return parsePermissionDecisionResolution(
+      requestKind,
+      candidate,
+      permission,
+    );
+  }
   if (
     action !== "submit" &&
     ("answers" in candidate ||
@@ -318,6 +368,81 @@ export function parseHarnessRuntimeRequestResolution(
   return { action };
 }
 
+const PERMISSION_DECISION_KEYS = new Set([
+  "action",
+  "decision",
+  "contractSha256",
+]);
+
+/**
+ * A typed permission request accepts only `permission_decision` (once or
+ * reject, bound to a contract hash) or `cancel`. Session-wide acceptance and
+ * legacy accept/decline actions are rejected so nothing can widen a grant.
+ * The hash is only checked for shape here; the driver compares it with the
+ * pending contract and replies `reject` on mismatch.
+ */
+function parsePermissionDecisionResolution(
+  requestKind: HarnessRuntimeRequestKind,
+  candidate: Record<string, unknown>,
+  permission:
+    | Pick<PaperclipOpenCodePermissionContract, "contractSha256">
+    | undefined,
+): HarnessRuntimeRequestResolution {
+  if (requestKind !== "permission_approval" || permission === undefined) {
+    throw new HarnessRuntimeRequestResolutionError(
+      requestKind,
+      "permission_decision answers only typed permission requests",
+    );
+  }
+  if (candidate.action === "cancel") {
+    if (Object.keys(candidate).some((key) => key !== "action")) {
+      throw new HarnessRuntimeRequestResolutionError(
+        requestKind,
+        "cancel does not carry a permission decision",
+      );
+    }
+    return { action: "cancel" };
+  }
+  if (candidate.action !== "permission_decision") {
+    throw new HarnessRuntimeRequestResolutionError(
+      requestKind,
+      "typed permission requests accept only permission_decision or cancel",
+    );
+  }
+  if (Object.keys(candidate).some((key) => !PERMISSION_DECISION_KEYS.has(key))) {
+    throw new HarnessRuntimeRequestResolutionError(
+      requestKind,
+      "permission_decision carries unknown keys",
+    );
+  }
+  const decision = candidate.decision;
+  if (
+    !PAPERCLIP_PERMISSION_DECISIONS.includes(
+      decision as PaperclipPermissionDecision,
+    )
+  ) {
+    throw new HarnessRuntimeRequestResolutionError(
+      requestKind,
+      "permission_decision requires decision once or reject",
+    );
+  }
+  const contractSha256 = candidate.contractSha256;
+  if (
+    typeof contractSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(contractSha256)
+  ) {
+    throw new HarnessRuntimeRequestResolutionError(
+      requestKind,
+      "permission_decision requires a lowercase hex sha256 contract hash",
+    );
+  }
+  return {
+    action: "permission_decision",
+    decision: decision as PaperclipPermissionDecision,
+    contractSha256,
+  };
+}
+
 /**
  * The single payload shape every driver emits for a terminal
  * `runtime_request.*` fact. Request identity travels in the payload as well as
@@ -342,7 +467,8 @@ export function harnessRuntimeRequestOutcome(
   request: Pick<
     HarnessRuntimeRequest,
     "requestId" | "requestKind" | "turnId" | "itemId" | "origin" | "input"
-  >,
+  > &
+    Partial<Pick<HarnessRuntimeRequest, "permission">>,
   outcome: {
     action?: HarnessRuntimeRequestAction | null;
     reason?: string | null;
@@ -366,7 +492,14 @@ export function harnessRuntimeRequestOutcome(
             : {}),
           requestType: "input" as const,
         }
-      : {}),
+      : request.permission
+        ? {
+            ...(request.origin?.adapter
+              ? { adapter: request.origin.adapter }
+              : {}),
+            requestType: "permission" as const,
+          }
+        : {}),
   };
 }
 

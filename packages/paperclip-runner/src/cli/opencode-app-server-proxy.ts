@@ -22,7 +22,11 @@ import {
   assertOpenCodeProxyCollaborationMode,
   openCodeProxyCollaborationModes,
 } from "./opencode-proxy-collaboration-mode.js";
-import { parseOpenCodeProxyPermissionMode } from "./opencode-proxy-permission-mode.js";
+import {
+  parseOpenCodeProxyPermissionMode,
+  parseOpenCodeProxyPermissionProfile,
+  settleOpenCodeProxyPermissionRequest,
+} from "./opencode-proxy-permission-mode.js";
 import {
   trustedOpenCodeLaunchBinding,
   withoutAmbientOpenCodeCommand,
@@ -105,11 +109,21 @@ async function open(
         JSON.parse(readFileSync(runtimeContextPath, "utf8")),
       )
     : null;
+  const permissionProfile = parseOpenCodeProxyPermissionProfile(
+    process.env.PAPERCLIP_OPENCODE_PERMISSION_PROFILE,
+  );
   driver = new OpenCodeServerDriver({
     model,
     permissionMode: parseOpenCodeProxyPermissionMode(
       process.env.PAPERCLIP_OPENCODE_PERMISSION_MODE,
     ),
+    ...(permissionProfile
+      ? {
+          permissionProfile,
+          llamaCppBaseUrl:
+            process.env.PAPERCLIP_OPENCODE_LLAMACPP_BASE_URL?.trim() ?? "",
+        }
+      : {}),
     command: launchBinding.command,
     commandFd: launchBinding.commandFd,
     commandLifecycle: launchBinding.commandLifecycle,
@@ -253,6 +267,27 @@ async function pumpEvents(opened: HarnessSession): Promise<void> {
       // Keep consuming OpenCode SSE while the controller waits for the user.
       // If the underlying provider disappears, the stream can then fail the
       // proxy and runnerd will expire the still-pending canonical request.
+      if (request.type === "permission") {
+        const isPending = () =>
+          (opened.pendingRuntimeRequests?.() ?? []).some(
+            (candidate) => candidate.requestId === requestId,
+          );
+        void settleOpenCodeProxyPermissionRequest({
+          ask: () => requestController("paperclip/runtimeRequest", { request }),
+          resolve: (resolution) =>
+            opened.resolveRuntimeRequest!({
+              requestId,
+              turnId,
+              resolution: resolution as HarnessRuntimeRequestResolution,
+            }),
+          isPending,
+          onFallback: (reason) =>
+            process.stderr.write(
+              `[opencode] permission ${requestId} settles as reject: ${reason}\n`,
+            ),
+        }).catch((error) => failProxy(error));
+        continue;
+      }
       void (async () => {
         const controllerResponse = record(
           await requestController("paperclip/runtimeRequest", {

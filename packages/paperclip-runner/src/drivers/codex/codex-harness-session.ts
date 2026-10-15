@@ -426,6 +426,7 @@ export class CodexHarnessSession
       pending.request.requestKind,
       input.resolution,
       pending.request.input,
+      pending.request.permission,
     );
     if (pending.settlingResolution !== undefined) {
       throw new HarnessCapabilityUnavailableError(

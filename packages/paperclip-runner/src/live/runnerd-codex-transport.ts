@@ -45,6 +45,12 @@ import type {
   PersistedHarnessProviderIdentity,
 } from "../contracts/harness-driver.js";
 import {
+  PAPERCLIP_OPENCODE_PERMISSION_CONTRACT_SCHEMA_V1,
+  PAPERCLIP_PERMISSION_DECISION_SCHEMA_V1,
+  PAPERCLIP_RUNTIME_REQUEST_PERMISSION_SCHEMA_V1,
+} from "../contracts/harness-driver.js";
+import { PAPERCLIP_PERMISSION_BRIDGE_METHOD } from "../drivers/codex/codex-question-adapter.js";
+import {
   DurablePrpControlPlane,
   durableRecoveryInternals,
   inspectWarmRunTransition,
@@ -863,6 +869,139 @@ async function awaitAdoptedRunnerAuthentication(input: {
   }
 }
 
+const PERMISSION_REQUEST_KEYS = new Set([
+  "schema",
+  "requestKind",
+  "requestId",
+  "type",
+  "status",
+  "prompt",
+  "turnId",
+  "itemId",
+  "origin",
+  "decisions",
+  "permission",
+]);
+const PERMISSION_CONTRACT_KEYS = new Set([
+  "schema",
+  "provider",
+  "providerVersion",
+  "providerSessionId",
+  "providerRequestId",
+  "permission",
+  "tool",
+  "patterns",
+  "always",
+  "metadata",
+  "arguments",
+  "cwd",
+  "targets",
+  "policy",
+  "contractSha256",
+]);
+
+function canonicalPermissionJson(value: unknown): string {
+  if (Array.isArray(value))
+    return `[${value.map(canonicalPermissionJson).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalPermissionJson(object[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "undefined";
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+/**
+ * Validates a PRP `paperclip.runtime_request.permission.v1` request (TAX-452
+ * §1) and maps it onto the synthetic session server request. Unknown keys,
+ * any decision other than once/reject, an oversize contract, or a contract
+ * whose hash does not match its canonical body are rejected (null).
+ */
+export function bridgedPermissionRequestParams(
+  request: Record<string, unknown>,
+  threadId: string,
+  turnId: string,
+): Record<string, unknown> | null {
+  if (
+    request.schema !== PAPERCLIP_RUNTIME_REQUEST_PERMISSION_SCHEMA_V1 ||
+    request.requestKind !== "runtime" ||
+    request.type !== "permission" ||
+    request.status !== "pending" ||
+    typeof request.requestId !== "string" ||
+    request.requestId.length === 0 ||
+    typeof request.prompt !== "string" ||
+    request.prompt.length > 4_000 ||
+    Object.keys(request).some((key) => !PERMISSION_REQUEST_KEYS.has(key)) ||
+    (request.itemId !== undefined && typeof request.itemId !== "string") ||
+    !Array.isArray(request.decisions) ||
+    canonicalPermissionJson(request.decisions) !== '["once","reject"]' ||
+    ["adapter", "provider", "method"].some(
+      (key) => typeof record(request.origin)[key] !== "string",
+    )
+  )
+    return null;
+  const permission = record(request.permission);
+  if (
+    permission.schema !== PAPERCLIP_OPENCODE_PERMISSION_CONTRACT_SCHEMA_V1 ||
+    Object.keys(permission).length !== PERMISSION_CONTRACT_KEYS.size ||
+    Object.keys(permission).some((key) => !PERMISSION_CONTRACT_KEYS.has(key)) ||
+    typeof permission.contractSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(permission.contractSha256) ||
+    !isStringArray(permission.patterns) ||
+    !isStringArray(permission.always)
+  )
+    return null;
+  const { contractSha256, ...unsigned } = permission;
+  if (
+    createHash("sha256")
+      .update(canonicalPermissionJson(unsigned), "utf8")
+      .digest("hex") !== contractSha256 ||
+    Buffer.byteLength(canonicalPermissionJson(permission), "utf8") > 64 * 1024
+  )
+    return null;
+  return {
+    threadId,
+    turnId,
+    itemId:
+      typeof request.itemId === "string" ? request.itemId : request.requestId,
+    prompt: request.prompt,
+    origin: structuredClone(record(request.origin)),
+    decisions: ["once", "reject"],
+    permission: structuredClone(permission),
+  };
+}
+
+/**
+ * PRP `request.resolve` response for a typed permission (TAX-452 §2). `cancel`
+ * is delivered as an explicit reject bound to the pending contract hash.
+ */
+export function permissionDecisionResolveResponse(
+  resolution: HarnessRuntimeRequestResolution,
+  pendingContractSha256: string,
+): Record<string, unknown> {
+  if (resolution.action === "permission_decision")
+    return {
+      schema: PAPERCLIP_PERMISSION_DECISION_SCHEMA_V1,
+      decision: resolution.decision,
+      contractSha256: resolution.contractSha256,
+    };
+  if (resolution.action === "cancel")
+    return {
+      schema: PAPERCLIP_PERMISSION_DECISION_SCHEMA_V1,
+      decision: "reject",
+      contractSha256: pendingContractSha256,
+    };
+  throw new Error(
+    "runnerd-native permission requests accept only permission_decision or cancel",
+  );
+}
+
 function bridgedCodexQuestionParams(
   request: Record<string, unknown>,
   method: string,
@@ -1070,6 +1209,13 @@ export interface CapabilityRunnerdProcessEvidence {
 export interface CapabilityRunnerdCodexTransportOptions {
   provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
   opencodePermissionMode?: NativeOpenCodePermissionMode;
+  /**
+   * Opt-in TAX-452 typed permission profile. Unset keeps the legacy OpenCode
+   * permission behavior; the proxy fails closed on any other value.
+   */
+  opencodePermissionProfile?: "restricted_v1";
+  /** llama.cpp base URL the restricted OpenCode profile may reach. */
+  llamaCppBaseUrl?: string;
   acpxAgent?: QualifiedAcpxAgent;
   acpxPermissionMode?: NativeAcpxPermissionMode;
   acpxPermissionModePinned?: boolean;
@@ -3086,6 +3232,18 @@ export function createCapabilityRunnerdProviderEnvironment(input: {
       ...createSanitizedOpenCodeRunnerEnvironment(input.options.environment),
       PAPERCLIP_OPENCODE_PERMISSION_MODE:
         input.options.opencodePermissionMode ?? "ask",
+      ...(input.options.opencodePermissionProfile
+        ? {
+            PAPERCLIP_OPENCODE_PERMISSION_PROFILE:
+              input.options.opencodePermissionProfile,
+          }
+        : {}),
+      ...(input.options.llamaCppBaseUrl?.trim()
+        ? {
+            PAPERCLIP_OPENCODE_LLAMACPP_BASE_URL:
+              input.options.llamaCppBaseUrl.trim(),
+          }
+        : {}),
       PAPERCLIP_OPENCODE_RUNTIME_DIR:
         input.options.opencodeRuntimeDirectory ??
         resolve(input.options.stateDirectory ?? tmpdir(), "opencode"),
@@ -3345,7 +3503,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   readonly #traceFrameIndex = new RunnerdTraceFrameIndex();
   #pendingTraceRehydrations: PendingTraceRehydration[] = [];
   #pendingDriverTraceInterpretations: PendingDriverTraceInterpretation[] = [];
-  readonly #bridgedRuntimeInputs = new Map<string, { durableTurnId: string }>();
+  readonly #bridgedRuntimeInputs = new Map<
+    string,
+    { durableTurnId: string; permissionContractSha256?: string }
+  >();
 
   constructor(readonly options: CapabilityRunnerdCodexTransportOptions) {
     if (options.adoptExistingRunner && !options.stateDirectory?.trim()) {
@@ -3873,6 +4034,25 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       throw new Error(
         `PRP runtime request ${input.requestId} is no longer pending`,
       );
+    if (pending.permissionContractSha256 !== undefined) {
+      const response = permissionDecisionResolveResponse(
+        input.resolution,
+        pending.permissionContractSha256,
+      );
+      await this.#command(
+        "request.resolve",
+        {
+          requestId: input.requestId,
+          turnId: pending.durableTurnId,
+          response,
+        },
+        `command_runtime_permission_${createHash("sha256")
+          .update(`${input.requestId}:${pending.durableTurnId}`)
+          .digest("hex")
+          .slice(0, 24)}`,
+      );
+      return;
+    }
     if (!("response" in input.resolution)) {
       throw new Error(
         "runnerd-native runtime requests require a canonical question response",
@@ -5872,6 +6052,45 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           typeof normalizedRequest.requestId === "string"
             ? normalizedRequest.requestId
             : "";
+        const permissionParams =
+          normalizedRequest.type === "permission" &&
+          normalizedRequest.schema ===
+            PAPERCLIP_RUNTIME_REQUEST_PERMISSION_SCHEMA_V1
+            ? bridgedPermissionRequestParams(
+                normalizedRequest,
+                this.#threadId,
+                this.#turnId,
+              )
+            : null;
+        if (
+          requestId &&
+          permissionParams &&
+          !this.#bridgedRuntimeInputs.has(requestId)
+        ) {
+          this.#bridgedRuntimeInputs.set(requestId, {
+            durableTurnId:
+              typeof event.envelope.turnId === "string"
+                ? event.envelope.turnId
+                : this.#durableTurnId,
+            permissionContractSha256: String(
+              record(permissionParams.permission).contractSha256,
+            ),
+          });
+          void this.#handler({
+            id: requestId,
+            method: PAPERCLIP_PERMISSION_BRIDGE_METHOD,
+            params: permissionParams,
+            paperclipTrace: {
+              sourceEventId: event.sourceEventId,
+              sourceEventType: event.eventType,
+            },
+          }).catch((error) => {
+            this.#failTransport(
+              error instanceof Error ? error : new Error(String(error)),
+            );
+          });
+          continue;
+        }
         const origin = record(normalizedRequest.origin);
         const method = typeof origin.method === "string" ? origin.method : "";
         const params = bridgedCodexQuestionParams(
