@@ -657,6 +657,14 @@ export interface IssueExecutionMonitorPolicy {
   notes: string | null;
   scheduledBy: IssueMonitorScheduledBy;
   kind?: IssueExecutionMonitorKind | null;
+  /** GitHub.com repository and exact revision. Required for github_checks. */
+  repo?: string;
+  prNumber?: number;
+  headSha?: string;
+  expectedChecks?: string[];
+  /** Initial polling interval; server clamps it to 5–30 minutes. */
+  intervalMinutes?: number;
+
   serviceName?: string | null;
   externalRef?: string | null;
   timeoutAt?: string | null;
@@ -687,6 +695,14 @@ export interface IssueExecutionMonitorState {
   notes: string | null;
   scheduledBy: IssueMonitorScheduledBy | null;
   kind?: IssueExecutionMonitorKind | null;
+  /** GitHub.com repository and exact revision. Required for github_checks. */
+  repo?: string;
+  prNumber?: number;
+  headSha?: string;
+  expectedChecks?: string[];
+  /** Initial polling interval; server clamps it to 5–30 minutes. */
+  intervalMinutes?: number;
+
   serviceName?: string | null;
   externalRef?: string | null;
   timeoutAt?: string | null;

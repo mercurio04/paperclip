@@ -1,3 +1,5 @@
+import { dispatchGithubChecksMonitor, githubChecksMonitorEnabled, githubMonitorClaimCondition } from "./github-checks-monitor.js";
+import type { GithubProbeEvent } from "./github-checks-probe.js";
 import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
@@ -3604,6 +3606,8 @@ function normalizeMaxConcurrentRuns(value: unknown) {
 }
 
 interface WakeupOptions {
+  /** Server-only claim proof, rechecked under the issue admission lock. */
+  githubMonitorClaim?: Parameters<typeof githubMonitorClaimCondition>[0];
   /** Set only by authenticated board wake routes; never copied from caller payloads. */
   manualUserWake?: boolean;
   /** Internal resume of a queue with persisted board interruption intent. */
@@ -11010,6 +11014,7 @@ export function heartbeatService(
     billingCode: issues.billingCode,
     executionPolicy: issues.executionPolicy,
     executionState: issues.executionState,
+    monitorProbeState: issues.monitorProbeState,
     monitorNextCheckAt: issues.monitorNextCheckAt,
     monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
     monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
@@ -11032,6 +11037,7 @@ export function heartbeatService(
     billingCode: string | null;
     executionPolicy: Record<string, unknown> | null;
     executionState: Record<string, unknown> | null;
+    monitorProbeState?: Record<string, unknown> | null;
     monitorNextCheckAt: Date | null;
     monitorWakeRequestedAt: Date | null;
     monitorLastTriggeredAt: Date | null;
@@ -11341,7 +11347,7 @@ export function heartbeatService(
     runId: string | null;
     activitySource: "manual" | "scheduled";
   }) {
-    await db
+    const [cleared] = await db
       .update(issues)
       .set({
         ...buildIssueMonitorClearedPatch({
@@ -11352,7 +11358,9 @@ export function heartbeatService(
         }),
         updatedAt: input.now,
       })
-      .where(eq(issues.id, input.claimed.id));
+      .where(input.monitor?.kind === "github_checks" && githubChecksMonitorEnabled()
+        ? githubMonitorClaimCondition(input.claimed) : eq(issues.id, input.claimed.id)).returning({ id: issues.id });
+    if (!cleared) return { outcome: "skipped" as const, reason: "claim_changed" };
 
     await logActivity(db, {
       companyId: input.claimed.companyId,
@@ -11395,6 +11403,8 @@ export function heartbeatService(
     claimed: IssueMonitorDispatchRow,
     input: {
       now: Date;
+      githubProbeProcessed?: boolean;
+      githubChecksEvent?: GithubProbeEvent;
       source: "automation" | "on_demand";
       triggerDetail: "manual" | "system";
       wakeReason: string;
@@ -11405,7 +11415,7 @@ export function heartbeatService(
       clearOnClientError: boolean;
       activitySource: "manual" | "scheduled";
     },
-  ) {
+  ): Promise<{ outcome: "triggered" | "skipped" | "rescheduled"; reason?: string }> {
     if (!claimed.assigneeAgentId || !claimed.monitorNextCheckAt) {
       throw conflict("Issue monitor is not ready to dispatch");
     }
@@ -11416,7 +11426,15 @@ export function heartbeatService(
       claimed.executionPolicy ?? null,
     );
     const monitor = policy?.monitor ?? null;
-    const clearReason = issueMonitorLimitClearReason({
+    if (monitor?.kind === "github_checks" && githubChecksMonitorEnabled() && !input.githubProbeProcessed) {
+      return dispatchGithubChecksMonitor({ db, claim: claimed, policy: policy!, now: input.now,
+        dispatch: (current, event, now) => dispatchClaimedIssueMonitor(current, {
+          ...input, now: now ?? input.now, githubProbeProcessed: true, githubChecksEvent: event,
+        }),
+      });
+    }
+    const claimCondition = input.githubProbeProcessed ? githubMonitorClaimCondition(claimed) : eq(issues.id, claimed.id);
+    const clearReason = input.githubChecksEvent ? null : issueMonitorLimitClearReason({
       monitor,
       nextAttemptCount,
       now: input.now,
@@ -11439,7 +11457,7 @@ export function heartbeatService(
     const reviewParticipantAgentId =
       currentParticipant?.type === "agent" ? currentParticipant.agentId : null;
     const isProviderQuotaReviewMonitor =
-      monitor?.serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME &&
+      (monitor?.kind !== "github_checks" || !githubChecksMonitorEnabled()) && monitor?.serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME &&
       Boolean(reviewParticipantAgentId);
     const targetAgentId = isProviderQuotaReviewMonitor
       ? reviewParticipantAgentId
@@ -11479,7 +11497,7 @@ export function heartbeatService(
     }
 
     try {
-      if (monitor?.serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME) {
+      if ((monitor?.kind !== "github_checks" || !githubChecksMonitorEnabled()) && monitor?.serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME) {
         // Normalized monitor projections redact externalRef. Read the claimed
         // persisted policy only on this server-owned quota recovery path.
         const sourceRunId = readNonEmptyString(
@@ -11535,8 +11553,11 @@ export function heartbeatService(
           if (scheduled.outcome === "not_scheduled")
             throw conflict(scheduled.reason);
         }
-      } else
+      } else if (!input.githubProbeProcessed || !(await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.companyId, claimed.companyId),
+          eq(agentWakeupRequests.idempotencyKey, `issue-monitor:${claimed.id}:${scheduledAtIso}`))).limit(1)).length)
         await enqueueWakeup(targetAgentId, {
+          ...(input.githubProbeProcessed ? { githubMonitorClaim: claimed } : {}),
           source: input.source,
           triggerDetail: input.triggerDetail,
           reason: wakeReason,
@@ -11546,6 +11567,7 @@ export function heartbeatService(
             nextCheckAt: scheduledAtIso,
             monitorAttemptCount: nextAttemptCount,
             monitorNotes: claimed.monitorNotes ?? null,
+            ...(input.githubChecksEvent ? { githubChecks: input.githubChecksEvent } : {}),
             ...monitorMetadata,
             ...reviewRecoveryContext,
             source: input.activitySource,
@@ -11561,6 +11583,7 @@ export function heartbeatService(
             nextCheckAt: scheduledAtIso,
             monitorAttemptCount: nextAttemptCount,
             monitorNotes: claimed.monitorNotes ?? null,
+            ...(input.githubChecksEvent ? { githubChecks: input.githubChecksEvent } : {}),
             ...monitorMetadata,
             ...reviewRecoveryContext,
             manualTrigger: input.activitySource === "manual",
@@ -11577,7 +11600,7 @@ export function heartbeatService(
           }),
           updatedAt: new Date(),
         })
-        .where(eq(issues.id, claimed.id));
+        .where(claimCondition);
 
       await logActivity(db, {
         companyId: claimed.companyId,
@@ -11614,7 +11637,7 @@ export function heartbeatService(
               }),
               updatedAt: new Date(),
             })
-            .where(eq(issues.id, claimed.id));
+            .where(claimCondition);
 
           await logActivity(db, {
             companyId: claimed.companyId,
@@ -11644,7 +11667,7 @@ export function heartbeatService(
             monitorWakeRequestedAt: null,
             updatedAt: new Date(),
           })
-          .where(eq(issues.id, claimed.id));
+          .where(claimCondition);
       } else {
         await db
           .update(issues)
@@ -11652,7 +11675,7 @@ export function heartbeatService(
             monitorWakeRequestedAt: null,
             updatedAt: new Date(),
           })
-          .where(eq(issues.id, claimed.id));
+          .where(claimCondition);
       }
 
       throw err;
@@ -26491,6 +26514,18 @@ export function heartbeatService(
               finishedAt: new Date(),
             });
             return { kind: "skipped" as const };
+          }
+
+          if (opts.githubMonitorClaim) {
+            const [liveClaim] = await tx.select({ id: issues.id }).from(issues)
+              .where(githubMonitorClaimCondition(opts.githubMonitorClaim));
+            if (!liveClaim) return { kind: "skipped" as const };
+            // A saved event can be replayed by overlapping dispatches of the
+            // same claim. Serialize receipt dedup with admission, not gh I/O.
+            const [receipt] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+              .where(and(eq(agentWakeupRequests.companyId, issue.companyId),
+                eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey!))).limit(1);
+            if (receipt) return { kind: "skipped" as const };
           }
 
           if (opts.failedRunId) {

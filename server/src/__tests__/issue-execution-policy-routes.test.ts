@@ -654,7 +654,7 @@ describe("issue execution policy routes", () => {
     );
   });
 
-  it("allows an agent-authored in_review transition with a scheduled monitor", async () => {
+  it.each(["external_service", "github_checks"])("allows an agent-authored in_review transition with a scheduled %s monitor", async (kind) => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
@@ -690,6 +690,12 @@ describe("issue execution policy routes", () => {
         status: "in_review",
         executionPolicy: {
           monitor: {
+            kind,
+            ...(kind === "github_checks" ? {
+              repo: "example/project", prNumber: 4, headSha: "a".repeat(40),
+              expectedChecks: ["build"], intervalMinutes: 5,
+              timeoutAt: "2026-12-01T14:00:00.000Z", maxAttempts: 10,
+            } : {}),
             nextCheckAt: "2026-12-01T12:00:00.000Z",
             scheduledBy: "assignee",
             notes: "Wait for external QA report.",

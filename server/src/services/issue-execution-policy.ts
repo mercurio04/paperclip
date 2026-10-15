@@ -92,9 +92,17 @@ export function redactIssueMonitorExternalRef(value: string | null | undefined) 
   return normalizeMonitorText(value) ? REDACTED_ISSUE_MONITOR_EXTERNAL_REF : null;
 }
 
+function githubMonitorMetadata(monitor: IssueExecutionMonitorPolicy | IssueExecutionMonitorState | null | undefined) {
+  return monitor?.kind === "github_checks" ? {
+    repo: monitor.repo, prNumber: monitor.prNumber, headSha: monitor.headSha,
+    expectedChecks: monitor.expectedChecks, intervalMinutes: monitor.intervalMinutes,
+  } : {};
+}
+
 function monitorMetadataFromPolicy(monitor: IssueExecutionMonitorPolicy) {
   return {
     kind: monitor.kind ?? null,
+    ...githubMonitorMetadata(monitor),
     serviceName: normalizeMonitorText(monitor.serviceName),
     externalRef: redactIssueMonitorExternalRef(monitor.externalRef),
     timeoutAt: monitor.timeoutAt ?? null,
@@ -106,6 +114,7 @@ function monitorMetadataFromPolicy(monitor: IssueExecutionMonitorPolicy) {
 function monitorMetadataFromState(state: IssueExecutionMonitorState | null | undefined) {
   return {
     kind: state?.kind ?? null,
+    ...githubMonitorMetadata(state),
     serviceName: normalizeMonitorText(state?.serviceName),
     externalRef: redactIssueMonitorExternalRef(state?.externalRef),
     timeoutAt: state?.timeoutAt ?? null,
@@ -390,6 +399,7 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
       notes: normalizeMonitorNotes(parsed.data.monitor.notes),
       scheduledBy: parsed.data.monitor.scheduledBy,
       kind: parsed.data.monitor.kind ?? null,
+      ...githubMonitorMetadata(parsed.data.monitor),
       serviceName: normalizeMonitorText(parsed.data.monitor.serviceName),
       externalRef: redactIssueMonitorExternalRef(parsed.data.monitor.externalRef),
       timeoutAt: parsed.data.monitor.timeoutAt ?? null,
@@ -1071,6 +1081,8 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
     : null;
 
   let targetMonitorState = currentMonitorState;
+  // Probe history belongs to the server. A new explicit schedule starts fresh.
+  if (input.monitorExplicitlyUpdated) patch.monitorProbeState = null;
 
   if (input.policy?.monitor) {
     if (invalidReason) {
@@ -1157,6 +1169,23 @@ export function buildInitialIssueMonitorFields(input: {
     monitorNotes: input.policy.monitor.notes ?? null,
     monitorScheduledBy: input.policy.monitor.scheduledBy,
     executionState: executionStateWithMonitor(null, monitorState) as Record<string, unknown> | null,
+  };
+}
+
+export function buildIssueMonitorRescheduledPatch(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy;
+  nextCheckAt: Date;
+}) {
+  const monitor = { ...input.policy.monitor!, nextCheckAt: input.nextCheckAt.toISOString() };
+  const existingState = parseIssueExecutionState(input.issue.executionState);
+  const currentMonitorState = derivePersistedMonitorState({ issue: input.issue, state: existingState, policy: input.policy });
+  return {
+    executionPolicy: { ...input.policy, monitor } as Record<string, unknown>,
+    executionState: executionStateWithMonitor(existingState, buildScheduledMonitorState(currentMonitorState, monitor)) as unknown as Record<string, unknown>,
+    monitorAttemptCount: input.issue.monitorAttemptCount ?? 0,
+    monitorNextCheckAt: input.nextCheckAt,
+    monitorWakeRequestedAt: null,
   };
 }
 
