@@ -62,6 +62,18 @@ describe("issue subresource commands", () => {
     ]);
   });
 
+  it.each([
+    { args: [] as string[], reopen: undefined },
+    { args: ["--no-reopen"], reopen: false },
+    { args: ["--reopen"], reopen: true },
+  ])("sends the explicit comment reopen intent: $args", async ({ args, reopen }) => {
+    const fetchMock = vi.fn().mockImplementation(async () => jsonResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    await run(["issue", "comment", ISSUE_ID, "--body", "Acknowledged", ...args]);
+    const payload = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(payload).toEqual({ body: "Acknowledged", ...(reopen === undefined ? {} : { reopen }) });
+  });
+
   it("binds explicit uploaded attachments when adding a comment", async () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
     vi.stubGlobal("fetch", fetchMock);
