@@ -431,6 +431,46 @@ describe("PaperclipRunnerToolAuthority", () => {
     ).resolves.toMatchObject({ approval: { id: approvalId }, tasks: [] });
   });
 
+  it.each([null, {
+    version: 1,
+    target: "private-approval-probe-sentinel",
+    probingClaim: "2026-04-11T12:30:00Z",
+    pendingEvent: { reason: "checks_failed", repo: "example/project", prNumber: 4 },
+  }])("omits private probe state from approval tasks without narrowing their public contract (%j)", async probeState => {
+    const linkedIssueId = randomUUID();
+    const approvalId = randomUUID();
+    const payload = { monitorProbeState: { public: "caller-owned approval metadata" } };
+    await db.insert(issues).values({
+      id: linkedIssueId, companyId, title: `Approval projection ${linkedIssueId}`,
+      description: "Public issue description", status: "todo", priority: "high",
+      monitorNotes: "Public monitor schedule note", monitorProbeState: probeState,
+    });
+    await db.insert(approvals).values({ id: approvalId, companyId, type: "runner_review", status: "pending", payload });
+    await db.insert(issueApprovals).values({ companyId, approvalId, issueId: linkedIssueId, linkedByAgentId: agentId });
+    const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
+    const output = await authority.execute({
+      tool: "get_approval_context", callId: `approval-projection-${approvalId}`, arguments: { approvalId },
+    }) as { approval: { id: string; payload: unknown }; tasks: Record<string, unknown>[] };
+
+    expect(output.approval).toMatchObject({ id: approvalId, payload });
+    expect(output.tasks).toHaveLength(1);
+    expect(output.tasks[0]).toMatchObject({
+      id: linkedIssueId, companyId, title: `Approval projection ${linkedIssueId}`,
+      description: "Public issue description", status: "todo", priority: "high",
+      monitorNotes: "Public monitor schedule note",
+    });
+    expect(output.tasks[0]).not.toHaveProperty("monitorProbeState");
+    expect(JSON.stringify(output)).not.toContain("private-approval-probe-sentinel");
+    // The other task tools retain their existing curated contracts.
+    for (const tool of ["get_task_context", "search_tasks"]) {
+      const context = await authority.execute({ tool, callId: `${tool}-${approvalId}`, arguments: { query: linkedIssueId } });
+      expect(JSON.stringify(context)).not.toContain("monitorProbeState");
+      expect(JSON.stringify(context)).not.toContain("private-approval-probe-sentinel");
+    }
+    const [persisted] = await db.select().from(issues).where(eq(issues.id, linkedIssueId));
+    expect(persisted!.monitorProbeState).toEqual(probeState);
+  });
+
   it("does not advertise delegation tools during pre-acceptance planning", () => {
     const authority = new PaperclipRunnerToolAuthority(db, {
       companyId,
