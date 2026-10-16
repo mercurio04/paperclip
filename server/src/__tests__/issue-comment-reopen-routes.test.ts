@@ -504,6 +504,84 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
+  for (const method of ["post", "patch"] as const) {
+    for (const status of ["done", "cancelled"] as const) {
+      for (const reopen of [false, undefined]) {
+        it(`${method}: comment one second after ${status}, reopen=${reopen}`, async () => {
+          const closedAt = new Date("2026-10-01T12:00:00Z");
+          const issue = { ...makeIssue(status), completedAt: closedAt, updatedAt: closedAt };
+          mockIssueService.getById.mockResolvedValue(issue);
+          mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
+            makeIssueUpdateReceipt(issue, patch));
+          mockIssueService.addComment.mockResolvedValue({
+            id: "comment-1", issueId: issue.id, companyId: issue.companyId,
+            body: "hello", authorUserId: "local-board", authorAgentId: null,
+            createdAt: new Date(closedAt.getTime() + 1000),
+          });
+          const app = await installActor(createApp());
+          const res = await request(app)[method](
+            `/api/issues/${issue.id}${method === "post" ? "/comments" : ""}`,
+          ).send({ [method === "post" ? "body" : "comment"]: "hello", ...(reopen === false ? { reopen } : {}) });
+          expect(res.status).toBe(method === "post" ? 201 : 200);
+          expect(mockIssueService.addComment).toHaveBeenCalled();
+          const statusWrites = mockIssueService.update.mock.calls
+            .map((call) => call[1].status).filter(Boolean);
+          if (reopen === false) {
+            expect(statusWrites).not.toContain("todo");
+            expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+          } else {
+            expect(statusWrites).toContain("todo");
+            await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+            expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(issue.assigneeAgentId,
+              expect.objectContaining({ reason: "issue_reopened_via_comment" }));
+          }
+        });
+      }
+    }
+
+    it(`${method}: reopen=false keeps explicit mentions on a closed issue`, async () => {
+      const issue = makeIssue("done");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch));
+      mockIssueService.findMentionedAgents.mockResolvedValue(["33333333-3333-4333-8333-333333333333"]);
+      const res = await request(await installActor(createApp()))[method](
+        `/api/issues/${issue.id}${method === "post" ? "/comments" : ""}`,
+      ).send({ [method === "post" ? "body" : "comment"]: "hello @Reviewer", reopen: false });
+      expect(res.status).toBe(method === "post" ? 201 : 200);
+      expect(mockIssueService.update.mock.calls.map((call) => call[1].status)).not.toContain("todo");
+      await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith("33333333-3333-4333-8333-333333333333",
+        expect.objectContaining({ reason: "issue_comment_mentioned" }));
+    });
+
+    it(`${method}: reopen=false keeps the existing blocked comment resume`, async () => {
+      const issue = makeIssue("blocked");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.getDependencyReadiness.mockResolvedValue({ unresolvedBlockerCount: 0 });
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch));
+      const res = await request(await installActor(createApp()))[method](
+        `/api/issues/${issue.id}${method === "post" ? "/comments" : ""}`,
+      ).send({ [method === "post" ? "body" : "comment"]: "hello", reopen: false });
+      expect(res.status).toBe(method === "post" ? 201 : 200);
+      expect(mockIssueService.update.mock.calls.map((call) => call[1].status)).toContain("todo");
+    });
+
+    it(`${method}: reopen=false preserves comments on an open issue`, async () => {
+      const issue = makeIssue("in_progress");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch));
+      const res = await request(await installActor(createApp()))[method](
+        `/api/issues/${issue.id}${method === "post" ? "/comments" : ""}`,
+      ).send({ [method === "post" ? "body" : "comment"]: "hello", reopen: false });
+      expect(res.status).toBe(method === "post" ? 201 : 200);
+      await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(issue.assigneeAgentId,
+        expect.objectContaining({ reason: "issue_commented" })));
+    });
+  }
+
   it("treats reopen=true as a no-op when the issue is already open", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
     mockIssueService.update.mockImplementation(

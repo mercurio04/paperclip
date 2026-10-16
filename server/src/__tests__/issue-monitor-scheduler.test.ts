@@ -1,6 +1,11 @@
+import { fork } from "node:child_process";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { PROVIDER_QUOTA_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
 import {
   activityLog,
@@ -545,4 +550,255 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(JSON.stringify(activity.map((row) => row.details))).not.toContain("provider.example");
     expect(activity.find((row) => row.action === "issue.monitor_triggered")?.details).not.toHaveProperty("externalRef");
   });
+  describe("github_checks deterministic polling", () => {
+    const headSha = "a".repeat(40);
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+    let fixtureDir: string;
+    let fixtureFile: string;
+    let fixture: Record<string, unknown>;
+    const target = { kind: "github_checks", repo: "example/project", prNumber: 4, headSha,
+      expectedChecks: ["build", "test"], intervalMinutes: 5, timeoutAt: "2026-04-11T15:00:00Z", maxAttempts: 10 };
+    const run = (name: string, conclusion: string | null = null) => ({ id: name === "build" ? 1 : 2, name,
+      status: conclusion ? "completed" : "in_progress", conclusion, app: { id: 1 } });
+    const saveFixture = () => writeFileSync(fixtureFile, JSON.stringify(fixture));
+    const calls = () => existsSync(fixtureFile + ".calls") ? readFileSync(fixtureFile + ".calls", "utf8").trim().split("\n") : [];
+    const readIssue = (id: string) => db.select().from(issues).where(eq(issues.id, id)).then(rows => rows[0]!);
+    const wakes = () => db.select().from(agentWakeupRequests);
+    beforeEach(() => {
+      fixtureDir = mkdtempSync(join(tmpdir(), "github-monitor-"));
+      fixtureFile = join(fixtureDir, "fixture.json");
+      fixture = { pr: { head: { sha: headSha }, state: "open", merged: false }, runs: [run("build", "success"), run("test")] };
+      saveFixture();
+      vi.stubEnv("PATH", fileURLToPath(new URL("./fixtures/github-checks", import.meta.url)) + ":" + process.env.PATH);
+      vi.stubEnv("GITHUB_MONITOR_FIXTURE", fixtureFile);
+      vi.stubEnv("PAPERCLIP_GITHUB_CHECKS_MONITOR_ENABLED", "true");
+    });
+    afterEach(() => { vi.unstubAllEnvs(); rmSync(fixtureDir, { recursive: true, force: true }); });
+
+    it("G2 no change: zero wakes, persisted digest and bounded backoff", async () => {
+      const { issueId } = await seedFixture({ monitor: target });
+      let row = await readIssue(issueId);
+      for (const minutes of [5, 7.5, 11.25, 16.875, 25.3125, 30, 30]) {
+        const now = row.monitorAttemptCount === 0 ? tickAt : row.monitorNextCheckAt!;
+        await heartbeatService(db).tickTimers(now);
+        row = await readIssue(issueId);
+        expect(row.monitorNextCheckAt!.getTime() - now.getTime()).toBeGreaterThanOrEqual(minutes * 60_000);
+        expect(row.monitorNextCheckAt!.getTime() - now.getTime()).toBeLessThan(minutes * 60_000 + 2_000);
+        expect(row.monitorWakeRequestedAt).toBeNull();
+        expect(row.monitorProbeState).toMatchObject({ intervalMinutes: minutes, consecutiveErrors: 0 });
+        expect(parseIssueExecutionState(row.executionState)?.monitor?.attemptCount).toBe(row.monitorAttemptCount);
+        expect(normalizeIssueExecutionPolicy(row.executionPolicy)?.monitor?.timeoutAt).toBe(target.timeoutAt);
+      }
+      expect(row.monitorAttemptCount).toBe(7);
+      expect(await wakes()).toHaveLength(0);
+      expect(await db.select().from(heartbeatRuns)).toHaveLength(0);
+      expect(row.executionPolicy).not.toHaveProperty("monitorProbeState");
+    });
+    it.each(["head_changed", "pr_closed", "merged", "failure", "cancelled", "timed_out", "action_required", "green", "missing"])("G2 %s: one structured wake and no further query", async kind => {
+      const { issueId } = await seedFixture({ monitor: target });
+      if (kind === "head_changed") fixture.pr = { head: { sha: "b".repeat(40) }, state: "open", merged: false };
+      else if (["pr_closed", "merged"].includes(kind)) fixture.pr = { head: { sha: headSha }, state: "closed", merged: kind === "merged" };
+      else fixture.runs = kind === "missing" ? [run("build", "success")] : [run("build", "success"), run("test", kind === "green" ? "success" : kind)];
+      saveFixture();
+      await heartbeatService(db).tickTimers(tickAt);
+      const firstCalls = calls().length;
+      await heartbeatService(db).tickTimers(new Date(tickAt.getTime() + 6 * 60_000));
+      const events = await wakes();
+      expect(events).toHaveLength(1);
+      expect(events[0]!.idempotencyKey).toBe(`issue-monitor:${issueId}:2026-04-11T12:30:00.000Z`);
+      expect(events[0]!.payload?.githubChecks).toMatchObject({ repo: target.repo, headSha,
+        reason: kind === "merged" ? "pr_closed" : kind === "green" ? "checks_completed" : kind === "missing" ? "expected_checks_missing" : ["head_changed", "pr_closed"].includes(kind) ? kind : "checks_failed" });
+      expect(calls()).toHaveLength(firstCalls);
+      expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
+    });
+    it.each(["HTTP 500", "HTTP 429", "HTTP 403 rate limit exceeded", "network unavailable"])("G2 %s: third consecutive error wakes, never green", async error => {
+      const { issueId } = await seedFixture({ monitor: target });
+      fixture.error = error; saveFixture();
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const row = await readIssue(issueId);
+        await heartbeatService(db).tickTimers(attempt === 1 ? tickAt : row.monitorNextCheckAt!);
+        expect(await wakes()).toHaveLength(attempt === 3 ? 1 : 0);
+      }
+      expect((await wakes())[0]!.payload?.githubChecks).toMatchObject({ reason: "probe_error", allGreen: false, probeError: { kind: "transient", consecutiveErrors: 3 } });
+      expect((await readIssue(issueId)).monitorAttemptCount).toBe(3);
+    });
+    it.each([401, 403, 404])("G2 HTTP %s: immediate error wake with no raw output", async status => {
+      await seedFixture({ monitor: target }); fixture.error = `private-text HTTP ${status}`; saveFixture();
+      await heartbeatService(db).tickTimers(tickAt);
+      expect(await wakes()).toHaveLength(1);
+      expect((await wakes())[0]!.payload?.githubChecks).toMatchObject({ reason: "probe_error", probeError: { kind: "access", status } });
+      expect(JSON.stringify(await wakes())).not.toContain("private-text");
+    });
+    it("G2 successful poll resets consecutive errors", async () => {
+      const { issueId } = await seedFixture({ monitor: target }); fixture.error = "HTTP 500"; saveFixture();
+      await heartbeatService(db).tickTimers(tickAt);
+      delete fixture.error; saveFixture();
+      await heartbeatService(db).tickTimers((await readIssue(issueId)).monitorNextCheckAt!);
+      expect((await readIssue(issueId)).monitorProbeState?.consecutiveErrors).toBe(0);
+      expect(await wakes()).toHaveLength(0);
+    });
+    it.each(["timeout", "attempts", "last_attempt"])("G2 %s: clear/recover without extending limits", async kind => {
+      const { issueId } = await seedFixture({ monitor: { ...target, ...(kind === "timeout" ? { timeoutAt: tickAt.toISOString() } : { maxAttempts: 1 }) }, monitorAttemptCount: kind === "attempts" ? 1 : 0 });
+      await heartbeatService(db).tickTimers(tickAt);
+      expect(calls()).toHaveLength(kind === "last_attempt" ? 3 : 0);
+      const row = await readIssue(issueId);
+      expect(row.monitorNextCheckAt).toBeNull();
+      expect(parseIssueExecutionState(row.executionState)?.monitor?.clearReason).toBe(kind === "timeout" ? "timeout_exceeded" : "max_attempts_exhausted");
+      expect(await wakes()).toHaveLength(1);
+    });
+    it.each(["failure", "cancelled", "timed_out", "green", "head_changed"])("O2 decisive %s observed after deadline is preserved in the wake", async kind => {
+      const deadline = new Date(tickAt.getTime() + 100);
+      const { issueId } = await seedFixture({ monitor: { ...target, timeoutAt: deadline.toISOString(), maxAttempts: 1 } });
+      fixture.delay = 150;
+      if (kind === "head_changed") fixture.pr = { head: { sha: "b".repeat(40) }, state: "open", merged: false };
+      else fixture.runs = [run("build", "success"), run("test", kind === "green" ? "success" : kind)];
+      saveFixture();
+      await heartbeatService(db).tickTimers(tickAt);
+      const receipts = await wakes();
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]!.reason).toBe("issue_monitor_due");
+      expect(receipts[0]!.payload?.githubChecks).toMatchObject({
+        headSha, reason: kind === "head_changed" ? kind : kind === "green" ? "checks_completed" : "checks_failed",
+      });
+      const row = await readIssue(issueId);
+      expect(row.monitorAttemptCount).toBe(1); expect(row.monitorNextCheckAt).toBeNull();
+      expect(parseIssueExecutionState(row.executionState)?.monitor).toMatchObject({ timeoutAt: deadline.toISOString(), maxAttempts: 1 });
+      await heartbeatService(db).tickTimers(new Date(tickAt.getTime() + 6 * 60_000));
+      expect(await wakes()).toHaveLength(1);
+    });
+    it.each(["HTTP 500", "HTTP 401", "waiting", "neutral", "missing"])("O2 %s after deadline uses clear/recover and never reports green", async kind => {
+      const deadline = new Date(tickAt.getTime() + 100);
+      const { issueId } = await seedFixture({ monitor: { ...target, timeoutAt: deadline.toISOString() } });
+      fixture.delay = 150;
+      if (kind.startsWith("HTTP")) fixture.error = kind;
+      if (kind === "neutral") fixture.runs = [run("build", "success"), run("test", "neutral")];
+      if (kind === "missing") fixture.runs = [run("build", "success")];
+      saveFixture();
+      await heartbeatService(db).tickTimers(tickAt);
+      const receipts = await wakes(); expect(receipts).toHaveLength(1);
+      expect(receipts[0]!.reason).toBe("issue_monitor_recovery");
+      expect(receipts[0]!.payload).toMatchObject({ clearReason: "timeout_exceeded", timeoutAt: deadline.toISOString() });
+      expect(receipts[0]!.payload).not.toHaveProperty("githubChecks");
+      const row = await readIssue(issueId);
+      expect(row.monitorAttemptCount).toBe(1); expect(row.monitorNextCheckAt).toBeNull();
+    });
+    it("G2 clamps next poll to the original deadline", async () => {
+      const deadline = new Date(tickAt.getTime() + 60_000);
+      const { issueId } = await seedFixture({ monitor: { ...target, intervalMinutes: 1, timeoutAt: deadline.toISOString() } });
+      await heartbeatService(db).tickTimers(tickAt);
+      expect((await readIssue(issueId)).monitorNextCheckAt).toEqual(deadline);
+      await heartbeatService(db).tickTimers(deadline);
+      expect(calls()).toHaveLength(3);
+      expect(await wakes()).toHaveLength(1);
+    });
+    it("G2 concurrent ticks have one effective claim", async () => {
+      const { issueId } = await seedFixture({ monitor: target }); fixture.delay = 50; saveFixture();
+      await Promise.all([heartbeatService(db).tickTimers(tickAt), heartbeatService(db).tickTimers(tickAt)]);
+      expect((await readIssue(issueId)).monitorAttemptCount).toBe(1);
+      expect(calls()).toHaveLength(3);
+      expect(await wakes()).toHaveLength(0);
+    });
+    it("O1 concurrent saved-event admission creates at most one wake receipt", async () => {
+      const { issueId, agentId } = await seedFixture({ monitor: target });
+      await db.update(issues).set({ monitorWakeRequestedAt: tickAt }).where(eq(issues.id, issueId));
+      const claim = await readIssue(issueId);
+      const heartbeat = heartbeatService(db);
+      const opts = { source: "automation" as const, triggerDetail: "system" as const, reason: "issue_monitor_due",
+        githubMonitorClaim: claim, idempotencyKey: `issue-monitor:${issueId}:${claim.monitorNextCheckAt!.toISOString()}`,
+        requestedByActorType: "system" as const, requestedByActorId: "heartbeat_scheduler",
+        payload: { issueId, githubChecks: { reason: "checks_completed", headSha, allGreen: true } },
+        contextSnapshot: { issueId, source: "issue.monitor", wakeReason: "issue_monitor_due" },
+      };
+      await Promise.all([heartbeat.wakeup(agentId, opts), heartbeatService(db).wakeup(agentId, opts)]);
+      expect(await wakes()).toHaveLength(1);
+      expect(calls()).toHaveLength(0);
+    });
+    it("G2 crash after claim: lease recovers only after five minutes", async () => {
+      const { issueId } = await seedFixture({ monitor: target });
+      await db.update(issues).set({ monitorWakeRequestedAt: tickAt, monitorAttemptCount: 1 }).where(eq(issues.id, issueId));
+      await heartbeatService(db).tickTimers(new Date(tickAt.getTime() + 5 * 60_000));
+      expect(calls()).toHaveLength(0);
+      fixture.runs = [run("build", "success"), run("test", "success")]; saveFixture();
+      const now = new Date(tickAt.getTime() + 5 * 60_000 + 1);
+      await Promise.all([heartbeatService(db).tickTimers(now), heartbeatService(db).tickTimers(now)]);
+      expect(await wakes()).toHaveLength(1);
+      expect((await readIssue(issueId)).monitorAttemptCount).toBe(2);
+    });
+    it("G2 clear or close cancels future probes", async () => {
+      const { issueId } = await seedFixture({ monitor: target });
+      await db.update(issues).set({ monitorNextCheckAt: null }).where(eq(issues.id, issueId));
+      await heartbeatService(db).tickTimers(tickAt);
+      await db.update(issues).set({ monitorNextCheckAt: tickAt, status: "done" }).where(eq(issues.id, issueId));
+      await heartbeatService(db).tickTimers(tickAt);
+      expect(calls()).toHaveLength(0);
+    });
+    it.each(["clear", "rearm", "close"])("G2 %s during query: CAS discards stale result", async kind => {
+      const { issueId } = await seedFixture({ monitor: target }); fixture.delay = 200; saveFixture();
+      const tick = heartbeatService(db).tickTimers(tickAt);
+      const deadline = Date.now() + 5000;
+      while (!calls().length && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+      expect(calls().length).toBeGreaterThan(0);
+      await db.update(issues).set(kind === "close" ? { status: "done" } : kind === "clear" ? { monitorNextCheckAt: null, monitorWakeRequestedAt: null } : { monitorNextCheckAt: new Date(tickAt.getTime() + 60_000), monitorWakeRequestedAt: null }).where(eq(issues.id, issueId));
+      await tick;
+      expect(await wakes()).toHaveLength(0);
+      // The attempt reservation is durable; a cancelled query cannot save its result.
+      expect((await readIssue(issueId)).monitorProbeState).not.toHaveProperty("checks");
+      expect((await readIssue(issueId)).monitorProbeState).not.toHaveProperty("pendingEvent");
+    });
+    it.each(["disabled", "external_service"])("G2 %s: legacy one-shot behavior and no gh calls", async kind => {
+      if (kind === "disabled") vi.stubEnv("PAPERCLIP_GITHUB_CHECKS_MONITOR_ENABLED", "false");
+      await seedFixture({ monitor: kind === "external_service" ? { kind, serviceName: "Deploy health" } : target });
+      await heartbeatService(db).tickTimers(tickAt);
+      expect(await wakes()).toHaveLength(1);
+      expect(calls()).toHaveLength(0);
+      expect((await wakes())[0]!.payload).not.toHaveProperty("githubChecks");
+    });
+    it.each([false, true])("G2 crash around wake delivery (delivered=%s): durable event replays at most once", async delivered => {
+      const { issueId, companyId, agentId } = await seedFixture({ monitor: target });
+      await heartbeatService(db).tickTimers(tickAt);
+      const row = await readIssue(issueId);
+      const scheduledAt = row.monitorNextCheckAt!;
+      const event = { reason: "checks_completed", repo: target.repo, prNumber: target.prNumber, headSha, allGreen: true };
+      await db.update(issues).set({ monitorProbeState: { ...row.monitorProbeState, pendingEvent: event },
+        monitorWakeRequestedAt: tickAt }).where(eq(issues.id, issueId));
+      if (delivered) await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", status: "queued", reason: "issue_monitor_due",
+        payload: { issueId, githubChecks: event }, idempotencyKey: `issue-monitor:${issueId}:${scheduledAt.toISOString()}` });
+      const count = calls().length;
+      await heartbeatService(db).tickTimers(new Date(scheduledAt.getTime() + 5 * 60_000 + 1));
+      expect(await wakes()).toHaveLength(1);
+      expect(calls()).toHaveLength(count);
+      expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
+    });
+    it("G2 additive migration is idempotent on the disposable database", async () => {
+      const migration = readFileSync(fileURLToPath(new URL("../../../packages/db/src/migrations/0280_shallow_spitfire.sql", import.meta.url)), "utf8");
+      await db.execute(sql.raw(migration));
+      await db.execute(sql.raw(migration));
+    });
+    it("G2 real process restart: durable monitor resumes in a fresh loopback server", async () => {
+      const { issueId } = await seedFixture({ monitor: target });
+      const start = async () => {
+        const child = fork(fileURLToPath(new URL("./fixtures/github-checks/restart-server.ts", import.meta.url)), [], {
+          execArgv: ["--import", fileURLToPath(new URL("../../node_modules/tsx/dist/loader.mjs", import.meta.url))], cwd: fileURLToPath(new URL("../../..", import.meta.url)),
+          env: { ...process.env, GITHUB_MONITOR_TEST_DB: tempDb!.connectionString }, stdio: ["ignore", "ignore", "pipe", "ipc"],
+        });
+        await new Promise<void>((resolve, reject) => { const timer = setTimeout(() => reject(new Error("server start timeout")), 20000); child.once("message", () => { clearTimeout(timer); resolve(); }); child.once("exit", code => reject(new Error(`server exited ${code}`))); });
+        return child;
+      };
+      const tick = async (child: ReturnType<typeof fork>, now: Date) => {
+        const message = new Promise<unknown>(resolve => child.once("message", resolve)); child.send({ now: now.toISOString() });
+        expect(await message).not.toHaveProperty("error");
+      };
+      const stop = async (child: ReturnType<typeof fork>) => { const exited = new Promise(resolve => child.once("exit", resolve)); child.kill("SIGTERM"); await exited; };
+      const first = await start();
+      try { await tick(first, tickAt); } finally { await stop(first); }
+      const row = await readIssue(issueId);
+      expect(row.monitorAttemptCount).toBe(1); expect(await wakes()).toHaveLength(0);
+      fixture.runs = [run("build", "success"), run("test", "success")]; saveFixture();
+      const second = await start();
+      try { expect(second.pid).not.toBe(first.pid); await tick(second, row.monitorNextCheckAt!); } finally { await stop(second); }
+      expect(await wakes()).toHaveLength(1);
+      expect((await readIssue(issueId)).monitorAttemptCount).toBe(2);
+    }, 60000);
+  });
+
 });

@@ -1776,7 +1776,15 @@ export interface IssueFilters {
   updatedSince?: string;
 }
 
-type IssueRow = typeof issues.$inferSelect;
+// Probe claims, digests and pending events belong to the scheduler, not the API.
+type IssueRow = Omit<typeof issues.$inferSelect, "monitorProbeState">;
+
+export function toPublicIssue<T extends IssueRow>(row: T): Omit<T, "monitorProbeState"> {
+  const { monitorProbeState: _probeState, ...publicIssue } = row as T & {
+    monitorProbeState?: unknown;
+  };
+  return publicIssue;
+}
 type IssueLabelRow = typeof labels.$inferSelect;
 type IssuePlanDecompositionRow = typeof issuePlanDecompositions.$inferSelect;
 type IssueActiveRunRow = {
@@ -3194,7 +3202,7 @@ async function withIssueLabels(
   return rows.map((row) => {
     const issueLabels = labelsByIssueId.get(row.id) ?? [];
     return {
-      ...row,
+      ...toPublicIssue(row),
       labels: issueLabels,
       labelIds: issueLabels.map((label) => label.id),
       watchdog: watchdogByIssueId.get(row.id) ?? null,
@@ -7639,7 +7647,7 @@ export function issueService(db: Db) {
   }
 
   async function addStopRelayCommentIfNeeded(
-    child: typeof issues.$inferSelect,
+    child: IssueRow,
     dbOrTx: any = db,
   ) {
     if (
@@ -9392,7 +9400,7 @@ export function issueService(db: Db) {
       });
 
       let currentClaim = initialClaim;
-      const newlyCreatedIssues: Array<typeof issues.$inferSelect> = [];
+      const newlyCreatedIssues: IssueRow[] = [];
 
       while (true) {
         const step = await db.transaction(async (tx) => {
@@ -9629,7 +9637,7 @@ export function issueService(db: Db) {
 
     getConversation: async (companyId: string, agentId: string, userId: string) => db.select().from(issues).where(and(
       eq(issues.companyId, companyId), eq(issues.conversationAgentId, agentId), eq(issues.conversationUserId, userId),
-    )).then((rows) => rows[0] ?? null),
+    )).then((rows) => rows[0] ? toPublicIssue(rows[0]) : null),
 
     create: async (
       companyId: string,

@@ -1,3 +1,4 @@
+import { findPendingWakeInteraction } from "../pending-wake-interaction.js";
 import { hasLiveLegacyController } from "../legacy-controller-lease.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { isWaitingConversation, settleConversationTurn, deliverConversationComments } from "../agent-conversations.js";
@@ -1105,25 +1106,6 @@ export function recoveryService(
     ]);
 
     return Boolean(run || deferredWake || nativeRecovery);
-  }
-
-  async function hasPendingWakeInteraction(companyId: string, issueId: string) {
-    return db
-      .select({ id: issueThreadInteractions.id })
-      .from(issueThreadInteractions)
-      .where(
-        and(
-          eq(issueThreadInteractions.companyId, companyId),
-          eq(issueThreadInteractions.issueId, issueId),
-          eq(issueThreadInteractions.status, "pending"),
-          inArray(issueThreadInteractions.continuationPolicy, [
-            "wake_assignee",
-            "wake_assignee_on_accept",
-          ]),
-        ),
-      )
-      .limit(1)
-      .then((rows) => Boolean(rows[0]));
   }
 
   /**
@@ -4323,7 +4305,7 @@ export function recoveryService(
         continue;
       }
 
-      if (await hasPendingWakeInteraction(issue.companyId, issue.id)) {
+      if (await findPendingWakeInteraction(db, issue.companyId, issue.id)) {
         result.skipped += 1;
         continue;
       }
@@ -5388,7 +5370,7 @@ export function recoveryService(
           continue;
         }
 
-        if (await hasPendingWakeInteraction(companyId, candidate.id)) {
+        if (await findPendingWakeInteraction(db, companyId, candidate.id)) {
           result.interactionSkipped += 1;
           continue;
         }

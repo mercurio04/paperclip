@@ -52,7 +52,7 @@ export type IssueWatchdogUpsertInput = {
 };
 
 type IssueWatchdogRow = typeof issueWatchdogs.$inferSelect;
-type IssueRow = typeof issues.$inferSelect;
+type IssueRow = Omit<typeof issues.$inferSelect, "monitorProbeState">;
 
 export type TaskWatchdogClassifierIssue = Pick<
   IssueRow,

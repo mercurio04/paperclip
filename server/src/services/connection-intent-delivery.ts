@@ -62,7 +62,7 @@ export function connectionIntentDeliveryService(db: Db, heartbeat: Pick<Heartbea
   // Only a repaired AI-authentication failure may reopen a blocked task. An old
   // card must never resume a newer failure, a reassignment, or a manual hold.
   async function restoreAiBlockedTask(loaded: {
-    issue: typeof issues.$inferSelect;
+    issue: Omit<typeof issues.$inferSelect, "monitorProbeState">;
     interaction: typeof issueThreadInteractions.$inferSelect;
   }) {
     const publications: ActivityPublication[] = [];
@@ -113,7 +113,10 @@ export function connectionIntentDeliveryService(db: Db, heartbeat: Pick<Heartbea
       .set({ nextAttemptAt: new Date(now.getTime() + 60_000) })
       .where(and(eq(connectionIntentDeliveries.interactionId, interactionId), isNull(connectionIntentDeliveries.deliveredAt), lte(connectionIntentDeliveries.nextAttemptAt, now))).returning();
     if (!claimed) return;
-    const [loaded] = await db.select({ interaction: issueThreadInteractions, issue: issues })
+    const [loaded]: Array<{
+      interaction: typeof issueThreadInteractions.$inferSelect;
+      issue: Omit<typeof issues.$inferSelect, "monitorProbeState">;
+    }> = await db.select({ interaction: issueThreadInteractions, issue: issues })
       .from(issueThreadInteractions).innerJoin(issues, eq(issues.id, issueThreadInteractions.issueId))
       .where(and(eq(issueThreadInteractions.id, interactionId), eq(issueThreadInteractions.companyId, claimed.companyId), eq(issues.companyId, claimed.companyId)));
     const interaction = loaded?.interaction;

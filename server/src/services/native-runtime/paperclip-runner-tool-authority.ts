@@ -39,7 +39,7 @@ import { CAPABILITY_SEMANTIC_TOOL_CATALOG } from "../../vendor/paperclip-runner/
 import { agentService } from "../agents.js";
 import { approvalService } from "../approvals.js";
 import { documentService } from "../documents.js";
-import { issueService } from "../issues.js";
+import { issueService, toPublicIssue } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { persistActivity, publishActivity } from "../activity-log.js";
 import { captureRunIdentity } from "../run-identity.js";
@@ -398,7 +398,7 @@ export class PaperclipRunnerToolAuthority {
             eq(issueApprovals.companyId, this.binding.companyId),
             eq(issues.companyId, this.binding.companyId),
           ));
-        return { approval, tasks: tasks.map((row) => row.issue) };
+        return { approval, tasks: tasks.map((row) => toPublicIssue(row.issue)) };
       }
       case "report_progress": return this.#reportProgress(input);
       case "request_human_input": return this.#requestHumanInput(input,
@@ -1367,7 +1367,7 @@ function redactedActor(actor: {
   };
 }
 
-function redactedTask(task: typeof issues.$inferSelect) {
+function redactedTask(task: Omit<typeof issues.$inferSelect, "monitorProbeState">) {
   return {
     id: task.id,
     companyId: task.companyId,

@@ -84,7 +84,7 @@ import {
 } from "../services/pipelines-aggregation.js";
 import { accessService } from "../services/access.js";
 import { authorizationService } from "../services/authorization.js";
-import { issueService } from "../services/issues.js";
+import { issueService, toPublicIssue } from "../services/issues.js";
 import { assertCompanyAccess } from "./authz.js";
 import {
   computePipelineHealth,
@@ -1947,7 +1947,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         actor,
         payload: { issueId: issue!.id },
       });
-      return { issue: issue!, created: true };
+      return { issue: toPublicIssue(issue!), created: true };
     });
     res.status(result.created ? 201 : 200).json(result);
   });
@@ -1965,7 +1965,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         eq(issueRows.companyId, companyId),
       ))
       .orderBy(asc(pipelineCaseIssueLinks.createdAt));
-    res.json(links);
+    res.json(links.map(({ link, issue }) => ({ link, issue: toPublicIssue(issue) })));
   });
 
   router.get("/cases/:caseId/outputs", async (req, res) => {
